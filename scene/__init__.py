@@ -52,8 +52,11 @@ class Scene:
             assert False, "Could not recognize scene type!"
 
         if not self.loaded_iter:
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
-                dest_file.write(src_file.read())
+            try:
+                with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+                    dest_file.write(src_file.read())
+            except FileNotFoundError:
+                print(f"Warning: Could not copy {scene_info.ply_path} to input.ply (file not found)")
             json_cams = []
             camlist = []
             if scene_info.test_cameras:

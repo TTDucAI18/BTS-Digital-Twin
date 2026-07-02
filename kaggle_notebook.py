@@ -126,6 +126,15 @@ REPO_DIR   = "/kaggle/working/BTS-Digital-Twin"
 OUTPUT_DIR = "/kaggle/working/output"
 ITERATIONS = 30000
 
+# Tự động lấy default entity của tài khoản để tránh lỗi "entity not specified"
+import wandb
+try:
+    WANDB_ENTITY = wandb.Api().default_entity
+    print(f"✅ Đã nhận diện WandB Entity: {WANDB_ENTITY}")
+except:
+    WANDB_ENTITY = "ttducpslnbg"
+    print(f"⚠️ Không thể lấy default entity, dùng mặc định: {WANDB_ENTITY}")
+
 def train_scene(scene_path: str, gpu_id: int) -> str:
     scene_name = os.path.basename(scene_path)
     scene_out  = f"{OUTPUT_DIR}/{scene_name}"
@@ -143,8 +152,8 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         f"-s {scene_path} "
         f"-m {scene_out} "
         f"--use_wandb "
-        f"--wandb_project bts-digital-twin-kaggle "
-        f"--wandb_entity ttducpslnbg "
+        f"--wandb_project ai_race "
+        f"--wandb_entity {WANDB_ENTITY} "
         f"--iterations {ITERATIONS} "
         f"--lambda_dssim 0.4 "
         f"--densify_grad_threshold 0.00015 "

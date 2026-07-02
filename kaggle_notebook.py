@@ -49,6 +49,7 @@ print("=" * 60)
 if os.path.exists(REPO_DIR):
     print(f"Repo already exists at {REPO_DIR}, pulling latest...")
     run(f"git -C {REPO_DIR} pull origin main")
+    run(f"git -C {REPO_DIR} submodule update --init --recursive")
 else:
     run(f"git clone --recurse-submodules {REPO_URL} {REPO_DIR}")
 
@@ -74,13 +75,13 @@ for submod in [
     "submodules/fused-ssim",
 ]:
     print(f"\n[Building] {submod} ...")
-    rc = run(f"pip install -e {submod} -q")
+    rc = run(f"pip install -e {submod} -q", cwd=REPO_DIR)
     status = "✅ OK" if rc == 0 else "❌ FAILED"
     print(f"  → {status}")
 
 # Verify import
-run("python -c \"from diff_gaussian_rasterization import GaussianRasterizer; print('Rasterizer OK')\"")
-run("python -c \"import simple_knn; print('simple_knn OK')\"")
+run("python -c \"from diff_gaussian_rasterization import GaussianRasterizer; print('Rasterizer OK')\"", cwd=REPO_DIR)
+run("python -c \"import simple_knn; print('simple_knn OK')\"", cwd=REPO_DIR)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,7 +101,7 @@ print("WandB login OK ✅")
 # ─────────────────────────────────────────────────────────────────────────────
 import glob
 
-DATA_DIR   = "/kaggle/input/bts-digital-twin-phase1/phase1"
+DATA_DIR   = "/kaggle/input/datasets/tdukaggle/ai-race-data/phase1"
 OUTPUT_DIR = "/kaggle/working/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 

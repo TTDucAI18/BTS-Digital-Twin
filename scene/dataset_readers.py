@@ -271,11 +271,17 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             xyz, rgb, _ = read_points3D_binary(bin_path)
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+        
+        try:
+            storePly(ply_path, xyz, rgb)
+        except OSError:
+            print(f"Warning: Could not save .ply to {ply_path} (Read-only file system). Proceeding with in-memory points.")
+        pcd = BasicPointCloud(points=xyz, colors=rgb, normals=np.zeros((xyz.shape[0], 3)))
+    else:
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

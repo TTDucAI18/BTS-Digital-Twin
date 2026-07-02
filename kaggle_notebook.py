@@ -70,7 +70,7 @@ for submod in [
     "submodules/fused-ssim",
 ]:
     print(f"\n[Building] {submod} ...")
-    rc = run(f"pip install -e {submod}", cwd=REPO_DIR)
+    rc = run(f"pip install --no-build-isolation -e {submod}", cwd=REPO_DIR)
     status = "✅ OK" if rc == 0 else "❌ FAILED"
     print(f"  → {status}")
 

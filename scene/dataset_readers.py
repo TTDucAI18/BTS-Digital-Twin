@@ -23,6 +23,17 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 
+def get_actual_path(path):
+    if os.path.exists(path):
+        return path
+    dirname = os.path.dirname(path)
+    basename = os.path.basename(path).lower()
+    if os.path.exists(dirname):
+        for f in os.listdir(dirname):
+            if f.lower() == basename:
+                return os.path.join(dirname, f)
+    return path
+
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -114,7 +125,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
             except:
                 print("\n", key, "not found in depths_params")
 
-        image_path = os.path.join(images_folder, extr.name)
+        image_path = get_actual_path(os.path.join(images_folder, extr.name))
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
 

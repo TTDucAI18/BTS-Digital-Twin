@@ -158,6 +158,17 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
 
     status = "✅ DONE" if result.returncode == 0 else f"❌ FAILED (rc={result.returncode})"
     print(f"  [{scene_name}] {status} — log: {log_file}")
+    
+    if result.returncode != 0:
+        print(f"\n{'='*20} ERROR LOG FOR {scene_name} (Last 50 lines) {'='*20}")
+        try:
+            with open(log_file, "r") as f:
+                lines = f.readlines()
+                print("".join(lines[-50:]))
+        except Exception as e:
+            print(f"Could not read log: {e}")
+        print("=" * 60 + "\n")
+        
     return scene_name, result.returncode
 
 
@@ -198,6 +209,17 @@ def render_scene(scene_path: str, gpu_id: int) -> str:
 
     status = "✅ DONE" if result.returncode == 0 else f"❌ FAILED (rc={result.returncode})"
     print(f"  [{scene_name}] {status}")
+    
+    if result.returncode != 0:
+        print(f"\n{'='*20} ERROR LOG FOR {scene_name} (Last 50 lines) {'='*20}")
+        try:
+            with open(log_file, "r") as f:
+                lines = f.readlines()
+                print("".join(lines[-50:]))
+        except Exception as e:
+            print(f"Could not read log: {e}")
+        print("=" * 60 + "\n")
+
     return scene_name, result.returncode
 
 

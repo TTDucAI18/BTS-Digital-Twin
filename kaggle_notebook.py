@@ -144,6 +144,7 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         f"-m {scene_out} "
         f"--use_wandb "
         f"--wandb_project bts-digital-twin-kaggle "
+        f"--wandb_entity ttducpslnbg "
         f"--iterations {ITERATIONS} "
         f"--lambda_dssim 0.4 "
         f"--densify_grad_threshold 0.00015 "

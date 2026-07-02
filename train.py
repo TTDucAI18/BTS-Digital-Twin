@@ -230,7 +230,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
         
     if args.use_wandb:
-        wandb.init(project=args.wandb_project, name=os.path.basename(args.model_path), config=vars(args))
+        wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=os.path.basename(args.model_path), config=vars(args))
         
     return tb_writer
 
@@ -302,6 +302,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
     parser.add_argument("--wandb_project", type=str, default="bts-digital-twin")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (username or team)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     

@@ -15,7 +15,12 @@ pip install -e submodules/diff-gaussian-rasterization
 pip install -e submodules/simple-knn
 
 echo "[3.5] Logging into Weights & Biases..."
-wandb login 
+# Use Kaggle Secrets: Add WANDB_API_KEY in Kaggle > Add-ons > Secrets
+if [ -n "$WANDB_API_KEY" ]; then
+    wandb login $WANDB_API_KEY
+else
+    echo "Warning: WANDB_API_KEY not set. Add it via Kaggle Secrets. Skipping WandB login."
+fi
 
 echo "[4] Starting Multi-GPU Training (Data distribution)..."
 DATA_DIR="/kaggle/input/bts-digital-twin-phase1/phase1"
@@ -33,12 +38,27 @@ train_scene() {
     SCENE_NAME=$(basename $SCENE_PATH)
     echo "Starting training for $SCENE_NAME on GPU $GPU_ID..."
     
+    # Auto-resume: find latest checkpoint if exists
+    RESUME_FLAG=""
+    CKPT_DIR="$OUTPUT_DIR/$SCENE_NAME"
+    if [ -d "$CKPT_DIR" ]; then
+        LATEST_CKPT=$(ls -t $CKPT_DIR/chkpnt*.pth 2>/dev/null | head -n1)
+        if [ -n "$LATEST_CKPT" ]; then
+            echo "  Resuming from checkpoint: $LATEST_CKPT"
+            RESUME_FLAG="--start_checkpoint $LATEST_CKPT"
+        fi
+    fi
+    
     CUDA_VISIBLE_DEVICES=$GPU_ID python train.py \
         -s $SCENE_PATH \
         -m $OUTPUT_DIR/$SCENE_NAME \
         --use_wandb \
         --wandb_project "bts-digital-twin-kaggle" \
-        --iterations 30000 > $OUTPUT_DIR/${SCENE_NAME}_train.log 2>&1
+        --iterations 30000 \
+        --lambda_dssim 0.4 \
+        --densify_grad_threshold 0.00015 \
+        --checkpoint_iterations 7000 15000 30000 \
+        $RESUME_FLAG > $OUTPUT_DIR/${SCENE_NAME}_train.log 2>&1
         
     echo "Finished training $SCENE_NAME, generating test poses..."
     CUDA_VISIBLE_DEVICES=$GPU_ID python render.py \

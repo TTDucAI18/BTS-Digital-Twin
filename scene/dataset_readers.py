@@ -178,18 +178,28 @@ def readKaggleTestCameras(test_poses_file):
     return cam_infos
 
 def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+    # Auto-detect BTS/Kaggle nested structure: scene_root/train/{images,sparse}
+    # vs standard 3DGS structure: source_path/{images,sparse}
+    if os.path.exists(os.path.join(path, "train", "sparse")):
+        train_root = os.path.join(path, "train")
+        scene_root = path
+        print(f"[INFO] Detected BTS/Kaggle nested structure. train_root={train_root}")
+    else:
+        train_root = path
+        scene_root = path
+
     try:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+        cameras_extrinsic_file = os.path.join(train_root, "sparse/0", "images.bin")
+        cameras_intrinsic_file = os.path.join(train_root, "sparse/0", "cameras.bin")
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
     except:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
+        cameras_extrinsic_file = os.path.join(train_root, "sparse/0", "images.txt")
+        cameras_intrinsic_file = os.path.join(train_root, "sparse/0", "cameras.txt")
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    depth_params_file = os.path.join(path, "sparse/0", "depth_params.json")
+    depth_params_file = os.path.join(train_root, "sparse/0", "depth_params.json")
     ## if depth_params_file isnt there AND depths file is here -> throw error
     depths_params = None
     if depths != "":
@@ -220,7 +230,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             cam_names = sorted(cam_names)
             test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
         else:
-            with open(os.path.join(path, "sparse/0", "test.txt"), 'r') as file:
+            with open(os.path.join(train_root, "sparse/0", "test.txt"), 'r') as file:
                 test_cam_names_list = [line.strip() for line in file]
     else:
         test_cam_names_list = []
@@ -228,22 +238,24 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     reading_dir = "images" if images == None else images
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
-        images_folder=os.path.join(path, reading_dir), 
-        depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
+        images_folder=os.path.join(train_root, reading_dir), 
+        depths_folder=os.path.join(train_root, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     test_cam_infos = [c for c in cam_infos if c.is_test]
     
-    test_poses_path = os.path.join(path, "test", "test_poses.csv")
+    test_poses_path = os.path.join(scene_root, "test", "test_poses.csv")
     kaggle_test_cams = readKaggleTestCameras(test_poses_path)
+    if kaggle_test_cams:
+        print(f"[INFO] Loaded {len(kaggle_test_cams)} test poses from {test_poses_path}")
     test_cam_infos.extend(kaggle_test_cams)
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    ply_path = os.path.join(train_root, "sparse/0/points3D.ply")
+    bin_path = os.path.join(train_root, "sparse/0/points3D.bin")
+    txt_path = os.path.join(train_root, "sparse/0/points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:

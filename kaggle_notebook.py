@@ -126,14 +126,19 @@ REPO_DIR   = "/kaggle/working/BTS-Digital-Twin"
 OUTPUT_DIR = "/kaggle/working/output"
 ITERATIONS = 30000
 
-# Tự động lấy tên tài khoản (username) hiện tại thay vì default_entity để tránh ghi nhầm vào "models"
+# Ưu tiên sử dụng entity (team) "ai_race" nếu tài khoản có quyền truy cập, nếu không dùng username
 import wandb
 try:
-    WANDB_ENTITY = wandb.Api().viewer.username
-    print(f"✅ Đã nhận diện WandB Username: {WANDB_ENTITY}")
+    viewer = wandb.Api().viewer
+    teams = [t for t in getattr(viewer, 'teams', [])]
+    if 'ai_race' in teams or viewer.username == 'ai_race':
+        WANDB_ENTITY = 'ai_race'
+    else:
+        WANDB_ENTITY = viewer.username
+    print(f"✅ Đã chốt WandB Entity: {WANDB_ENTITY}")
 except:
-    WANDB_ENTITY = "ttducpslnbg"
-    print(f"⚠️ Không thể lấy username, dùng mặc định: {WANDB_ENTITY}")
+    WANDB_ENTITY = "ai_race"
+    print(f"⚠️ Không thể lấy thông tin, ép dùng mặc định: {WANDB_ENTITY}")
 
 def train_scene(scene_path: str, gpu_id: int) -> str:
     scene_name = os.path.basename(scene_path)
@@ -152,7 +157,7 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         f"-s {scene_path} "
         f"-m {scene_out} "
         f"--use_wandb "
-        f"--wandb_project ai_race "
+        f"--wandb_project bts-digital-twin "
         f"--wandb_entity {WANDB_ENTITY} "
         f"--iterations {ITERATIONS} "
         f"--lambda_dssim 0.4 "

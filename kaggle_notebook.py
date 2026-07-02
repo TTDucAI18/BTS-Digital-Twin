@@ -126,14 +126,14 @@ REPO_DIR   = "/kaggle/working/BTS-Digital-Twin"
 OUTPUT_DIR = "/kaggle/working/output"
 ITERATIONS = 30000
 
-# Tự động lấy default entity của tài khoản để tránh lỗi "entity not specified"
+# Tự động lấy tên tài khoản (username) hiện tại thay vì default_entity để tránh ghi nhầm vào "models"
 import wandb
 try:
-    WANDB_ENTITY = wandb.Api().default_entity
-    print(f"✅ Đã nhận diện WandB Entity: {WANDB_ENTITY}")
+    WANDB_ENTITY = wandb.Api().viewer.username
+    print(f"✅ Đã nhận diện WandB Username: {WANDB_ENTITY}")
 except:
     WANDB_ENTITY = "ttducpslnbg"
-    print(f"⚠️ Không thể lấy default entity, dùng mặc định: {WANDB_ENTITY}")
+    print(f"⚠️ Không thể lấy username, dùng mặc định: {WANDB_ENTITY}")
 
 def train_scene(scene_path: str, gpu_id: int) -> str:
     scene_name = os.path.basename(scene_path)

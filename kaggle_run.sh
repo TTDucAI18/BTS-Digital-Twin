@@ -14,6 +14,9 @@ pip install plyfile tqdm wandb opencv-python
 pip install -e submodules/diff-gaussian-rasterization
 pip install -e submodules/simple-knn
 
+echo "[3.5] Logging into Weights & Biases..."
+wandb login 
+
 echo "[4] Starting Multi-GPU Training (Data distribution)..."
 DATA_DIR="/kaggle/input/bts-digital-twin-phase1/phase1"
 OUTPUT_DIR="/kaggle/working/output"

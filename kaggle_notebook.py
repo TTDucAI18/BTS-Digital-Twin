@@ -24,16 +24,11 @@ run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CELL 2 — Sync PyTorch với NVCC của Kaggle (tránh CUDA compilation trap)
+# CELL 2 — (Đã xoá: Không cài lại PyTorch để tránh lỗi mismatch với Kaggle NVCC 12.x)
 # ─────────────────────────────────────────────────────────────────────────────
 print("=" * 60)
-print("Re-installing PyTorch cu118 to match Kaggle NVCC...")
+print("Sử dụng PyTorch mặc định của Kaggle để đảm bảo khớp với NVCC...")
 print("=" * 60)
-run(
-    "pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 torchaudio==2.1.2+cu118 "
-    "--index-url https://download.pytorch.org/whl/cu118 --force-reinstall -q"
-)
-run("python -c \"import torch; print('PyTorch OK:', torch.__version__, '| CUDA:', torch.version.cuda)\"")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,8 +60,8 @@ print("=" * 60)
 print("Installing Python dependencies & submodules...")
 print("=" * 60)
 
-# Base deps
-run("pip install plyfile tqdm wandb opencv-python -q")
+# Base deps (Bắt buộc dùng setuptools < 70 để tránh lỗi distutils khi compile CUDA)
+run("pip install plyfile tqdm wandb opencv-python ninja \"setuptools<70.0.0\"")
 
 # Compile submodules
 for submod in [
@@ -75,7 +70,7 @@ for submod in [
     "submodules/fused-ssim",
 ]:
     print(f"\n[Building] {submod} ...")
-    rc = run(f"pip install -e {submod} -q", cwd=REPO_DIR)
+    rc = run(f"pip install -e {submod}", cwd=REPO_DIR)
     status = "✅ OK" if rc == 0 else "❌ FAILED"
     print(f"  → {status}")
 

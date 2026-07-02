@@ -126,6 +126,11 @@ REPO_DIR   = "/kaggle/working/BTS-Digital-Twin"
 OUTPUT_DIR = "/kaggle/working/output"
 ITERATIONS = 30000
 
+# ĐƯỜNG DẪN TỚI CHECKPOINT TỪ KAGGLE INPUT (nếu có). 
+# Ví dụ: "/kaggle/input/my-models-dataset" (bên trong phải chứa các thư mục con mang tên scene như HCM0193, hcm0031...)
+# Bỏ trống "" nếu chỉ muốn tự động resume từ output hiện tại.
+INPUT_CHECKPOINT_DIR = ""
+
 # Ưu tiên sử dụng entity (team) "ai_race" nếu tài khoản có quyền truy cập, nếu không dùng username
 import wandb
 try:
@@ -146,11 +151,18 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
     log_file   = f"{OUTPUT_DIR}/{scene_name}_train.log"
     os.makedirs(scene_out, exist_ok=True)
 
-    # Auto-resume: tìm checkpoint mới nhất
-    ckpts = sorted(glob.glob(f"{scene_out}/chkpnt*.pth"))
+    # Auto-resume: Ưu tiên lấy từ INPUT_CHECKPOINT_DIR trước, nếu không có thì lấy từ thư mục output hiện tại
+    ckpts = []
+    if INPUT_CHECKPOINT_DIR and os.path.exists(f"{INPUT_CHECKPOINT_DIR}/{scene_name}"):
+        ckpts = sorted(glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth"))
+        
+    if not ckpts:
+        ckpts = sorted(glob.glob(f"{scene_out}/chkpnt*.pth"))
+        
     resume_flag = f"--start_checkpoint {ckpts[-1]}" if ckpts else ""
     if resume_flag:
-        print(f"  [{scene_name}] Resuming from {os.path.basename(ckpts[-1])}")
+        source = "INPUT" if INPUT_CHECKPOINT_DIR and os.path.exists(f"{INPUT_CHECKPOINT_DIR}/{scene_name}") and ckpts[-1].startswith(INPUT_CHECKPOINT_DIR) else "OUTPUT"
+        print(f"  [{scene_name}] Resuming from {os.path.basename(ckpts[-1])} ({source})")
 
     cmd = (
         f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/train.py "

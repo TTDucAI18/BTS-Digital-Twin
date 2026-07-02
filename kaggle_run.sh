@@ -15,12 +15,7 @@ pip install -e submodules/diff-gaussian-rasterization
 pip install -e submodules/simple-knn
 
 echo "[3.5] Logging into Weights & Biases..."
-# Use Kaggle Secrets: Add WANDB_API_KEY in Kaggle > Add-ons > Secrets
-if [ -n "$WANDB_API_KEY" ]; then
-    wandb login $WANDB_API_KEY
-else
-    echo "Warning: WANDB_API_KEY not set. Add it via Kaggle Secrets. Skipping WandB login."
-fi
+wandb login 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
 
 echo "[4] Starting Multi-GPU Training (Data distribution)..."
 DATA_DIR="/kaggle/input/bts-digital-twin-phase1/phase1"

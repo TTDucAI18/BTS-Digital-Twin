@@ -207,20 +207,34 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
     return scene_name, result.returncode
 
 
-# Chạy song song: mỗi cặp 2 scenes trên 2 GPU
+import queue
+
+# Chạy song song: quản lý GPU linh hoạt bằng Queue
 print("=" * 60)
 print(f"Starting training for {len(all_scenes)} scenes on 2x GPU T4...")
 print("=" * 60)
 
+gpu_queue = queue.Queue()
+gpu_queue.put(0)
+gpu_queue.put(1)
+
+def train_scene_wrapper(scene_path):
+    gpu_id = gpu_queue.get()
+    try:
+        return train_scene(scene_path, gpu_id)
+    finally:
+        gpu_queue.put(gpu_id)
+
 with ThreadPoolExecutor(max_workers=2) as executor:
     futures = {
-        executor.submit(train_scene, scene, i % 2): scene
-        for i, scene in enumerate(all_scenes)
+        executor.submit(train_scene_wrapper, scene): scene
+        for scene in all_scenes
     }
     for future in as_completed(futures):
         scene_name, rc = future.result()
 
 print("\nAll training jobs completed!")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,15 +276,28 @@ print("=" * 60)
 print("Rendering test views for all scenes...")
 print("=" * 60)
 
+# Khởi tạo lại queue cho quá trình render
+render_gpu_queue = queue.Queue()
+render_gpu_queue.put(0)
+render_gpu_queue.put(1)
+
+def render_scene_wrapper(scene_path):
+    gpu_id = render_gpu_queue.get()
+    try:
+        return render_scene(scene_path, gpu_id)
+    finally:
+        render_gpu_queue.put(gpu_id)
+
 with ThreadPoolExecutor(max_workers=2) as executor:
     futures = {
-        executor.submit(render_scene, scene, i % 2): scene
-        for i, scene in enumerate(all_scenes)
+        executor.submit(render_scene_wrapper, scene): scene
+        for scene in all_scenes
     }
     for future in as_completed(futures):
         scene_name, rc = future.result()
 
 print("\nAll renders completed!")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

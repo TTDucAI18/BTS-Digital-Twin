@@ -151,13 +151,20 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
     log_file   = f"{OUTPUT_DIR}/{scene_name}_train.log"
     os.makedirs(scene_out, exist_ok=True)
 
+    # Hàm phụ để lấy số iteration từ tên file (ví dụ: chkpnt15000.pth -> 15000)
+    def get_iter_from_ckpt(ckpt_path):
+        try:
+            return int(os.path.basename(ckpt_path).replace("chkpnt", "").replace(".pth", ""))
+        except:
+            return 0
+
     # Auto-resume: Ưu tiên lấy từ INPUT_CHECKPOINT_DIR trước, nếu không có thì lấy từ thư mục output hiện tại
     ckpts = []
     if INPUT_CHECKPOINT_DIR and os.path.exists(f"{INPUT_CHECKPOINT_DIR}/{scene_name}"):
-        ckpts = sorted(glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth"))
+        ckpts = sorted(glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth"), key=get_iter_from_ckpt)
         
     if not ckpts:
-        ckpts = sorted(glob.glob(f"{scene_out}/chkpnt*.pth"))
+        ckpts = sorted(glob.glob(f"{scene_out}/chkpnt*.pth"), key=get_iter_from_ckpt)
         
     resume_flag = f"--start_checkpoint {ckpts[-1]}" if ckpts else ""
     if resume_flag:

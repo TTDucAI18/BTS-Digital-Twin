@@ -52,11 +52,11 @@ for submod in [
 import glob
 
 # [1] THƯ MỤC CHỨA ẢNH GỐC & TEST POSES
-DATA_DIR = "/kaggle/input/datasets/tdukaggle/ai-race-data/phase1"
+DATA_DIR = "/kaggle/input/datasets/tdukaggle/ai-race-data/VAI_NVS_DATA/phase1"
 
 # [2] THƯ MỤC CHỨA CÁC CHECKPOINT ĐÃ TRAIN XONG (Thay đổi tên dataset nếu cần)
 # Ví dụ: Nếu bạn add output của Kaggle training trước đó làm dataset
-CHECKPOINT_DIR = "/kaggle/input/my-models-dataset"
+CHECKPOINT_DIR = "/kaggle/input/datasets/tdukaggle/ai-race-data"
 
 print("=" * 60)
 print("Đang tìm kiếm checkpoints...")
@@ -109,6 +109,7 @@ def eval_worker(ckpt):
             f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/evaluate_checkpoint.py "
             f"--checkpoint \"{ckpt}\" "
             f"--data_root \"{DATA_DIR}\" "
+            f"--save_renders_dir \"/kaggle/working/eval_renders\" "
         )
         
         # Bỏ capture_output để in trực tiếp tiến trình (realtime) ra màn hình
@@ -130,3 +131,73 @@ if final_checkpoints:
 print("\n" + "=" * 60)
 print("✅ HOÀN THÀNH QUÁ TRÌNH ĐÁNH GIÁ TẤT CẢ CHECKPOINTS")
 print("=" * 60)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CELL 3 — Trực quan hoá kết quả (Visualization)
+# ─────────────────────────────────────────────────────────────────────────────
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import random
+
+RENDERS_DIR = "/kaggle/working/eval_renders"
+
+if not os.path.exists(RENDERS_DIR):
+    print(f"⚠️ Chưa có ảnh render nào trong {RENDERS_DIR}. Hãy chắc chắn rằng bạn đã chạy Cell 2 thành công.")
+else:
+    print("=" * 60)
+    print("Trực quan hoá kết quả (Ground Truth vs Render)...")
+    print("=" * 60)
+    
+    scenes = [d for d in os.listdir(RENDERS_DIR) if os.path.isdir(os.path.join(RENDERS_DIR, d))]
+    if not scenes:
+        print(f"⚠️ Không tìm thấy scene nào trong {RENDERS_DIR}.")
+    else:
+        for scene in scenes:
+            scene_render_dir = os.path.join(RENDERS_DIR, scene)
+            
+            # Lấy danh sách ảnh render
+            images = [img for img in os.listdir(scene_render_dir) if img.lower().endswith((".png", ".jpg", ".jpeg"))]
+            if not images: continue
+            
+            # Chọn ngẫu nhiên tối đa 2 ảnh để hiển thị cho mỗi scene
+            num_samples = min(2, len(images))
+            sample_images = random.sample(images, num_samples)
+            
+            # Xử lý subplot dimensions
+            fig, axes = plt.subplots(num_samples, 2, figsize=(16, 6 * num_samples))
+            fig.suptitle(f"SCENE: {scene.upper()}", fontsize=18, fontweight="bold", y=1.02)
+            
+            for i, img_name in enumerate(sample_images):
+                render_path = os.path.join(scene_render_dir, img_name)
+                
+                # Tìm đường dẫn ảnh Ground Truth tương ứng
+                gt_path = None
+                for d in os.listdir(DATA_DIR):
+                    if d.lower() == scene.lower():
+                        gt_path = os.path.join(DATA_DIR, d, "test", "images", img_name)
+                        break
+                
+                # Xử lý indexing cho array axes (1D vs 2D)
+                if num_samples == 1:
+                    ax_gt = axes[0]
+                    ax_render = axes[1]
+                else:
+                    ax_gt = axes[i, 0]
+                    ax_render = axes[i, 1]
+                
+                # Plot Ground Truth
+                if gt_path and os.path.exists(gt_path):
+                    ax_gt.imshow(mpimg.imread(gt_path))
+                else:
+                    ax_gt.text(0.5, 0.5, 'GT Missing', horizontalalignment='center', verticalalignment='center', fontsize=20)
+                ax_gt.set_title(f"Ground Truth ({img_name})", fontsize=14)
+                ax_gt.axis("off")
+                
+                # Plot Render Output
+                ax_render.imshow(mpimg.imread(render_path))
+                ax_render.set_title(f"3DGS Render ({img_name})", fontsize=14)
+                ax_render.axis("off")
+                
+            plt.tight_layout()
+            plt.show()

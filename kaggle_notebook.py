@@ -117,9 +117,9 @@ print(f"Total: {len(all_scenes)} scenes")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CELL 7 — Chạy Training Multi-GPU (scene chẵn → GPU 0, scene lẻ → GPU 1)
+# CELL 7 — Chạy Training Multi-GPU (queue-based: scene nào xong sớm thì GPU đó nhận scene tiếp)
 # ─────────────────────────────────────────────────────────────────────────────
-import subprocess
+import subprocess, queue, shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REPO_DIR   = "/kaggle/working/BTS-Digital-Twin"
@@ -130,6 +130,67 @@ ITERATIONS = 30000
 # Ví dụ: "/kaggle/input/my-models-dataset" (bên trong phải chứa các thư mục con mang tên scene như HCM0193, hcm0031...)
 # Bỏ trống "" nếu chỉ muốn tự động resume từ output hiện tại.
 INPUT_CHECKPOINT_DIR = ""
+
+def check_disk_space(label: str = ""):
+    """In dung lượng còn trống trên /kaggle/working."""
+    import shutil as _sh
+    total, used, free = _sh.disk_usage("/kaggle/working")
+    free_gb  = free  / (1024 ** 3)
+    total_gb = total / (1024 ** 3)
+    tag = f"[{label}] " if label else ""
+    flag = "⚠️ LOW DISK" if free_gb < 3 else "💾"
+    print(f"  {flag} {tag}Disk: {free_gb:.1f} GB free / {total_gb:.1f} GB total")
+    return free_gb
+
+def cleanup_after_train(scene_out: str, scene_name: str):
+    """Giải phóng disk sau khi train xong một scene:
+    - Xoá checkpoint trung gian (giữ lại chkpnt30000.pth)
+    - Xoá thư mục point_cloud của các iteration cũ (giữ lại iteration_30000)
+    """
+    freed = 0
+
+    # 1. Xoá checkpoint trung gian
+    keep_ckpt = f"{scene_out}/chkpnt{ITERATIONS}.pth"
+    for ckpt in glob.glob(f"{scene_out}/chkpnt*.pth"):
+        if ckpt != keep_ckpt:
+            try:
+                size = os.path.getsize(ckpt)
+                os.remove(ckpt)
+                freed += size
+                print(f"    🗑  Removed checkpoint: {os.path.basename(ckpt)}")
+            except Exception as e:
+                print(f"    ⚠️  Could not remove {ckpt}: {e}")
+
+    # 2. Xoá point_cloud của iteration cũ (giữ lại iteration_30000)
+    pc_base = f"{scene_out}/point_cloud"
+    keep_iter = f"iteration_{ITERATIONS}"
+    if os.path.isdir(pc_base):
+        for iter_dir in os.listdir(pc_base):
+            if iter_dir != keep_iter:
+                full = os.path.join(pc_base, iter_dir)
+                try:
+                    size = sum(os.path.getsize(os.path.join(dp, f))
+                               for dp, _, fs in os.walk(full) for f in fs)
+                    shutil.rmtree(full)
+                    freed += size
+                    print(f"    🗑  Removed old PLY dir: point_cloud/{iter_dir}")
+                except Exception as e:
+                    print(f"    ⚠️  Could not remove {full}: {e}")
+
+    print(f"  [{scene_name}] 🧹 Cleanup freed: {freed / (1024**3):.2f} GB")
+    check_disk_space(scene_name)
+
+def is_valid_checkpoint(path: str) -> bool:
+    """Kiểm tra checkpoint có phải ZIP hợp lệ không (PyTorch .pth là zip archive).
+    File bị truncate do disk-full sẽ thiếu magic bytes và central directory.
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(path, 'r') as zf:
+            bad = zf.testzip()  # None nếu tất cả OK
+            return bad is None
+    except (zipfile.BadZipFile, EOFError, OSError):
+        return False
 
 # Ưu tiên sử dụng entity (team) "ai_race" nếu tài khoản có quyền truy cập, nếu không dùng username
 import wandb
@@ -151,27 +212,105 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
     log_file   = f"{OUTPUT_DIR}/{scene_name}_train.log"
     os.makedirs(scene_out, exist_ok=True)
 
-    # Hàm phụ để lấy số iteration từ tên file (ví dụ: chkpnt15000.pth -> 15000)
+    # Skip nếu đã train xong (point_cloud.ply tồn tại)
+    final_ply = f"{scene_out}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
+    if os.path.exists(final_ply):
+        print(f"  ✅ [{scene_name}] Already trained (point_cloud.ply found) — skipping")
+        return scene_name, 0
+
+    # Hàm phụ để lấy số iteration từ tên file
+    # Hỗ trợ 2 format:
+    #   - Chuẩn:  chkpnt7000.pth
+    #   - Flat:   chkpnt7000_hcm0181.pth  (tên file có scene name)
     def get_iter_from_ckpt(ckpt_path):
         try:
-            return int(os.path.basename(ckpt_path).replace("chkpnt", "").replace(".pth", ""))
+            name = os.path.basename(ckpt_path).replace("chkpnt", "").replace(".pth", "")
+            # Nếu có hậu tố _scenename thì bỏ phần đó đi: "7000_hcm0181" → "7000"
+            name = name.split("_")[0]
+            return int(name)
         except:
             return 0
 
-    # Auto-resume: Ưu tiên lấy từ INPUT_CHECKPOINT_DIR trước, nếu không có thì lấy từ thư mục output hiện tại
+    # Auto-resume: tìm checkpoint theo thứ tự ưu tiên
     ckpts = []
-    if INPUT_CHECKPOINT_DIR and os.path.exists(f"{INPUT_CHECKPOINT_DIR}/{scene_name}"):
-        ckpts = sorted(glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth"), key=get_iter_from_ckpt)
+
+    if INPUT_CHECKPOINT_DIR:
+        # Ưu tiên 1: subfolder chuẩn → INPUT_CHECKPOINT_DIR/HCM0181/chkpnt*.pth
+        subdir_ckpts = sorted(
+            glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth"),
+            key=get_iter_from_ckpt
+        )
+
+        # Ưu tiên 2: flat file → INPUT_CHECKPOINT_DIR/chkpnt*_{scene_name}.pth hoặc .lower()
+        # Ví dụ: chkpnt7000_hcm0181.pth hoặc chkpnt15000_HCM0204.pth
+        flat_pattern_exact = f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name}.pth"
+        flat_pattern_lower = f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name.lower()}.pth"
         
+        flat_ckpts = []
+        for p in set(glob.glob(flat_pattern_exact) + glob.glob(flat_pattern_lower)):
+            flat_ckpts.append(p)
+        flat_ckpts = sorted(flat_ckpts, key=get_iter_from_ckpt)
+
+        if subdir_ckpts:
+            ckpts = subdir_ckpts
+            print(f"  [{scene_name}] Found {len(ckpts)} checkpoint(s) in subfolder")
+        elif flat_ckpts:
+            # Copy flat checkpoint → scene_out với tên chuẩn để train.py hiểu
+            import shutil
+            for flat_ckpt in flat_ckpts:
+                iter_num = get_iter_from_ckpt(flat_ckpt)
+                dst = f"{scene_out}/chkpnt{iter_num}.pth"
+                if not os.path.exists(dst):
+                    shutil.copy2(flat_ckpt, dst)
+                    print(f"  [{scene_name}] Copied flat checkpoint: {os.path.basename(flat_ckpt)} → {os.path.basename(dst)}")
+            # Sau khi copy, scan lại scene_out
+            ckpts = sorted(glob.glob(f"{scene_out}/chkpnt*.pth"), key=get_iter_from_ckpt)
+
+    # Fallback: tìm checkpoint đã có sẵn trong scene_out (từ session trước)
     if not ckpts:
         ckpts = sorted(glob.glob(f"{scene_out}/chkpnt*.pth"), key=get_iter_from_ckpt)
-        
+
+    # Lọc bỏ checkpoint bị corrupt (bị cắt ngắn do disk-full session trước)
+    valid_ckpts = []
+    for ckpt in ckpts:
+        if is_valid_checkpoint(ckpt):
+            valid_ckpts.append(ckpt)
+        else:
+            print(f"  ⚠️  [{scene_name}] Corrupt checkpoint detected, removing: {os.path.basename(ckpt)}")
+            try:
+                os.remove(ckpt)
+            except Exception as e:
+                print(f"    Could not remove: {e}")
+    ckpts = valid_ckpts
+
     resume_flag = f"--start_checkpoint {ckpts[-1]}" if ckpts else ""
     if resume_flag:
-        source = "INPUT" if INPUT_CHECKPOINT_DIR and os.path.exists(f"{INPUT_CHECKPOINT_DIR}/{scene_name}") and ckpts[-1].startswith(INPUT_CHECKPOINT_DIR) else "OUTPUT"
-        print(f"  [{scene_name}] Resuming from {os.path.basename(ckpts[-1])} ({source})")
+        iter_num = get_iter_from_ckpt(ckpts[-1])
+        remaining = ITERATIONS - iter_num
 
+        # Nếu checkpoint đã ở đúng iteration cuối → coi như xong, skip training
+        if iter_num >= ITERATIONS:
+            if os.path.exists(final_ply):
+                print(f"  ✅ [{scene_name}] Checkpoint @ iter {iter_num} + point_cloud.ply found — skipping")
+            else:
+                print(f"  ⚠️  [{scene_name}] Checkpoint @ iter {iter_num} found but point_cloud.ply MISSING")
+                print(f"       → Training sẽ chạy 0 iters, nhưng point_cloud.ply sẽ không được tạo tự động")
+                print(f"       → Cần chạy render để dùng checkpoint này trực tiếp, hoặc xoá checkpoint để train lại")
+            return scene_name, 0
+
+        print(f"  [{scene_name}] Resuming from iter {iter_num} → còn {remaining} iters nữa")
+    else:
+        print(f"  [{scene_name}] No checkpoint found — training from scratch")
+
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True giảm fragmentation VRAM
+    # -r 2: downscale x2 để giảm VRAM rasterization (full res dùng 4x VRAM)
+    # --densify_until_iter 12000: dừng tạo Gaussians sớm → giới hạn tổng số splats
+    # --densify_grad_threshold 0.0002: ngưỡng gốc, 0.00015 tạo quá nhiều splats → OOM
+    # NOTE: Chỉ lưu checkpoint tại 15000 và 30000 để tiết kiệm disk (Kaggle ~20GB limit)
+    check_disk_space(scene_name)
+    env_prefix = "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
     cmd = (
+        f"{env_prefix}"
         f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/train.py "
         f"-s {scene_path} "
         f"-m {scene_out} "
@@ -182,7 +321,8 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         f"--iterations {ITERATIONS} "
         f"--lambda_dssim 0.4 "
         f"--densify_grad_threshold 0.0002 "
-        f"--checkpoint_iterations 7000 15000 30000 "
+        f"--densify_until_iter 12000 "
+        f"--checkpoint_iterations 15000 30000 "
         f"--disable_viewer "
         f"{resume_flag}"
     )
@@ -203,13 +343,14 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         except Exception as e:
             print(f"Could not read log: {e}")
         print("=" * 60 + "\n")
+    else:
+        # Cleanup intermediate files để giải phóng disk sau khi train thành công
+        cleanup_after_train(scene_out, scene_name)
         
     return scene_name, result.returncode
 
 
-import queue
-
-# Chạy song song: quản lý GPU linh hoạt bằng Queue
+# Chạy song song: queue-based GPU scheduler (GPU nào rảnh sẽ nhận scene tiếp theo)
 print("=" * 60)
 print(f"Starting training for {len(all_scenes)} scenes on 2x GPU T4...")
 print("=" * 60)
@@ -219,11 +360,11 @@ gpu_queue.put(0)
 gpu_queue.put(1)
 
 def train_scene_wrapper(scene_path):
-    gpu_id = gpu_queue.get()
+    gpu_id = gpu_queue.get()  # block cho đến khi có GPU rảnh
     try:
         return train_scene(scene_path, gpu_id)
     finally:
-        gpu_queue.put(gpu_id)
+        gpu_queue.put(gpu_id)  # trả GPU về queue sau khi xong
 
 with ThreadPoolExecutor(max_workers=2) as executor:
     futures = {
@@ -247,10 +388,17 @@ def render_scene(scene_path: str, gpu_id: int) -> str:
 
     cmd = (
         f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/render.py "
+        f"-s {scene_path} "
         f"-m {scene_out} "
         f"--skip_train "
         f"--iteration {ITERATIONS}"
     )
+
+    # Kiểm tra point_cloud.ply tồn tại trước khi render để tránh crash
+    ply_path = f"{scene_out}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
+    if not os.path.exists(ply_path):
+        print(f"  ⚠️  [{scene_name}] Skipping render — point_cloud.ply not found (training incomplete?): {ply_path}")
+        return scene_name, 1
 
     print(f"🎨 Rendering [{scene_name}] on GPU {gpu_id} ...")
     with open(log_file, "w") as lf:
@@ -275,6 +423,24 @@ def render_scene(scene_path: str, gpu_id: int) -> str:
 print("=" * 60)
 print("Rendering test views for all scenes...")
 print("=" * 60)
+
+# Kiểm tra trạng thái training trước khi render
+print("\n📊 Training status check:")
+trained_scenes = []
+failed_scenes = []
+for scene_path in all_scenes:
+    scene_name = os.path.basename(scene_path)
+    ply_path = f"{OUTPUT_DIR}/{scene_name}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
+    if os.path.exists(ply_path):
+        print(f"  ✅ [{scene_name}] point_cloud.ply found")
+        trained_scenes.append(scene_path)
+    else:
+        print(f"  ❌ [{scene_name}] point_cloud.ply MISSING — will skip render")
+        failed_scenes.append(scene_name)
+
+print(f"\n  → {len(trained_scenes)}/{len(all_scenes)} scenes ready to render")
+if failed_scenes:
+    print(f"  → Skipping: {failed_scenes}")
 
 # Khởi tạo lại queue cho quá trình render
 render_gpu_queue = queue.Queue()

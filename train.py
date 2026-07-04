@@ -10,6 +10,7 @@
 #
 
 import os
+import glob as _glob
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -52,8 +53,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+        # weights_only=False: required for checkpoints containing numpy scalars (optimizer states)
+        # Compatible with PyTorch >= 2.6 where default changed from False to True
+        try:
+            (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
+        except (RuntimeError, Exception) as e:
+            print(f"[ERROR] Failed to load checkpoint '{checkpoint}': {e}")
+            print(f"[ERROR] Checkpoint may be corrupted (e.g. truncated by disk-full). Training from scratch.")
+            first_iter = 0
+            # Re-initialize gaussians without checkpoint
+            gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+            scene = Scene(dataset, gaussians)
+            gaussians.training_setup(opt)
+        else:
+            gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -205,8 +218,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
+                new_ckpt_path = scene.model_path + "/chkpnt" + str(iteration) + ".pth"
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                torch.save((gaussians.capture(), iteration), new_ckpt_path)
+                # Disk cleanup: xóa tất cả checkpoint cũ hơn, chỉ giữ 1 checkpoint mới nhất
+                # Giúp tiết kiệm disk trong giới hạn 20GB của Kaggle
+                def _ckpt_iter(p):
+                    try:
+                        return int(os.path.basename(p).replace("chkpnt", "").replace(".pth", ""))
+                    except:
+                        return 0
+                all_ckpts = sorted(_glob.glob(os.path.join(scene.model_path, "chkpnt*.pth")), key=_ckpt_iter)
+                for old_ckpt in all_ckpts:
+                    if old_ckpt != new_ckpt_path:
+                        try:
+                            os.remove(old_ckpt)
+                            print("[ITER {}] Deleted old checkpoint: {}".format(iteration, os.path.basename(old_ckpt)))
+                        except Exception as e:
+                            print("[ITER {}] Could not delete {}: {}".format(iteration, os.path.basename(old_ckpt), e))
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

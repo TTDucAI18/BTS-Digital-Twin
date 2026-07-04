@@ -62,12 +62,29 @@ print("=" * 60)
 print("Đang tìm kiếm checkpoints...")
 print("=" * 60)
 
+import glob
+import zipfile
+
+def is_valid_checkpoint(path):
+    """Kiểm tra file .pth có phải là ZIP hợp lệ không (tránh lỗi PytorchStreamReader)"""
+    try:
+        with zipfile.ZipFile(path) as z:
+            return z.testzip() is None
+    except:
+        return False
+
 # Tìm tất cả file .pth
 checkpoints = glob.glob(f"{CHECKPOINT_DIR}/**/*.pth", recursive=True)
 
-# Lọc chỉ lấy checkpoint cuối cùng (VD: chkpnt30000.pth hoặc chkpnt30000_hcm0181.pth)
-# Tự động loại bỏ các checkpoint trung gian để đánh giá cho nhanh
-final_checkpoints = [ckpt for ckpt in checkpoints if "30000" in os.path.basename(ckpt)]
+# Lọc checkpoint và kiểm tra tính toàn vẹn (loại bỏ các file bị corrupt)
+# Tùy chỉnh chuỗi nhận diện nếu bạn muốn lấy chkpnt25000 thay vì 30000
+final_checkpoints = []
+for ckpt in checkpoints:
+    if "30000" in os.path.basename(ckpt) or "25000" in os.path.basename(ckpt):
+        if is_valid_checkpoint(ckpt):
+            final_checkpoints.append(ckpt)
+        else:
+            print(f"❌ CẢNH BÁO: Checkpoint bị lỗi (corrupted) - bỏ qua: {ckpt}")
 
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed

@@ -157,9 +157,27 @@ def cleanup_after_train(scene_out: str, scene_name: str):
                 size = os.path.getsize(ckpt)
                 os.remove(ckpt)
                 freed += size
-                print(f"    🗑  Removed checkpoint: {os.path.basename(ckpt)}")
+                print(f"    🗑  Removed intermediate checkpoint: {os.path.basename(ckpt)}")
             except Exception as e:
                 print(f"    ⚠️  Could not remove {ckpt}: {e}")
+
+    # Xóa file Tensorboard logs (nếu vô tình sinh ra)
+    for tfevent in glob.glob(f"{scene_out}/events.out.tfevents*"):
+        try:
+            size = os.path.getsize(tfevent)
+            os.remove(tfevent)
+            freed += size
+        except: pass
+        
+    # Xoá bớt thư mục offline run của wandb để nhẹ máy
+    wandb_dir = "/kaggle/working/wandb"
+    if os.path.exists(wandb_dir):
+        for run_dir in os.listdir(wandb_dir):
+            if run_dir.startswith("run-") or run_dir.startswith("offline-"):
+                try:
+                    full_p = os.path.join(wandb_dir, run_dir)
+                    shutil.rmtree(full_p)
+                except: pass
 
     # 2. Xoá point_cloud của iteration cũ (giữ lại iteration_30000)
     pc_base = f"{scene_out}/point_cloud"
@@ -306,7 +324,7 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
     # -r 2: downscale x2 để giảm VRAM rasterization (full res dùng 4x VRAM)
     # --densify_until_iter 12000: dừng tạo Gaussians sớm → giới hạn tổng số splats
     # --densify_grad_threshold 0.0002: ngưỡng gốc, 0.00015 tạo quá nhiều splats → OOM
-    # NOTE: Chỉ lưu checkpoint tại 15000 và 30000 để tiết kiệm disk (Kaggle ~20GB limit)
+    # NOTE: Chỉ lưu checkpoint tại 30000 để tiết kiệm disk (Kaggle ~20GB limit)
     check_disk_space(scene_name)
     env_prefix = "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
     cmd = (
@@ -322,7 +340,7 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         f"--lambda_dssim 0.4 "
         f"--densify_grad_threshold 0.0002 "
         f"--densify_until_iter 12000 "
-        f"--checkpoint_iterations 15000 30000 "
+        f"--checkpoint_iterations 30000 "
         f"--save_iterations 30000 "
         f"--disable_viewer "
         f"{resume_flag}"

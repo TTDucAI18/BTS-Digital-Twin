@@ -103,40 +103,43 @@ def main():
     
     print(f"[*] Bắt đầu render và tính toán metrics cho {len(test_cameras)} góc nhìn test...")
     
-    for view in tqdm(test_cameras, desc="Evaluation"):
-        # Đọc ảnh ground-truth test
-        gt_path = os.path.join(test_images_dir, view.image_name)
-        if not os.path.exists(gt_path):
-            print(f"  [!] GT image missing: {gt_path}, bỏ qua.")
-            continue
+    with torch.no_grad():
+        for view in tqdm(test_cameras, desc="Evaluation"):
+            # Đọc ảnh ground-truth test
+            gt_path = os.path.join(test_images_dir, view.image_name)
+            if not os.path.exists(gt_path):
+                print(f"  [!] GT image missing: {gt_path}, bỏ qua.")
+                continue
+                
+            gt_img = Image.open(gt_path).convert("RGB")
+            gt_tensor = tf.to_tensor(gt_img).unsqueeze(0).cuda() # (1, 3, H, W)
             
-        gt_img = Image.open(gt_path).convert("RGB")
-        gt_tensor = tf.to_tensor(gt_img).unsqueeze(0).cuda() # (1, 3, H, W)
-        
-        # Render
-        render_pkg = render(view, gaussians, pipe, background, use_trained_exp=opt.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        render_tensor = render_pkg["render"].unsqueeze(0).clamp(0.0, 1.0) # (1, 3, H, W)
-        
-        # Resize GT nếu chênh lệch (đảm bảo đồng nhất kích thước để tính metrics)
-        if render_tensor.shape[2:] != gt_tensor.shape[2:]:
-            gt_tensor = tf.resize(gt_tensor, render_tensor.shape[2:])
+            # Render
+            render_pkg = render(view, gaussians, pipe, background, use_trained_exp=opt.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+            render_tensor = render_pkg["render"].unsqueeze(0).clamp(0.0, 1.0) # (1, 3, H, W)
             
-        # Lưu ảnh nếu có yêu cầu
-        if args.save_renders_dir is not None:
-            save_dir = os.path.join(args.save_renders_dir, scene_name)
-            os.makedirs(save_dir, exist_ok=True)
-            # torchvision.utils.save_image mong đợi shape (C, H, W)
-            torchvision.utils.save_image(render_tensor[0], os.path.join(save_dir, view.image_name))
+            # Resize GT nếu chênh lệch (đảm bảo đồng nhất kích thước để tính metrics)
+            if render_tensor.shape[2:] != gt_tensor.shape[2:]:
+                gt_tensor = tf.resize(gt_tensor, render_tensor.shape[2:])
+                
+            # Lưu ảnh nếu có yêu cầu
+            if args.save_renders_dir is not None:
+                save_dir = os.path.join(args.save_renders_dir, scene_name)
+                os.makedirs(save_dir, exist_ok=True)
+                # torchvision.utils.save_image mong đợi shape (C, H, W)
+                torchvision.utils.save_image(render_tensor[0], os.path.join(save_dir, view.image_name))
+                
+            # Tính metrics
+            val_ssim = ssim(render_tensor, gt_tensor).item()
+            val_psnr = psnr(render_tensor, gt_tensor).item()
+            val_lpips = lpips(render_tensor, gt_tensor, net_type='vgg').item()
             
-        # Tính metrics
-        val_ssim = ssim(render_tensor, gt_tensor).item()
-        val_psnr = psnr(render_tensor, gt_tensor).item()
-        val_lpips = lpips(render_tensor, gt_tensor, net_type='vgg').item()
-        
-        ssims.append(val_ssim)
-        psnrs.append(val_psnr)
-        lpipss.append(val_lpips)
-        
+            ssims.append(val_ssim)
+            psnrs.append(val_psnr)
+            lpipss.append(val_lpips)
+            
+            torch.cuda.empty_cache()
+            
     if not ssims:
         print("[!] Không tính toán được kết quả cho bất kỳ ảnh nào.")
         sys.exit(1)

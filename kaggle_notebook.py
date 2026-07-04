@@ -323,6 +323,7 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         f"--densify_grad_threshold 0.0002 "
         f"--densify_until_iter 12000 "
         f"--checkpoint_iterations 15000 30000 "
+        f"--save_iterations 30000 "
         f"--disable_viewer "
         f"{resume_flag}"
     )

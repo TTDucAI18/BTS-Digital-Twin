@@ -135,9 +135,15 @@ class GaussianModel:
 
     def get_exposure_from_name(self, image_name):
         if self.pretrained_exposures is None:
-            return self._exposure[self.exposure_mapping[image_name]]
+            if image_name in self.exposure_mapping:
+                return self._exposure[self.exposure_mapping[image_name]]
+            else:
+                return torch.eye(3, 4, device="cuda")
         else:
-            return self.pretrained_exposures[image_name]
+            if image_name in self.pretrained_exposures:
+                return self.pretrained_exposures[image_name]
+            else:
+                return torch.eye(3, 4, device="cuda")
     
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)

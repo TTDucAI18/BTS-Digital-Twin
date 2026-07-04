@@ -16,7 +16,7 @@ from gaussian_renderer import GaussianModel, render
 from utils.loss_utils import ssim
 from utils.image_utils import psnr
 from lpipsPyTorch import lpips
-from arguments import ModelParams, PipelineParams
+from arguments import ModelParams, PipelineParams, OptimizationParams
 
 def find_scene_path(base_dir, scene_name):
     """Tìm thư mục chứa dữ liệu scene (không phân biệt hoa/thường)"""
@@ -36,6 +36,7 @@ def main():
     # Kế thừa các argument mặc định của hệ thống
     lp = ModelParams(parser)
     pp = PipelineParams(parser)
+    op = OptimizationParams(parser)
     args, _ = parser.parse_known_args()
     
     # 1. Trích xuất tên scene từ tên file checkpoint (ví dụ: chkpnt30000_hcm0181.pth -> hcm0181)
@@ -81,7 +82,8 @@ def main():
     try:
         # Load weights_only=False để tương thích với PyTorch 2.6
         (model_params, first_iter) = torch.load(args.checkpoint, weights_only=False)
-        gaussians.restore(model_params, opt)
+        optim_args = op.extract(args)
+        gaussians.restore(model_params, optim_args)
     except Exception as e:
         print(f"[!] Lỗi khi nạp checkpoint: {e}")
         sys.exit(1)

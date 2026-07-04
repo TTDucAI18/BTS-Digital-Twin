@@ -94,14 +94,11 @@ def eval_worker(ckpt):
             f"--data_root \"{DATA_DIR}\" "
         )
         
-        # Bắt output thay vì in realtime để tránh bị rối màn hình khi chạy song song
-        result = subprocess.run(cmd, shell=True, text=True, capture_output=True)
+        # Bỏ capture_output để in trực tiếp tiến trình (realtime) ra màn hình
+        # Kaggle sẽ tự động gộp log của cả 2 GPU (hơi lộn xộn một chút do tqdm, nhưng bù lại bạn thấy được cả 2 đang chạy)
+        subprocess.run(cmd, shell=True)
         
-        output_str = f"\n{'='*60}\n🚀 KẾT QUẢ TỪ [GPU {gpu_id}] CHO CHECKPOINT: {ckpt_name}\n{'='*60}\n"
-        if result.stdout: output_str += result.stdout
-        if result.stderr: output_str += f"\n[LỖI]:\n{result.stderr}"
-        
-        return output_str
+        return f"\n✅ [GPU {gpu_id}] Đã chạy xong: {ckpt_name}"
     finally:
         gpu_queue.put(gpu_id)
 

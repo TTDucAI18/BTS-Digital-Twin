@@ -62,6 +62,7 @@ def main():
     opt.source_path = source_path
     opt.model_path = "./eval_output_temp"
     opt.eval = True
+    opt.data_device = "cpu" # Lưu ảnh gốc vào CPU RAM thay vì VRAM để tránh OOM
     os.makedirs(opt.model_path, exist_ok=True)
     
     pipe = pp.extract(args)

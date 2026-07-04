@@ -61,6 +61,7 @@ def main():
     opt.source_path = source_path
     opt.model_path = "./eval_output_temp"
     opt.eval = True
+    os.makedirs(opt.model_path, exist_ok=True)
     
     pipe = pp.extract(args)
     

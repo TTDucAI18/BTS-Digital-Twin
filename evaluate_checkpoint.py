@@ -2,7 +2,9 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import sys
+import shutil
 import torch
+import torchvision
 import torchvision.transforms.functional as tf
 from PIL import Image
 from tqdm import tqdm
@@ -58,41 +60,45 @@ def main():
         sys.exit(1)
 
     # 3. Khởi tạo cấu hình và model
-    opt = lp.extract(args)
-    opt.source_path = source_path
-    opt.model_path = "./eval_output_temp"
-    opt.eval = True
-    opt.data_device = "cpu" # Lưu ảnh gốc vào CPU RAM thay vì VRAM để tránh OOM
-    os.makedirs(opt.model_path, exist_ok=True)
-    
+    # QUAN TRỌNG: lp.extract() trả về ModelParams, KHÔNG phải OptimizationParams
+    # Đặt tên rõ ràng để tránh nhầm lẫn khi truyền vào gaussians.restore()
+    model_cfg = lp.extract(args)
+    model_cfg.source_path = source_path
+    model_cfg.model_path = "./eval_output_temp"
+    model_cfg.eval = True
+    model_cfg.data_device = "cpu"  # Lưu ảnh gốc vào CPU RAM thay vì VRAM để tránh OOM
+    os.makedirs(model_cfg.model_path, exist_ok=True)
+
     pipe = pp.extract(args)
     
     try:
         from diff_gaussian_rasterization import SparseGaussianAdam
         SPARSE_ADAM_AVAILABLE = True
-    except:
+    except Exception:
         SPARSE_ADAM_AVAILABLE = False
-        
-    optimizer_type = getattr(opt, "optimizer_type", "default")
-    gaussians = GaussianModel(opt.sh_degree, optimizer_type)
-    
+
+    optimizer_type = getattr(model_cfg, "optimizer_type", "default")
+    gaussians = GaussianModel(model_cfg.sh_degree, optimizer_type)
+
     print("[*] Đang khởi tạo Scene từ COLMAP data...")
-    scene = Scene(opt, gaussians, load_iteration=None, shuffle=False)
-    
+    scene = Scene(model_cfg, gaussians, load_iteration=None, shuffle=False)
+
     print(f"[*] Đang nạp checkpoint: {args.checkpoint}")
     try:
-        # Load weights_only=False để tương thích với PyTorch 2.6
-        (model_params, first_iter) = torch.load(args.checkpoint, weights_only=False)
+        # weights_only=False: bắt buộc cho checkpoint chứa numpy scalar (optimizer states)
+        # Tương thích với PyTorch >= 2.6 (default đã đổi từ False → True)
+        (ckpt_model_params, first_iter) = torch.load(args.checkpoint, weights_only=False)
+        # PHẢI truyền OptimizationParams vào restore(), không phải ModelParams
         optim_args = op.extract(args)
-        gaussians.restore(model_params, optim_args)
+        gaussians.restore(ckpt_model_params, optim_args)
     except Exception as e:
         print(f"[!] Lỗi khi nạp checkpoint: {e}")
         sys.exit(1)
         
     # 4. Thiết lập môi trường đánh giá
-    bg_color = [1, 1, 1] if opt.white_background else [0, 0, 0]
+    bg_color = [1, 1, 1] if model_cfg.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    
+
     test_cameras = scene.getTestCameras()
     if not test_cameras:
         print("[!] Không tìm thấy test camera poses nào (test_poses.csv).")
@@ -115,45 +121,60 @@ def main():
             gt_img = Image.open(gt_path).convert("RGB")
             gt_tensor = tf.to_tensor(gt_img).unsqueeze(0).cuda() # (1, 3, H, W)
             
-            # Render
-            render_pkg = render(view, gaussians, pipe, background, use_trained_exp=opt.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-            render_tensor = render_pkg["render"].unsqueeze(0).clamp(0.0, 1.0) # (1, 3, H, W)
-            
-            # Resize GT nếu chênh lệch (đảm bảo đồng nhất kích thước để tính metrics)
+            # Render (SPARSE_ADAM_AVAILABLE quyết định có dùng separate_sh hay không)
+            render_pkg = render(
+                view, gaussians, pipe, background,
+                use_trained_exp=getattr(model_cfg, "train_test_exp", False),
+                separate_sh=SPARSE_ADAM_AVAILABLE
+            )
+            render_tensor = render_pkg["render"].unsqueeze(0).clamp(0.0, 1.0)  # (1, 3, H, W)
+
+            # Resize GT nếu kích thước lệch (đảm bảo đồng nhất để tính metrics)
             if render_tensor.shape[2:] != gt_tensor.shape[2:]:
-                gt_tensor = tf.resize(gt_tensor, render_tensor.shape[2:])
-                
+                gt_tensor = tf.resize(gt_tensor, [render_tensor.shape[2], render_tensor.shape[3]])
+
             # Lưu ảnh nếu có yêu cầu
             if args.save_renders_dir is not None:
                 save_dir = os.path.join(args.save_renders_dir, scene_name)
                 os.makedirs(save_dir, exist_ok=True)
-                # torchvision.utils.save_image mong đợi shape (C, H, W)
+                # torchvision.utils.save_image mong đợi tensor shape (C, H, W)
                 torchvision.utils.save_image(render_tensor[0], os.path.join(save_dir, view.image_name))
-                
-            # Tính metrics
+
+            # Tính metrics — cả 3 metrics đều chạy trong torch.no_grad() block
             val_ssim = ssim(render_tensor, gt_tensor).item()
             val_psnr = psnr(render_tensor, gt_tensor).item()
             val_lpips = lpips(render_tensor, gt_tensor, net_type='vgg').item()
-            
+
             ssims.append(val_ssim)
             psnrs.append(val_psnr)
             lpipss.append(val_lpips)
-            
+
+            # Giải phóng VRAM sau mỗi ảnh để tránh OOM
+            del render_tensor, gt_tensor, render_pkg
             torch.cuda.empty_cache()
             
     if not ssims:
         print("[!] Không tính toán được kết quả cho bất kỳ ảnh nào.")
         sys.exit(1)
         
-    mean_ssim = sum(ssims) / len(ssims)
-    mean_psnr = sum(psnrs) / len(psnrs)
-    mean_lpips = sum(lpipss) / len(lpipss)
+    # Dùng sum/len thay vì numpy để tránh thêm dependency khi không cần thiết
+    n = len(ssims)
+    mean_ssim  = sum(ssims)  / n
+    mean_psnr  = sum(psnrs)  / n
+    mean_lpips = sum(lpipss) / n
     
     # 5. Tính Score tổng hợp
     # Score = 0.4 × (1 − LPIPS) + 0.3 × SSIM + 0.3 × PSNRnorm
     psnr_norm = max(0.0, min(1.0, mean_psnr / args.psnr_max))
     score = 0.4 * (1.0 - mean_lpips) + 0.3 * mean_ssim + 0.3 * psnr_norm
     
+    # Dọn thư mục temp (tránh tốn disk trên Kaggle)
+    if os.path.exists(model_cfg.model_path) and model_cfg.model_path == "./eval_output_temp":
+        try:
+            shutil.rmtree(model_cfg.model_path)
+        except Exception as e:
+            print(f"[!] Không thể xoá thư mục temp {model_cfg.model_path}: {e}")
+
     print("\n" + "="*60)
     print(f"📊 KẾT QUẢ ĐÁNH GIÁ: {scene_name.upper()}")
     print("="*60)

@@ -50,6 +50,9 @@ for submod in [
 # CELL 2 — Cấu hình thư mục và chạy Evaluation + Render
 # ─────────────────────────────────────────────────────────────────────────────
 import glob
+import zipfile
+import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # [1] THƯ MỤC CHỨA ẢNH GỐC & TEST POSES
 DATA_DIR = "/kaggle/input/datasets/tdukaggle/ai-race-data/VAI_NVS_DATA/phase1"
@@ -62,15 +65,13 @@ print("=" * 60)
 print("Đang tìm kiếm checkpoints...")
 print("=" * 60)
 
-import glob
-import zipfile
-
 def is_valid_checkpoint(path):
     """Kiểm tra file .pth có phải là ZIP hợp lệ không (tránh lỗi PytorchStreamReader)"""
     try:
-        with zipfile.ZipFile(path) as z:
-            return z.testzip() is None
-    except:
+        with zipfile.ZipFile(path, 'r') as z:
+            bad = z.testzip()  # None nếu tất cả OK
+            return bad is None
+    except (zipfile.BadZipFile, EOFError, OSError):
         return False
 
 # Tìm tất cả file .pth
@@ -86,8 +87,8 @@ for ckpt in checkpoints:
         else:
             print(f"❌ CẢNH BÁO: Checkpoint bị lỗi (corrupted) - bỏ qua: {ckpt}")
 
-import queue
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
 
 if not final_checkpoints:
     print(f"⚠️ Không tìm thấy checkpoint nào chứa '30000' trong tên file tại: {CHECKPOINT_DIR}")
@@ -111,12 +112,11 @@ def eval_worker(ckpt):
             f"--data_root \"{DATA_DIR}\" "
             f"--save_renders_dir \"/kaggle/working/eval_renders\" "
         )
-        
+
         # Bỏ capture_output để in trực tiếp tiến trình (realtime) ra màn hình
-        # Kaggle sẽ tự động gộp log của cả 2 GPU (hơi lộn xộn một chút do tqdm, nhưng bù lại bạn thấy được cả 2 đang chạy)
-        subprocess.run(cmd, shell=True)
-        
-        return f"\n✅ [GPU {gpu_id}] Đã chạy xong: {ckpt_name}"
+        result = subprocess.run(cmd, shell=True)
+        status = "✅ OK" if result.returncode == 0 else f"❌ FAILED (rc={result.returncode})"
+        return f"\n{status} [GPU {gpu_id}] Hoàn thành: {ckpt_name}"
     finally:
         gpu_queue.put(gpu_id)
 

@@ -119,12 +119,15 @@ print(f"Total: {len(all_scenes)} scenes")
 # ─────────────────────────────────────────────────────────────────────────────
 # CELL 7 — Chạy Training Multi-GPU (queue-based: scene nào xong sớm thì GPU đó nhận scene tiếp)
 # ─────────────────────────────────────────────────────────────────────────────
-import subprocess, queue, shutil
+import subprocess, queue, shutil, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REPO_DIR   = "/kaggle/working/BTS-Digital-Twin"
 OUTPUT_DIR = "/kaggle/working/output"
-ITERATIONS = 30000
+ITERATIONS      = 30_000  # Phase 1: train nền tại độ phân giải adaptive
+FINETUNE_ITERS  = 5_000   # Phase 2: fine-tune tại -r 1 (0 = tắt)
+KAGGLE_TIME_LIMIT_H  = 10.0         # Ngưỡng an toàn (12h limit - 2h buffer)
+KAGGLE_SESSION_START = time.time()  # Bắt đầu tính giờ ngay khi chạy Cell 7
 
 # ĐƯỜNG DẪN TỚI CHECKPOINT TỪ KAGGLE INPUT (nếu có). 
 # Ví dụ: "/kaggle/input/my-models-dataset" (bên trong phải chứa các thư mục con mang tên scene như HCM0193, hcm0031...)
@@ -133,8 +136,7 @@ INPUT_CHECKPOINT_DIR = ""
 
 def check_disk_space(label: str = ""):
     """In dung lượng còn trống trên /kaggle/working."""
-    import shutil as _sh
-    total, used, free = _sh.disk_usage("/kaggle/working")
+    total, used, free = shutil.disk_usage("/kaggle/working")
     free_gb  = free  / (1024 ** 3)
     total_gb = total / (1024 ** 3)
     tag = f"[{label}] " if label else ""
@@ -142,22 +144,25 @@ def check_disk_space(label: str = ""):
     print(f"  {flag} {tag}Disk: {free_gb:.1f} GB free / {total_gb:.1f} GB total")
     return free_gb
 
-def cleanup_after_train(scene_out: str, scene_name: str):
-    """Giải phóng disk sau khi train xong một scene:
-    - Xoá checkpoint trung gian (giữ lại chkpnt30000.pth)
-    - Xoá thư mục point_cloud của các iteration cũ (giữ lại iteration_30000)
+def cleanup_after_train(scene_out: str, scene_name: str, final_iter: int = None):
+    """Giải phóng disk sau khi train xong một scene.
+    - Xoá checkpoint trung gian (giữ lại checkpoint mới nhất)
+    - Xoá thư mục point_cloud cũ (giữ lại iteration mới nhất)
+    final_iter: iteration cần giữ lại. None = tự động detect từ thư mục.
     """
+    if final_iter is None:
+        final_iter = get_final_iteration(scene_out)
     freed = 0
 
-    # 1. Xoá checkpoint trung gian
-    keep_ckpt = f"{scene_out}/chkpnt{ITERATIONS}.pth"
+    # 1. Xoá checkpoint trung gian, chỉ giữ checkpoint mới nhất
+    keep_ckpt = f"{scene_out}/chkpnt{final_iter}.pth"
     for ckpt in glob.glob(f"{scene_out}/chkpnt*.pth"):
         if ckpt != keep_ckpt:
             try:
                 size = os.path.getsize(ckpt)
                 os.remove(ckpt)
                 freed += size
-                print(f"    🗑  Removed intermediate checkpoint: {os.path.basename(ckpt)}")
+                print(f"    🗑  Removed checkpoint: {os.path.basename(ckpt)}")
             except Exception as e:
                 print(f"    ⚠️  Could not remove {ckpt}: {e}")
 
@@ -168,20 +173,19 @@ def cleanup_after_train(scene_out: str, scene_name: str):
             os.remove(tfevent)
             freed += size
         except: pass
-        
+
     # Xoá bớt thư mục offline run của wandb để nhẹ máy
     wandb_dir = "/kaggle/working/wandb"
     if os.path.exists(wandb_dir):
         for run_dir in os.listdir(wandb_dir):
             if run_dir.startswith("run-") or run_dir.startswith("offline-"):
                 try:
-                    full_p = os.path.join(wandb_dir, run_dir)
-                    shutil.rmtree(full_p)
+                    shutil.rmtree(os.path.join(wandb_dir, run_dir))
                 except: pass
 
-    # 2. Xoá point_cloud của iteration cũ (giữ lại iteration_30000)
+    # 2. Xoá point_cloud của iteration cũ, chỉ giữ iteration mới nhất
     pc_base = f"{scene_out}/point_cloud"
-    keep_iter = f"iteration_{ITERATIONS}"
+    keep_iter = f"iteration_{final_iter}"
     if os.path.isdir(pc_base):
         for iter_dir in os.listdir(pc_base):
             if iter_dir != keep_iter:
@@ -209,6 +213,131 @@ def is_valid_checkpoint(path: str) -> bool:
             return bad is None
     except (zipfile.BadZipFile, EOFError, OSError):
         return False
+
+def has_time_remaining(hours_needed: float) -> bool:
+    """Kiểm tra session còn đủ thời gian để chạy thêm bước không.
+    Tránh bị Kaggle cắt giữa chừng (timeout 12h).
+    """
+    elapsed_h = (time.time() - KAGGLE_SESSION_START) / 3600
+    remaining_h = KAGGLE_TIME_LIMIT_H - elapsed_h
+    if remaining_h < hours_needed:
+        print(f"  ⏱ Thời gian còn lại: {remaining_h:.1f}h < cần {hours_needed:.1f}h → bỏ qua bước này.")
+        return False
+    print(f"  ⏱ Thời gian còn lại: {remaining_h:.1f}h → đủ để chạy thêm {hours_needed:.1f}h")
+    return True
+
+def get_final_iteration(scene_out: str) -> int:
+    """Tìm iteration cao nhất có sẵn trong thư mục point_cloud.
+    Tự động nhận ra Phase 2 (35000) nếu đã chạy, fallback về Phase 1 (30000).
+    """
+    pc_base = os.path.join(scene_out, "point_cloud")
+    if not os.path.isdir(pc_base):
+        return ITERATIONS
+    iters = []
+    for d in os.listdir(pc_base):
+        if d.startswith("iteration_"):
+            try:
+                iters.append(int(d.replace("iteration_", "")))
+            except ValueError:
+                pass
+    return max(iters) if iters else ITERATIONS
+
+def get_scene_config(scene_path: str) -> dict:
+    """Trả về config training tối ưu dựa trên số ảnh của scene.
+    Scene ít ảnh → VRAM thấp hơn → có thể dùng full-res và densify lâu hơn.
+    Heuristic dựa trên data drone UAV HCM dataset.
+    """
+    img_dir = os.path.join(scene_path, "images")
+    if os.path.isdir(img_dir):
+        n_imgs = len([f for f in os.listdir(img_dir)
+                      if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+    else:
+        n_imgs = 9999  # Không detect được → assume rất lớn, dùng config an toàn
+    print(f"  [Config] Số ảnh train: {n_imgs}")
+
+    if n_imgs <= 50:
+        # Scene nhỏ: full-res, densify đầy đủ
+        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.0002}
+    elif n_imgs <= 120:
+        # Scene vừa: full-res, densify hơi ngắn hơn để an toàn VRAM
+        return {"resolution": 1, "densify_until_iter": 13000, "densify_grad_threshold": 0.0002}
+    elif n_imgs <= 250:
+        # Scene lớn: half-res, tăng densify lên mức default 3DGS (15k)
+        return {"resolution": 2, "densify_until_iter": 15000, "densify_grad_threshold": 0.0002}
+    else:
+        # Scene rất lớn: half-res, ngưỡng threshold cao hơn → ít splat hơn → tránh OOM
+        return {"resolution": 2, "densify_until_iter": 15000, "densify_grad_threshold": 0.00022}
+
+def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:
+    """Phase 2: Fine-tune tại -r 1 (full resolution) sau khi Phase 1 xong.
+
+    Tại sao an toàn về VRAM:
+    - Không chạy densification (densify_until_iter=0) → không có densification
+      stats tensor → VRAM tiết kiệm đáng kể so với Phase 1.
+    - Gaussians đã ở đúng vị trí từ Phase 1, Phase 2 chỉ tinh chỉnh
+      màu sắc/opacity tại full-res → gains lớn về PSNR/SSIM.
+    """
+    scene_name = os.path.basename(scene_path)
+    if FINETUNE_ITERS <= 0:
+        return 0
+
+    # Ước tính ~8-12 phút/scene cho 5000 iters → cần ít nhất 0.25h buffer
+    if not has_time_remaining(0.25):
+        print(f"  [{scene_name}] Phase 2 bị bỏ qua do sắp hết thời gian.")
+        return 0
+
+    # Tìm checkpoint Phase 1
+    p1_ckpt = f"{scene_out}/chkpnt{ITERATIONS}.pth"
+    if not is_valid_checkpoint(p1_ckpt):
+        print(f"  [{scene_name}] ⚠️ Không tìm thấy checkpoint Phase 1 hợp lệ → bỏ qua fine-tune.")
+        return 1
+
+    finetune_total_iters = ITERATIONS + FINETUNE_ITERS  # e.g. 35000
+    log_file = f"{scene_out}/{scene_name}_finetune.log"
+    check_disk_space(scene_name)
+
+    env_prefix = "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
+    cmd = (
+        f"{env_prefix}"
+        f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/train.py "
+        f"-s {scene_path} "
+        f"-m {scene_out} "
+        f"-r 1 "                                    # Full resolution!
+        f"--use_wandb "
+        f"--wandb_project bts-digital-twin "
+        f"--wandb_entity {WANDB_ENTITY} "
+        f"--iterations {finetune_total_iters} "
+        f"--lambda_dssim 0.5 "
+        f"--train_test_exp "
+        f"--densify_grad_threshold 0.0002 "
+        f"--densify_until_iter 0 "                  # QUAN TRỌNG: Tắt hoàn toàn densification
+        f"--checkpoint_iterations {finetune_total_iters} "
+        f"--save_iterations {finetune_total_iters} "
+        f"--disable_viewer "
+        f"--start_checkpoint {p1_ckpt}"
+    )
+
+    print(f"\n🔬 [Phase 2] Fine-tuning [{scene_name}] tại -r 1 trên GPU {gpu_id} (+{FINETUNE_ITERS} iters)...")
+    with open(log_file, "w") as lf:
+        result = subprocess.run(cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT, cwd=REPO_DIR)
+
+    status = "✅ DONE" if result.returncode == 0 else f"❌ FAILED (rc={result.returncode})"
+    print(f"  [{scene_name}] Phase 2 {status}")
+
+    if result.returncode != 0:
+        print(f"\n{'='*20} FINE-TUNE ERROR LOG ({scene_name}) — Last 30 lines {'='*20}")
+        try:
+            with open(log_file, "r") as f:
+                lines = f.readlines()
+                print("".join(lines[-30:]))
+        except Exception as e:
+            print(f"Could not read log: {e}")
+        print("=" * 60 + "\n")
+    else:
+        # Cleanup: xoá checkpoint Phase 1 và PLY cũ, chỉ giữ Phase 2
+        cleanup_after_train(scene_out, scene_name, final_iter=finetune_total_iters)
+
+    return result.returncode
 
 # Ưu tiên sử dụng entity (team) "ai_race" nếu tài khoản có quyền truy cập, nếu không dùng username
 import wandb
@@ -258,9 +387,6 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
             glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth"),
             key=get_iter_from_ckpt
         )
-
-        # Ưu tiên 2: flat file → INPUT_CHECKPOINT_DIR/chkpnt*_{scene_name}.pth hoặc .lower()
-        # Ví dụ: chkpnt7000_hcm0181.pth hoặc chkpnt15000_HCM0204.pth
         flat_pattern_exact = f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name}.pth"
         flat_pattern_lower = f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name.lower()}.pth"
         
@@ -273,22 +399,17 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
             ckpts = subdir_ckpts
             print(f"  [{scene_name}] Found {len(ckpts)} checkpoint(s) in subfolder")
         elif flat_ckpts:
-            # Copy flat checkpoint → scene_out với tên chuẩn để train.py hiểu
-            import shutil
             for flat_ckpt in flat_ckpts:
                 iter_num = get_iter_from_ckpt(flat_ckpt)
                 dst = f"{scene_out}/chkpnt{iter_num}.pth"
                 if not os.path.exists(dst):
                     shutil.copy2(flat_ckpt, dst)
                     print(f"  [{scene_name}] Copied flat checkpoint: {os.path.basename(flat_ckpt)} → {os.path.basename(dst)}")
-            # Sau khi copy, scan lại scene_out
             ckpts = sorted(glob.glob(f"{scene_out}/chkpnt*.pth"), key=get_iter_from_ckpt)
 
-    # Fallback: tìm checkpoint đã có sẵn trong scene_out (từ session trước)
     if not ckpts:
         ckpts = sorted(glob.glob(f"{scene_out}/chkpnt*.pth"), key=get_iter_from_ckpt)
 
-    # Lọc bỏ checkpoint bị corrupt (bị cắt ngắn do disk-full session trước)
     valid_ckpts = []
     for ckpt in ckpts:
         if is_valid_checkpoint(ckpt):
@@ -306,7 +427,6 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         iter_num = get_iter_from_ckpt(ckpts[-1])
         remaining = ITERATIONS - iter_num
 
-        # Nếu checkpoint đã ở đúng iteration cuối → coi như xong, skip training
         if iter_num >= ITERATIONS:
             if os.path.exists(final_ply):
                 print(f"  ✅ [{scene_name}] Checkpoint @ iter {iter_num} + point_cloud.ply found — skipping")
@@ -320,11 +440,10 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
     else:
         print(f"  [{scene_name}] No checkpoint found — training from scratch")
 
-    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True giảm fragmentation VRAM
-    # -r 2: downscale x2 để giảm VRAM rasterization (full res dùng 4x VRAM)
-    # --densify_until_iter 12000: dừng tạo Gaussians sớm → giới hạn tổng số splats
-    # --densify_grad_threshold 0.0002: ngưỡng gốc, 0.00015 tạo quá nhiều splats → OOM
-    # NOTE: Chỉ lưu checkpoint tại 30000 để tiết kiệm disk (Kaggle ~20GB limit)
+    # Phase 1: Train nền với config adaptive theo số ảnh của scene
+    # get_scene_config(): tự động chọn resolution và densify config phù hợp
+    # --train_test_exp: per-image appearance embedding cho drone auto-exposure
+    scene_cfg = get_scene_config(scene_path)
     check_disk_space(scene_name)
     env_prefix = "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
     cmd = (
@@ -332,27 +451,28 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/train.py "
         f"-s {scene_path} "
         f"-m {scene_out} "
-        f"-r 2 "
+        f"-r {scene_cfg['resolution']} "
         f"--use_wandb "
         f"--wandb_project bts-digital-twin "
         f"--wandb_entity {WANDB_ENTITY} "
         f"--iterations {ITERATIONS} "
-        f"--lambda_dssim 0.4 "
-        f"--densify_grad_threshold 0.0002 "
-        f"--densify_until_iter 12000 "
-        f"--checkpoint_iterations 30000 "
-        f"--save_iterations 30000 "
+        f"--lambda_dssim 0.5 "
+        f"--train_test_exp "
+        f"--densify_grad_threshold {scene_cfg['densify_grad_threshold']} "
+        f"--densify_until_iter {scene_cfg['densify_until_iter']} "
+        f"--checkpoint_iterations {ITERATIONS} "
+        f"--save_iterations {ITERATIONS} "
         f"--disable_viewer "
         f"{resume_flag}"
     )
 
-    print(f"\n🚀 Training [{scene_name}] on GPU {gpu_id} ...")
+    print(f"\n🚀 [Phase 1] Training [{scene_name}] -r {scene_cfg['resolution']} on GPU {gpu_id} ...")
     with open(log_file, "w") as lf:
         result = subprocess.run(cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT, cwd=REPO_DIR)
 
     status = "✅ DONE" if result.returncode == 0 else f"❌ FAILED (rc={result.returncode})"
-    print(f"  [{scene_name}] {status} — log: {log_file}")
-    
+    print(f"  [{scene_name}] Phase 1 {status} — log: {log_file}")
+
     if result.returncode != 0:
         print(f"\n{'='*20} ERROR LOG FOR {scene_name} (Last 50 lines) {'='*20}")
         try:
@@ -363,9 +483,11 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
             print(f"Could not read log: {e}")
         print("=" * 60 + "\n")
     else:
-        # Cleanup intermediate files để giải phóng disk sau khi train thành công
-        cleanup_after_train(scene_out, scene_name)
-        
+        # Cleanup Phase 1 intermediate files để giải phóng disk
+        cleanup_after_train(scene_out, scene_name, final_iter=ITERATIONS)
+        # Phase 2: Fine-tune tại full resolution nếu còn đủ thời gian
+        finetune_scene(scene_path, scene_out, gpu_id)
+
     return scene_name, result.returncode
 
 
@@ -405,19 +527,22 @@ def render_scene(scene_path: str, gpu_id: int) -> str:
     scene_out  = f"{OUTPUT_DIR}/{scene_name}"
     log_file   = f"{OUTPUT_DIR}/{scene_name}_render.log"
 
+    # Tự động phát hiện iteration cao nhất (Phase 2 nếu đã chạy, Phase 1 nếu không)
+    final_iter = get_final_iteration(scene_out)
+
+    # Kiểm tra point_cloud.ply tồn tại trước khi render để tránh crash
+    ply_path = f"{scene_out}/point_cloud/iteration_{final_iter}/point_cloud.ply"
+    if not os.path.exists(ply_path):
+        print(f"  ⚠️  [{scene_name}] Skipping render — point_cloud.ply not found: {ply_path}")
+        return scene_name, 1
+
     cmd = (
         f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/render.py "
         f"-s {scene_path} "
         f"-m {scene_out} "
         f"--skip_train "
-        f"--iteration {ITERATIONS}"
+        f"--iteration {final_iter}"
     )
-
-    # Kiểm tra point_cloud.ply tồn tại trước khi render để tránh crash
-    ply_path = f"{scene_out}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
-    if not os.path.exists(ply_path):
-        print(f"  ⚠️  [{scene_name}] Skipping render — point_cloud.ply not found (training incomplete?): {ply_path}")
-        return scene_name, 1
 
     print(f"🎨 Rendering [{scene_name}] on GPU {gpu_id} ...")
     with open(log_file, "w") as lf:
@@ -443,15 +568,17 @@ print("=" * 60)
 print("Rendering test views for all scenes...")
 print("=" * 60)
 
-# Kiểm tra trạng thái training trước khi render
+# Kiểm tra trạng thái training trước khi render (hỗ trợ cả Phase 1 và Phase 2)
 print("\n📊 Training status check:")
 trained_scenes = []
 failed_scenes = []
 for scene_path in all_scenes:
     scene_name = os.path.basename(scene_path)
-    ply_path = f"{OUTPUT_DIR}/{scene_name}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
+    scene_out_path = f"{OUTPUT_DIR}/{scene_name}"
+    final_iter_check = get_final_iteration(scene_out_path)
+    ply_path = f"{scene_out_path}/point_cloud/iteration_{final_iter_check}/point_cloud.ply"
     if os.path.exists(ply_path):
-        print(f"  ✅ [{scene_name}] point_cloud.ply found")
+        print(f"  ✅ [{scene_name}] point_cloud.ply found @ iter {final_iter_check}")
         trained_scenes.append(scene_path)
     else:
         print(f"  ❌ [{scene_name}] point_cloud.ply MISSING — will skip render")
@@ -476,7 +603,8 @@ def render_scene_wrapper(scene_path):
 with ThreadPoolExecutor(max_workers=2) as executor:
     futures = {
         executor.submit(render_scene_wrapper, scene): scene
-        for scene in all_scenes
+        # BUG FIX: Chỉ render những scene đã train xong (có point_cloud.ply)
+        for scene in trained_scenes
     }
     for future in as_completed(futures):
         scene_name, rc = future.result()
@@ -488,7 +616,7 @@ print("\nAll renders completed!")
 # ─────────────────────────────────────────────────────────────────────────────
 # CELL 9 — Đóng gói submission.zip
 # ─────────────────────────────────────────────────────────────────────────────
-import zipfile, shutil
+import zipfile  # shutil đã import ở Cell 7
 
 SUBMISSION_DIR = "/kaggle/working/submission"
 SUBMISSION_ZIP = "/kaggle/working/submission.zip"
@@ -502,7 +630,9 @@ missing_scenes = []
 
 for scene_path in all_scenes:
     scene_name  = os.path.basename(scene_path)
-    render_path = f"{OUTPUT_DIR}/{scene_name}/test/ours_{ITERATIONS}/renders"
+    # Tự động dùng iteration cao nhất (Phase 2 nếu có, Phase 1 nếu không)
+    final_iter  = get_final_iteration(f"{OUTPUT_DIR}/{scene_name}")
+    render_path = f"{OUTPUT_DIR}/{scene_name}/test/ours_{final_iter}/renders"
 
     if not os.path.isdir(render_path):
         print(f"  ⚠️  [{scene_name}] Render path not found: {render_path}")
@@ -543,7 +673,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 def preview_scene(scene_name: str, n: int = 3):
-    render_path = f"{OUTPUT_DIR}/{scene_name}/test/ours_{ITERATIONS}/renders"
+    final_iter  = get_final_iteration(f"{OUTPUT_DIR}/{scene_name}")
+    render_path = f"{OUTPUT_DIR}/{scene_name}/test/ours_{final_iter}/renders"
     imgs = sorted(glob.glob(f"{render_path}/*.png"))[:n]
     if not imgs:
         print(f"No renders found for {scene_name}")

@@ -57,11 +57,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Compatible with PyTorch >= 2.6 where default changed from False to True
         try:
             (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
-        except (RuntimeError, Exception) as e:
+        except Exception as e:
             print(f"[ERROR] Failed to load checkpoint '{checkpoint}': {e}")
             print(f"[ERROR] Checkpoint may be corrupted (e.g. truncated by disk-full). Training from scratch.")
             first_iter = 0
-            # Re-initialize gaussians without checkpoint
             gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
             scene = Scene(dataset, gaussians)
             gaussians.training_setup(opt)
@@ -95,13 +94,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
-        if network_gui.conn == None:
+        if network_gui.conn is None:
             network_gui.try_connect()
-        while network_gui.conn != None:
+        while network_gui.conn is not None:
             try:
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
+                if custom_cam is not None:
                     net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
@@ -124,7 +123,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_indices = list(range(len(viewpoint_stack)))
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
+        viewpoint_indices.pop(rand_idx)  # giữ đồng bộ với viewpoint_stack
 
         # Render
         if (iteration - 1) == debug_from:
@@ -279,23 +278,30 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if train_test_exp:
-                        image = image[..., image.shape[-1] // 2:]
-                        gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    if wandb.run is not None and (idx < 5):
-                        wandb.log({
-                            f"{config['name']}_view_{viewpoint.image_name}/render": wandb.Image(image.permute(1, 2, 0).cpu().numpy()),
-                            f"{config['name']}_view_{viewpoint.image_name}/ground_truth": wandb.Image(gt_image.permute(1, 2, 0).cpu().numpy()) if viewpoint.image_name != 'test' and hasattr(viewpoint, 'original_image') and viewpoint.original_image is not None and viewpoint.original_image.shape[0] == 3 else None
-                        }, step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                with torch.no_grad():
+                    for idx, viewpoint in enumerate(config['cameras']):
+                        image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                        gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                        if train_test_exp:
+                            image = image[..., image.shape[-1] // 2:]
+                            gt_image = gt_image[..., gt_image.shape[-1] // 2:]
+                        if tb_writer and (idx < 5):
+                            tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
+                            if iteration == testing_iterations[0]:
+                                tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                        if wandb.run is not None and (idx < 5):
+                            has_gt = (hasattr(viewpoint, 'original_image') 
+                                      and viewpoint.original_image is not None
+                                      and viewpoint.original_image.shape[0] == 3)
+                            log_dict = {
+                                f"{config['name']}_view_{viewpoint.image_name}/render": wandb.Image(image.permute(1, 2, 0).cpu().numpy()),
+                            }
+                            if has_gt:
+                                log_dict[f"{config['name']}_view_{viewpoint.image_name}/ground_truth"] = wandb.Image(gt_image.permute(1, 2, 0).cpu().numpy())
+                            wandb.log(log_dict, step=iteration)
+                        l1_test += l1_loss(image, gt_image).mean().double()
+                        psnr_test += psnr(image, gt_image).mean().double()
+                        del image, gt_image
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))

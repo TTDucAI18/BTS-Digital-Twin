@@ -38,8 +38,17 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)["render"]
         gt = view.original_image[0:3, :, :]
 
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        # Lưu theo image_name gốc từ test_poses.csv để submission khớp với ground truth
+        img_name = getattr(view, 'image_name', None)
+        if img_name:
+            # Đảm bảo phần mở rộng là .png
+            stem = os.path.splitext(img_name)[0]
+            out_name = stem + ".png"
+        else:
+            out_name = '{0:05d}'.format(idx) + ".png"
+
+        torchvision.utils.save_image(rendering, os.path.join(render_path, out_name))
+        torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool):
     with torch.no_grad():

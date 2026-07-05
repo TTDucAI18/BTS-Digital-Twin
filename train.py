@@ -76,7 +76,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    # Extract validation set
+    # Extract validation set (chỉ để monitor — KHÔNG loại khỏi training)
     import random
     all_train_cams = scene.getTrainCameras()
     val_size = min(10, max(1, len(all_train_cams) // 10))
@@ -84,7 +84,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     random.seed(42)
     val_indices = set(random.sample(range(len(all_train_cams)), val_size))
     val_cameras = [c for i, c in enumerate(all_train_cams) if i in val_indices]
-    train_cameras = [c for i, c in enumerate(all_train_cams) if i not in val_indices]
+    # Dùng 100% ảnh để train (không loại bỏ val set ra)
+    train_cameras = all_train_cams
 
     viewpoint_stack = train_cameras.copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))

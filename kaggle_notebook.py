@@ -124,8 +124,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REPO_DIR   = "/kaggle/working/BTS-Digital-Twin"
 OUTPUT_DIR = "/kaggle/working/output"
-ITERATIONS      = 30_000  # Phase 1: train nền tại độ phân giải adaptive
-FINETUNE_ITERS  = 5_000   # Phase 2: fine-tune tại -r 1 (0 = tắt)
+ITERATIONS      = 30_000  # Train đầy đủ 30k iters tại -r 1
+FINETUNE_ITERS  = 0       # Fine-tune TẮT: thực nghiệm cho thấy Phase 2 gây regression
 KAGGLE_TIME_LIMIT_H  = 10.0         # Ngưỡng an toàn (12h limit - 2h buffer)
 KAGGLE_SESSION_START = time.time()  # Bắt đầu tính giờ ngay khi chạy Cell 7
 
@@ -244,29 +244,31 @@ def get_final_iteration(scene_out: str) -> int:
 
 def get_scene_config(scene_path: str) -> dict:
     """Trả về config training tối ưu dựa trên số ảnh của scene.
-    Scene ít ảnh → VRAM thấp hơn → có thể dùng full-res và densify lâu hơn.
-    Heuristic dựa trên data drone UAV HCM dataset.
+    Ảnh dataset AI Race đã được scale 1/4 xuống 1320×989 → dùng -r 1 an toàn với T4 16GB.
+    Heuristic dựa trên data drone UAV HCM/HNI dataset.
     """
-    img_dir = os.path.join(scene_path, "images")
+    # BTS structure: scene_path/train/images (không phải scene_path/images)
+    img_dir = os.path.join(scene_path, "train", "images")
+    if not os.path.isdir(img_dir):
+        img_dir = os.path.join(scene_path, "images")  # fallback cho cấu trúc khác
     if os.path.isdir(img_dir):
         n_imgs = len([f for f in os.listdir(img_dir)
                       if f.lower().endswith((".jpg", ".jpeg", ".png"))])
     else:
-        n_imgs = 9999  # Không detect được → assume rất lớn, dùng config an toàn
+        n_imgs = 240  # Không detect được → assume trung bình
     print(f"  [Config] Số ảnh train: {n_imgs}")
 
-    if n_imgs <= 50:
-        # Scene nhỏ: full-res, densify đầy đủ
-        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.0002}
-    elif n_imgs <= 120:
-        # Scene vừa: full-res, densify hơi ngắn hơn để an toàn VRAM
-        return {"resolution": 1, "densify_until_iter": 13000, "densify_grad_threshold": 0.0002}
-    elif n_imgs <= 250:
-        # Scene lớn: half-res, tăng densify lên mức default 3DGS (15k)
-        return {"resolution": 2, "densify_until_iter": 15000, "densify_grad_threshold": 0.0002}
+    # Tất cả scene đều dùng -r 1 vì ảnh đã scale 1/4 → 1320×989 fit T4 16GB
+    # densify_until_iter 20000 (từ 15000) → densify lâu hơn, scene phức tạp được bao phủ đủ
+    if n_imgs <= 120:
+        # Scene nhỏ (HCM1439: 103 ảnh): densify đầy đủ, threshold thấp hơn để bắt chi tiết
+        return {"resolution": 1, "densify_until_iter": 20000, "densify_grad_threshold": 0.0001}
+    elif n_imgs <= 220:
+        # Scene vừa (HNI0265: 205, HNI0437: 224 ảnh)
+        return {"resolution": 1, "densify_until_iter": 20000, "densify_grad_threshold": 0.0002}
     else:
-        # Scene rất lớn: half-res, ngưỡng threshold cao hơn → ít splat hơn → tránh OOM
-        return {"resolution": 2, "densify_until_iter": 15000, "densify_grad_threshold": 0.00022}
+        # Scene đầy đủ (240 ảnh): threshold chuẩn 3DGS
+        return {"resolution": 1, "densify_until_iter": 20000, "densify_grad_threshold": 0.0002}
 
 def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:
     """Phase 2: Fine-tune tại -r 1 (full resolution) sau khi Phase 1 xong.
@@ -396,9 +398,17 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         flat_ckpts = sorted(flat_ckpts, key=get_iter_from_ckpt)
 
         if subdir_ckpts:
+            max_iter = get_iter_from_ckpt(subdir_ckpts[-1])
+            if max_iter >= ITERATIONS:
+                print(f"  ✅ [{scene_name}] Checkpoint @ iter {max_iter} found in input — skipping completely, NO disk copy")
+                return scene_name, 0
             ckpts = subdir_ckpts
             print(f"  [{scene_name}] Found {len(ckpts)} checkpoint(s) in subfolder")
         elif flat_ckpts:
+            max_iter = get_iter_from_ckpt(flat_ckpts[-1])
+            if max_iter >= ITERATIONS:
+                print(f"  ✅ [{scene_name}] Checkpoint @ iter {max_iter} found in input — skipping completely, NO disk copy")
+                return scene_name, 0
             for flat_ckpt in flat_ckpts:
                 iter_num = get_iter_from_ckpt(flat_ckpt)
                 dst = f"{scene_out}/chkpnt{iter_num}.pth"
@@ -456,11 +466,12 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
         f"--wandb_project bts-digital-twin "
         f"--wandb_entity {WANDB_ENTITY} "
         f"--iterations {ITERATIONS} "
-        f"--lambda_dssim 0.5 "
+        f"--lambda_dssim 0.2 "
         f"--train_test_exp "
+        f"--antialiasing "
         f"--densify_grad_threshold {scene_cfg['densify_grad_threshold']} "
         f"--densify_until_iter {scene_cfg['densify_until_iter']} "
-        f"--checkpoint_iterations {ITERATIONS} "
+        f"--checkpoint_iterations 15000 {ITERATIONS} "
         f"--save_iterations {ITERATIONS} "
         f"--disable_viewer "
         f"{resume_flag}"
@@ -490,6 +501,28 @@ def train_scene(scene_path: str, gpu_id: int) -> str:
 
     return scene_name, result.returncode
 
+
+def get_scene_priority(scene_path):
+    scene_name = os.path.basename(scene_path)
+    final_ply = f"{OUTPUT_DIR}/{scene_name}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
+    if os.path.exists(final_ply):
+        return 3 # Already fully trained
+    
+    has_ckpt = False
+    if INPUT_CHECKPOINT_DIR:
+        if glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth") or \
+           glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name}.pth") or \
+           glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name.lower()}.pth"):
+            has_ckpt = True
+            
+    if glob.glob(f"{OUTPUT_DIR}/{scene_name}/chkpnt*.pth"):
+        has_ckpt = True
+        
+    return 2 if has_ckpt else 1
+
+print("=" * 60)
+print("Sorting scenes by priority (scenes without checkpoints first)...")
+all_scenes = sorted(all_scenes, key=get_scene_priority)
 
 # Chạy song song: queue-based GPU scheduler (GPU nào rảnh sẽ nhận scene tiếp theo)
 print("=" * 60)
@@ -642,11 +675,13 @@ for scene_path in all_scenes:
     dest = f"{SUBMISSION_DIR}/{scene_name}"
     os.makedirs(dest, exist_ok=True)
 
-    imgs = glob.glob(f"{render_path}/*.png")
+    imgs = sorted(glob.glob(f"{render_path}/*.png"))
     for img in imgs:
         shutil.copy(img, dest)
 
-    print(f"  ✅ [{scene_name}] Copied {len(imgs)} images")
+    # Log mẫu tên ảnh để xác nhận khớp với test_poses.csv
+    sample_names = [os.path.basename(p) for p in imgs[:3]]
+    print(f"  ✅ [{scene_name}] Copied {len(imgs)} images  (samples: {sample_names})")
 
 # Zip
 if os.path.exists(SUBMISSION_ZIP):

@@ -11,6 +11,7 @@
 
 import os
 import glob as _glob
+import shutil
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -188,7 +189,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
-                import shutil
                 free_space_gb = shutil.disk_usage(scene.model_path).free / (1024**3)
                 if free_space_gb < 3.5:
                     print(f"\n[ITER {iteration}] WARNING: Disk space low ({free_space_gb:.2f} GB left). Stopping training early.")
@@ -313,10 +313,12 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
+                # Giới hạn số camera để tránh OOM khi Gaussian count cao
+                eval_cams = config['cameras'][:5]
                 l1_test = 0.0
                 psnr_test = 0.0
                 with torch.no_grad():
-                    for idx, viewpoint in enumerate(config['cameras']):
+                    for idx, viewpoint in enumerate(eval_cams):
                         image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                         gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                         if tb_writer and (idx < 5):
@@ -336,8 +338,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         l1_test += l1_loss(image, gt_image).mean().double()
                         psnr_test += psnr(image, gt_image).mean().double()
                         del image, gt_image
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
+                        torch.cuda.empty_cache()  # giải phóng fragment VRAM sau mỗi camera
+                psnr_test /= len(eval_cams)
+                l1_test /= len(eval_cams)          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
@@ -363,7 +366,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)

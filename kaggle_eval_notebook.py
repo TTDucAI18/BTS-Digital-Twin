@@ -78,20 +78,34 @@ def is_valid_checkpoint(path):
 checkpoints = glob.glob(f"{CHECKPOINT_DIR}/**/*.pth", recursive=True)
 
 # Lọc checkpoint và kiểm tra tính toàn vẹn (loại bỏ các file bị corrupt)
-# Tùy chỉnh chuỗi nhận diện nếu bạn muốn lấy chkpnt25000 thay vì 30000
-final_checkpoints = []
+# Tự động lấy checkpoint có iteration cao nhất hợp lệ cho mỗi scene (phù hợp với cơ chế ngắt sớm)
+from collections import defaultdict
+scene_ckpts = defaultdict(list)
+
+def get_iter_from_ckpt(ckpt_path):
+    try:
+        name = os.path.basename(ckpt_path).replace("chkpnt", "").replace(".pth", "")
+        return int(name.split("_")[0])
+    except:
+        return 0
+
 for ckpt in checkpoints:
-    if "30000" in os.path.basename(ckpt) or "25000" in os.path.basename(ckpt):
+    parent_dir = os.path.dirname(ckpt)
+    scene_ckpts[parent_dir].append(ckpt)
+
+final_checkpoints = []
+for parent_dir, ckpts in scene_ckpts.items():
+    # Sắp xếp checkpoint theo iteration giảm dần
+    ckpts_sorted = sorted(ckpts, key=get_iter_from_ckpt, reverse=True)
+    for ckpt in ckpts_sorted:
         if is_valid_checkpoint(ckpt):
             final_checkpoints.append(ckpt)
+            break # Lấy checkpoint có iteration cao nhất hợp lệ cho scene này
         else:
             print(f"❌ CẢNH BÁO: Checkpoint bị lỗi (corrupted) - bỏ qua: {ckpt}")
 
-
-
-
 if not final_checkpoints:
-    print(f"⚠️ Không tìm thấy checkpoint nào chứa '30000' trong tên file tại: {CHECKPOINT_DIR}")
+    print(f"⚠️ Không tìm thấy checkpoint hợp lệ nào tại: {CHECKPOINT_DIR}")
     print("Danh sách toàn bộ checkpoint tìm được:", checkpoints)
 else:
     print(f"✅ Tìm thấy {len(final_checkpoints)} final checkpoints để đánh giá.")

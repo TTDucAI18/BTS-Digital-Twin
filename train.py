@@ -17,7 +17,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state, get_expon_lr_func
+from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -74,7 +74,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
-    depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+
+    # ── TASK 2: Hybrid Depth Weight Scheduler (DA-v2 Two-Phase Strategy) ─────────
+    # Phase 1 (0 – 5 000 iters)  : Full base_weight  → anchor Gaussians on BTS tower
+    # Phase 2 (5 000 – 25 000)   : Linear decay → 0  → release for cable geometry
+    # Phase 3 (25 000 – 30 000+) : weight = 0        → color-only, zero VRAM overhead
+    def get_depth_weight(iteration, base_weight=0.1):
+        if iteration <= 5_000:
+            return base_weight
+        elif iteration < 25_000:
+            progress = (iteration - 5_000) / (25_000 - 5_000)
+            return base_weight * (1.0 - progress)
+        else:
+            return 0.0
 
     # Extract validation set (chỉ để monitor — KHÔNG loại khỏi training)
     import random
@@ -102,7 +114,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam is not None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]  # TASK 1: use_trained_exp removed
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -132,7 +144,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, separate_sh=SPARSE_ADAM_AVAILABLE)  # TASK 1: use_trained_exp removed
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -149,15 +161,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        # Depth regularization
+        # ── TASK 2: Hybrid Depth Regularization (DA-v2 + Two-Phase Scheduler) ────
+        # Only renders depth tensor and computes gradient graph when weight > 0.
+        # From iteration 25 000+, this block is skipped entirely → saves VRAM & time.
         Ll1depth_pure = 0.0
-        if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
+        current_depth_weight = get_depth_weight(iteration, base_weight=opt.depth_weight_init)
+        if current_depth_weight > 0.0 and viewpoint_cam.depth_reliable:
             invDepth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
-            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+            Ll1depth_pure = torch.abs((invDepth - mono_invdepth) * depth_mask).mean()
+            Ll1depth = current_depth_weight * Ll1depth_pure
             loss += Ll1depth
             Ll1depth = Ll1depth.item()
         else:
@@ -173,6 +188,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
+                import shutil
+                free_space_gb = shutil.disk_usage(scene.model_path).free / (1024**3)
+                if free_space_gb < 3.5:
+                    print(f"\n[ITER {iteration}] WARNING: Disk space low ({free_space_gb:.2f} GB left). Stopping training early.")
+                    scene.save(iteration)
+                    new_ckpt_path = scene.model_path + "/chkpnt" + str(iteration) + ".pth"
+                    torch.save((gaussians.capture(), iteration), new_ckpt_path)
+                    
+                    def _ckpt_iter(p):
+                        try:
+                            return int(os.path.basename(p).replace("chkpnt", "").replace(".pth", ""))
+                        except:
+                            return 0
+                    all_ckpts = sorted(_glob.glob(os.path.join(scene.model_path, "chkpnt*.pth")), key=_ckpt_iter)
+                    for old_ckpt in all_ckpts:
+                        if old_ckpt != new_ckpt_path:
+                            try:
+                                os.remove(old_ckpt)
+                            except Exception:
+                                pass
+                    break
+
                 epoch = iteration // len(train_cameras)
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Epoch": epoch})
                 progress_bar.update(10)
@@ -187,7 +224,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, val_cameras)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE), val_cameras)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -207,8 +244,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
+                # TASK 1: exposure_optimizer step removed — no exposure tensor to update.
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
@@ -263,7 +299,7 @@ def prepare_output_and_logger(args):
         
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, val_cameras):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, val_cameras):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)

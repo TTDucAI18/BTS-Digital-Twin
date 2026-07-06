@@ -19,9 +19,10 @@ import cv2
 class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
-                 train_test_exp = False, is_test_dataset = False, is_test_view = False
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
                  ):
+        # NOTE: train_test_exp / is_test_dataset / is_test_view removed.
+        # BTS data is captured under uniform lighting — no exposure compensation needed.
         super(Camera, self).__init__()
 
         self.uid = uid

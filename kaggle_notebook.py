@@ -24,7 +24,7 @@ run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CELL 2 — (Đã xoá: Không cài lại PyTorch để tránh lỗi mismatch với Kaggle NVCC 12.x)
+# CELL 2 — Sử dụng PyTorch mặc định của Kaggle (tránh lỗi mismatch với NVCC 12.x)
 # ─────────────────────────────────────────────────────────────────────────────
 print("=" * 60)
 print("Sử dụng PyTorch mặc định của Kaggle để đảm bảo khớp với NVCC...")
@@ -60,7 +60,7 @@ print("=" * 60)
 print("Installing Python dependencies & submodules...")
 print("=" * 60)
 
-# Base deps (Bắt buộc dùng setuptools < 70 để tránh lỗi distutils khi compile CUDA)
+# Base deps — setuptools<70 tránh lỗi distutils khi compile CUDA extension
 run("pip install plyfile tqdm wandb opencv-python ninja \"setuptools<70.0.0\"")
 
 # Compile submodules
@@ -100,7 +100,7 @@ DATA_DIR   = "/kaggle/input/datasets/tdukaggle/ai-race-data/phase1"
 OUTPUT_DIR = "/kaggle/working/output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Thu thập tất cả scenes (bỏ qua file .DS_Store và __MACOSX)
+# Thu thập tất cả scenes (bỏ qua .DS_Store và __MACOSX)
 public_scenes  = sorted([
     p for p in glob.glob(f"{DATA_DIR}/public_set/*")
     if os.path.isdir(p) and not os.path.basename(p).startswith(".")
@@ -117,46 +117,44 @@ print(f"Total: {len(all_scenes)} scenes")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CELL 7 — Chạy Training Multi-GPU (queue-based: scene nào xong sớm thì GPU đó nhận scene tiếp)
+# CELL 7 — Training Multi-GPU (queue-based: GPU nào rảnh nhận scene tiếp theo)
 # ─────────────────────────────────────────────────────────────────────────────
 import subprocess, queue, shutil, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-REPO_DIR   = "/kaggle/working/BTS-Digital-Twin"
-OUTPUT_DIR = "/kaggle/working/output"
-ITERATIONS      = 30_000  # Train đầy đủ 30k iters tại -r 1
-FINETUNE_ITERS  = 0       # Fine-tune TẮT: thực nghiệm cho thấy Phase 2 gây regression
-KAGGLE_TIME_LIMIT_H  = 10.0         # Ngưỡng an toàn (12h limit - 2h buffer)
-KAGGLE_SESSION_START = time.time()  # Bắt đầu tính giờ ngay khi chạy Cell 7
+REPO_DIR             = "/kaggle/working/BTS-Digital-Twin"
+OUTPUT_DIR           = "/kaggle/working/output"
+ITERATIONS           = 30_000   # Train đầy đủ 30k iters
+FINETUNE_ITERS       = 0        # Fine-tune TẮT (Phase 2 gây regression trên BTS data)
+KAGGLE_TIME_LIMIT_H  = 10.0     # Ngưỡng an toàn (12h limit Kaggle − 2h buffer)
+KAGGLE_SESSION_START = time.time()
 
-# ĐƯỜNG DẪN TỚI CHECKPOINT TỪ KAGGLE INPUT (nếu có). 
-# Ví dụ: "/kaggle/input/my-models-dataset" (bên trong phải chứa các thư mục con mang tên scene như HCM0193, hcm0031...)
-# Bỏ trống "" nếu chỉ muốn tự động resume từ output hiện tại.
-INPUT_CHECKPOINT_DIR = ""
+# Thư mục chứa checkpoint từ Kaggle Input dataset (để resume nếu có)
+INPUT_CHECKPOINT_DIR = "/kaggle/input/datasets/tdukaggle/ai-race-data"
+
 
 def check_disk_space(label: str = ""):
     """In dung lượng còn trống trên /kaggle/working."""
     total, used, free = shutil.disk_usage("/kaggle/working")
     free_gb  = free  / (1024 ** 3)
     total_gb = total / (1024 ** 3)
-    tag = f"[{label}] " if label else ""
+    tag  = f"[{label}] " if label else ""
     flag = "⚠️ LOW DISK" if free_gb < 3 else "💾"
     print(f"  {flag} {tag}Disk: {free_gb:.1f} GB free / {total_gb:.1f} GB total")
     return free_gb
 
+
 def cleanup_after_train(scene_out: str, scene_name: str, final_iter: int = None):
     """Giải phóng disk sau khi train xong một scene.
-    - Xoá thư mục point_cloud cũ (chỉ giữ iteration mới nhất)
-    - Xoá tensorboard logs
-    - KHÔNG xoá checkpoint — việc đó đã được xử lý trong train_scene()
-      sau khi xác nhận chkpnt30000 hợp lệ.
-    final_iter: iteration cần giữ lại. None = tự động detect từ thư mục.
+    - Xoá thư mục point_cloud của iteration cũ (chỉ giữ mới nhất)
+    - Xoá tensorboard event files
+    - KHÔNG xoá checkpoint — đã được xử lý trong train_scene() sau khi verify.
     """
     if final_iter is None:
         final_iter = get_final_iteration(scene_out)
     freed = 0
 
-    # Xóa file Tensorboard logs (nếu vô tình sinh ra)
+    # Xóa Tensorboard event files (nếu vô tình sinh ra)
     for tfevent in glob.glob(f"{scene_out}/events.out.tfevents*"):
         try:
             size = os.path.getsize(tfevent)
@@ -164,7 +162,7 @@ def cleanup_after_train(scene_out: str, scene_name: str, final_iter: int = None)
             freed += size
         except: pass
 
-    # Xoá bớt thư mục offline run của wandb để nhẹ máy
+    # Xoá wandb offline run directories để nhẹ máy
     wandb_dir = "/kaggle/working/wandb"
     if os.path.exists(wandb_dir):
         for run_dir in os.listdir(wandb_dir):
@@ -174,7 +172,7 @@ def cleanup_after_train(scene_out: str, scene_name: str, final_iter: int = None)
                 except: pass
 
     # Xoá point_cloud của iteration cũ, chỉ giữ iteration mới nhất
-    pc_base = f"{scene_out}/point_cloud"
+    pc_base   = f"{scene_out}/point_cloud"
     keep_iter = f"iteration_{final_iter}"
     if os.path.isdir(pc_base):
         for iter_dir in os.listdir(pc_base):
@@ -193,6 +191,7 @@ def cleanup_after_train(scene_out: str, scene_name: str, final_iter: int = None)
         print(f"  [{scene_name}] 🧹 Cleanup freed: {freed / (1024**3):.2f} GB")
     check_disk_space(scene_name)
 
+
 def is_valid_checkpoint(path: str) -> bool:
     """Kiểm tra checkpoint có phải ZIP hợp lệ không (PyTorch .pth là zip archive).
     File bị truncate do disk-full sẽ thiếu magic bytes và central directory.
@@ -200,16 +199,15 @@ def is_valid_checkpoint(path: str) -> bool:
     import zipfile
     try:
         with zipfile.ZipFile(path, 'r') as zf:
-            bad = zf.testzip()  # None nếu tất cả OK
+            bad = zf.testzip()   # None nếu tất cả OK
             return bad is None
     except (zipfile.BadZipFile, EOFError, OSError):
         return False
 
+
 def has_time_remaining(hours_needed: float) -> bool:
-    """Kiểm tra session còn đủ thời gian để chạy thêm bước không.
-    Tránh bị Kaggle cắt giữa chừng (timeout 12h).
-    """
-    elapsed_h = (time.time() - KAGGLE_SESSION_START) / 3600
+    """Kiểm tra session còn đủ thời gian để chạy thêm bước không."""
+    elapsed_h   = (time.time() - KAGGLE_SESSION_START) / 3600
     remaining_h = KAGGLE_TIME_LIMIT_H - elapsed_h
     if remaining_h < hours_needed:
         print(f"  ⏱ Thời gian còn lại: {remaining_h:.1f}h < cần {hours_needed:.1f}h → bỏ qua bước này.")
@@ -217,10 +215,9 @@ def has_time_remaining(hours_needed: float) -> bool:
     print(f"  ⏱ Thời gian còn lại: {remaining_h:.1f}h → đủ để chạy thêm {hours_needed:.1f}h")
     return True
 
+
 def get_final_iteration(scene_out: str) -> int:
-    """Tìm iteration cao nhất có sẵn trong thư mục point_cloud.
-    Tự động nhận ra Phase 2 (35000) nếu đã chạy, fallback về Phase 1 (30000).
-    """
+    """Tìm iteration cao nhất có sẵn trong thư mục point_cloud."""
     pc_base = os.path.join(scene_out, "point_cloud")
     if not os.path.isdir(pc_base):
         return ITERATIONS
@@ -233,42 +230,44 @@ def get_final_iteration(scene_out: str) -> int:
                 pass
     return max(iters) if iters else ITERATIONS
 
+
 def get_scene_config(scene_path: str) -> dict:
     """Trả về config training tối ưu dựa trên số ảnh của scene.
-    Ảnh dataset AI Race đã được scale 1/4 xuống 1320×989 → dùng -r 1 an toàn với T4 16GB.
-    Heuristic dựa trên data drone UAV HCM/HNI dataset.
+
+    Chiến lược -r 2:
+    - -r 2 → ảnh ~660×494, VRAM giảm ~4x, tốc độ tăng ~2-3x so với -r 1.
+    - Bù bằng: densify_grad_threshold thấp hơn, densify_until_iter cao hơn (22000).
     """
-    # BTS structure: scene_path/train/images (không phải scene_path/images)
+    # BTS structure: scene_path/train/images
     img_dir = os.path.join(scene_path, "train", "images")
     if not os.path.isdir(img_dir):
-        img_dir = os.path.join(scene_path, "images")  # fallback cho cấu trúc khác
+        img_dir = os.path.join(scene_path, "images")   # fallback
     if os.path.isdir(img_dir):
         n_imgs = len([f for f in os.listdir(img_dir)
                       if f.lower().endswith((".jpg", ".jpeg", ".png"))])
     else:
-        n_imgs = 240  # Không detect được → assume trung bình
+        n_imgs = 240   # Không detect được → assume trung bình
     print(f"  [Config] Số ảnh train: {n_imgs}")
 
-    # Tất cả scene đều dùng -r 1 vì ảnh đã scale 1/4 → 1320×989 fit T4 16GB
-    # densify_until_iter 20000 (từ 15000) → densify lâu hơn, scene phức tạp được bao phủ đủ
     if n_imgs <= 120:
-        # Scene nhỏ (HCM1439: 103 ảnh): densify đầy đủ, threshold thấp hơn để bắt chi tiết
-        return {"resolution": 1, "densify_until_iter": 20000, "densify_grad_threshold": 0.0001}
+        # Scene nhỏ (HCM1439: 103 ảnh)
+        return {"resolution": 2, "densify_until_iter": 22000, "densify_grad_threshold": 0.00008}
     elif n_imgs <= 220:
         # Scene vừa (HNI0265: 205, HNI0437: 224 ảnh)
-        return {"resolution": 1, "densify_until_iter": 20000, "densify_grad_threshold": 0.0002}
+        return {"resolution": 2, "densify_until_iter": 22000, "densify_grad_threshold": 0.0001}
     else:
-        # Scene đầy đủ (240 ảnh): threshold chuẩn 3DGS
-        return {"resolution": 1, "densify_until_iter": 20000, "densify_grad_threshold": 0.0002}
+        # Scene đầy đủ (~240 ảnh)
+        return {"resolution": 2, "densify_until_iter": 22000, "densify_grad_threshold": 0.00015}
+
 
 def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:
     """Phase 2: Fine-tune tại -r 1 (full resolution) sau khi Phase 1 xong.
 
     Tại sao an toàn về VRAM:
-    - Không chạy densification (densify_until_iter=0) → không có densification
-      stats tensor → VRAM tiết kiệm đáng kể so với Phase 1.
-    - Gaussians đã ở đúng vị trí từ Phase 1, Phase 2 chỉ tinh chỉnh
-      màu sắc/opacity tại full-res → gains lớn về PSNR/SSIM.
+    - densify_until_iter=0 → không chạy densification → VRAM tiết kiệm đáng kể.
+    - Gaussians đã ở đúng vị trí từ Phase 1; Phase 2 chỉ tinh chỉnh
+      màu sắc/opacity tại full-res → gains về PSNR/SSIM.
+    - Exposure compensation BỊ TẮT (giống Phase 1) vì BTS data đồng đều ánh sáng.
     """
     scene_name = os.path.basename(scene_path)
     if FINETUNE_ITERS <= 0:
@@ -285,7 +284,7 @@ def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:
         print(f"  [{scene_name}] ⚠️ Không tìm thấy checkpoint Phase 1 hợp lệ → bỏ qua fine-tune.")
         return 1
 
-    finetune_total_iters = ITERATIONS + FINETUNE_ITERS  # e.g. 35000
+    finetune_total_iters = ITERATIONS + FINETUNE_ITERS   # e.g. 35000
     log_file = f"{scene_out}/{scene_name}_finetune.log"
     check_disk_space(scene_name)
 
@@ -295,15 +294,18 @@ def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:
         f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/train.py "
         f"-s {scene_path} "
         f"-m {scene_out} "
-        f"-r 1 "                                    # Full resolution!
+        f"-r 1 "                                     # Full resolution
+        f"--data_device cpu "
         f"--use_wandb "
         f"--wandb_project bts-digital-twin "
         f"--wandb_entity {WANDB_ENTITY} "
         f"--iterations {finetune_total_iters} "
-        f"--lambda_dssim 0.5 "
-        f"--train_test_exp "
+        f"--lambda_dssim 0.3 "
+        # NOTE: --train_test_exp REMOVED — exposure compensation disabled for BTS.
+        # NOTE: --exposure_lr_* REMOVED — no exposure optimizer in this pipeline.
+        f"--depth_weight_init 0.0 "                  # Tắt depth loss ở Phase 2 fine-tune
         f"--densify_grad_threshold 0.0002 "
-        f"--densify_until_iter 0 "                  # QUAN TRỌNG: Tắt hoàn toàn densification
+        f"--densify_until_iter 0 "                   # QUAN TRỌNG: Tắt hoàn toàn densification
         f"--checkpoint_iterations {finetune_total_iters} "
         f"--save_iterations {finetune_total_iters} "
         f"--disable_viewer "
@@ -332,30 +334,33 @@ def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:
 
     return result.returncode
 
-# Ưu tiên sử dụng entity (team) "ai_race" nếu tài khoản có quyền truy cập, nếu không dùng username
+
+# ── Xác định WandB entity ─────────────────────────────────────────────────────
 import wandb
 try:
     viewer = wandb.Api().viewer
-    teams = [t for t in getattr(viewer, 'teams', [])]
+    teams  = [t for t in getattr(viewer, 'teams', [])]
     if 'ai_race' in teams or viewer.username == 'ai_race':
         WANDB_ENTITY = 'ai_race'
     else:
         WANDB_ENTITY = viewer.username
     print(f"✅ Đã chốt WandB Entity: {WANDB_ENTITY}")
-except:
+except Exception:
     WANDB_ENTITY = "ai_race"
     print(f"⚠️ Không thể lấy thông tin, ép dùng mặc định: {WANDB_ENTITY}")
+
 
 def train_scene(scene_path: str, gpu_id: int) -> tuple:
     """Train một scene. Trả về (scene_name, return_code).
 
     Chiến lược checkpoint (theo thứ tự ưu tiên kiểm tra):
-      1. Tìm checkpoint 30000 hợp lệ → bỏ qua NGAY, không copy, không load.
-      2. Tìm checkpoint 15000 hợp lệ → resume từ đó.
+      1. Tìm checkpoint 30000 hợp lệ → bỏ qua NGAY, không load.
+      2. Tìm checkpoint hợp lệ cao nhất < 30000 → resume từ đó.
       3. Không có checkpoint nào → train từ đầu.
+
     Sau khi train xong 30000:
       - Xác nhận checkpoint 30000 hợp lệ.
-      - Xóa checkpoint 15000 để giải phóng disk (~500 MB/scene).
+      - Xóa checkpoint cũ để giải phóng disk (~500 MB/scene).
     """
     scene_name = os.path.basename(scene_path)
     scene_out  = f"{OUTPUT_DIR}/{scene_name}"
@@ -370,7 +375,7 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         except:
             return 0
 
-    # ── BƯỚC 1: Kiểm tra checkpoint 30000 trong output dir ──────────────────
+    # ── BƯỚC 1: Kiểm tra checkpoint 30000 trong output dir ────────────────────
     final_ckpt = f"{scene_out}/chkpnt{ITERATIONS}.pth"
     final_ply  = f"{scene_out}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
 
@@ -385,7 +390,7 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         print(f"  ✅ [{scene_name}] point_cloud.ply found — skipping training")
         return scene_name, 0
 
-    # Xóa checkpoint 30000 nếu bị corrupt (để tránh resume sai)
+    # Xóa checkpoint 30000 nếu bị corrupt (tránh resume sai)
     if os.path.exists(final_ckpt):
         print(f"  🗑  [{scene_name}] Corrupt chkpnt{ITERATIONS}.pth detected → removing")
         try:
@@ -393,13 +398,13 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         except Exception as e:
             print(f"    Could not remove: {e}")
 
-    # ── BƯỚC 2: Tìm checkpoint để resume (ưu tiên iter cao nhất < 30000) ────
+    # ── BƯỚC 2: Tìm checkpoint để resume (ưu tiên iter cao nhất < 30000) ──────
     all_local_ckpts = sorted(
         glob.glob(f"{scene_out}/chkpnt*.pth"),
         key=get_iter_from_ckpt
     )
 
-    # Nếu có INPUT_CHECKPOINT_DIR, tìm ở đó trước
+    # Tìm checkpoint từ INPUT_CHECKPOINT_DIR (Kaggle Input dataset)
     if INPUT_CHECKPOINT_DIR:
         input_ckpts = sorted(
             glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth") +
@@ -413,7 +418,7 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
             if best_iter >= ITERATIONS and is_valid_checkpoint(best_input):
                 print(f"  ✅ [{scene_name}] Valid chkpnt{best_iter} in INPUT_CHECKPOINT_DIR — skipping (no copy)")
                 return scene_name, 0
-            # Copy các checkpoint hợp lệ sang output dir để resume
+            # Copy các checkpoint hợp lệ < 30000 sang output dir để resume
             for inp_ckpt in input_ckpts:
                 if get_iter_from_ckpt(inp_ckpt) < ITERATIONS and is_valid_checkpoint(inp_ckpt):
                     dst = f"{scene_out}/chkpnt{get_iter_from_ckpt(inp_ckpt)}.pth"
@@ -427,7 +432,7 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
     for ckpt in all_local_ckpts:
         it = get_iter_from_ckpt(ckpt)
         if it >= ITERATIONS:
-            continue  # checkpoint 30000 đã xử lý ở trên
+            continue   # checkpoint 30000 đã xử lý ở trên
         if is_valid_checkpoint(ckpt):
             resumable_ckpts.append(ckpt)
         else:
@@ -439,40 +444,46 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
 
     # Chọn checkpoint cao nhất để resume
     if resumable_ckpts:
-        best_ckpt = resumable_ckpts[-1]
-        iter_num  = get_iter_from_ckpt(best_ckpt)
+        best_ckpt   = resumable_ckpts[-1]
+        iter_num    = get_iter_from_ckpt(best_ckpt)
         resume_flag = f"--start_checkpoint {best_ckpt}"
         print(f"  [{scene_name}] Resuming from chkpnt{iter_num} → còn {ITERATIONS - iter_num} iters")
     else:
         resume_flag = ""
         print(f"  [{scene_name}] No valid checkpoint — training from scratch")
 
-    # ── BƯỚC 3: Chạy training ────────────────────────────────────────────────
-    scene_cfg = get_scene_config(scene_path)
+    # ── BƯỚC 3: Chạy training ─────────────────────────────────────────────────
+    scene_cfg  = get_scene_config(scene_path)
     check_disk_space(scene_name)
     env_prefix = "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
+
     cmd = (
         f"{env_prefix}"
         f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/train.py "
         f"-s {scene_path} "
         f"-m {scene_out} "
         f"-r {scene_cfg['resolution']} "
+        f"--data_device cpu "
         f"--use_wandb "
         f"--wandb_project bts-digital-twin "
         f"--wandb_entity {WANDB_ENTITY} "
         f"--iterations {ITERATIONS} "
-        f"--lambda_dssim 0.2 "
-        f"--train_test_exp "
+        f"--lambda_dssim 0.3 "
+        # NOTE: --train_test_exp REMOVED — exposure compensation disabled for BTS.
+        #       BTS drone data chụp cùng điều kiện ánh sáng → không cần bù trừ.
+        # NOTE: --exposure_lr_* REMOVED — exposure optimizer không còn tồn tại.
+        f"--depth_weight_init 0.1 "          # Hybrid Depth Scheduler: base weight cho DA-v2
         f"--antialiasing "
         f"--densify_grad_threshold {scene_cfg['densify_grad_threshold']} "
         f"--densify_until_iter {scene_cfg['densify_until_iter']} "
-        f"--checkpoint_iterations 15000 {ITERATIONS} "
+        f"--checkpoint_iterations 7500 15000 {ITERATIONS} "
         f"--save_iterations {ITERATIONS} "
         f"--disable_viewer "
         f"{resume_flag}"
     )
 
-    print(f"\n🚀 Training [{scene_name}] -r {scene_cfg['resolution']} on GPU {gpu_id} ...")
+    print(f"\n🚀 Training [{scene_name}] -r {scene_cfg['resolution']} (≈660×494) on GPU {gpu_id} "
+          f"| thresh={scene_cfg['densify_grad_threshold']} densify_until={scene_cfg['densify_until_iter']} ...")
     with open(log_file, "w") as lf:
         result = subprocess.run(cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT, cwd=REPO_DIR)
 
@@ -490,44 +501,46 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
             print(f"Could not read log: {e}")
         print("=" * 60 + "\n")
     else:
-        # ── BƯỚC 4: Sau khi train xong, xác nhận checkpoint 30000 hợp lệ ──
-        # rồi mới xóa checkpoint 15000 để giải phóng disk (~500 MB/scene)
+        # ── BƯỚC 4: Sau khi train xong, xác nhận checkpoint 30000 hợp lệ ─────
+        # rồi mới xóa checkpoint cũ để giải phóng disk (~500 MB/scene)
         if is_valid_checkpoint(final_ckpt):
-            print(f"  ✅ [{scene_name}] chkpnt{ITERATIONS}.pth verified OK — cleaning up intermediate checkpoints")
+            print(f"  ✅ [{scene_name}] chkpnt{ITERATIONS}.pth verified OK — xóa toàn bộ checkpoint cũ")
+            total_freed = 0
             for ckpt in glob.glob(f"{scene_out}/chkpnt*.pth"):
                 if get_iter_from_ckpt(ckpt) < ITERATIONS:
                     try:
                         sz = os.path.getsize(ckpt)
                         os.remove(ckpt)
-                        print(f"  🗑  [{scene_name}] Deleted intermediate: {os.path.basename(ckpt)} ({sz/1024/1024:.0f} MB)")
+                        total_freed += sz
+                        print(f"  🗑  [{scene_name}] Deleted: {os.path.basename(ckpt)} ({sz/1024/1024:.0f} MB)")
                     except Exception as e:
                         print(f"  ⚠️  Could not delete {os.path.basename(ckpt)}: {e}")
+            if total_freed > 0:
+                print(f"  💾 [{scene_name}] Freed {total_freed/1024/1024:.0f} MB from intermediate checkpoints")
         else:
-            print(f"  ⚠️  [{scene_name}] chkpnt{ITERATIONS}.pth MISSING or CORRUPT after training — keeping chkpnt15000 as backup")
+            print(f"  ⚠️  [{scene_name}] chkpnt{ITERATIONS}.pth MISSING or CORRUPT — GIỮ NGUYÊN mọi checkpoint cũ làm backup")
 
-        # Cleanup PLY cũ, log tensorboard
-        cleanup_after_train(scene_out, scene_name, final_iter=ITERATIONS)
+        # Cleanup PLY cũ và Tensorboard logs
+        cleanup_after_train(scene_out, scene_name)
 
     return scene_name, result.returncode
 
 
 def get_scene_priority(scene_path):
     """Sắp xếp thứ tự train để tối ưu disk và thời gian:
-      0 = đã có chkpnt30000 hợp lệ → skip ngay (xử lý trước để giải phóng GPU sớm)
-      1 = chưa có checkpoint nào → train từ đầu
-      2 = có checkpoint 15000 hợp lệ → resume (ưu tiên cao hơn, gần xong hơn)
-    Sắp xếp ascending → priority 0 xử lý trước (skip nhanh), rồi 2 (resume), rồi 1 (from scratch).
+      0 = đã có chkpnt30000 hợp lệ hoặc PLY → skip ngay
+      2 = có checkpoint 15000 hợp lệ → resume (ưu tiên cao, gần xong)
+      1 = không có gì → train từ đầu
+    Ascending → priority 0 xử lý trước (skip nhanh), 2 tiếp theo, 1 cuối.
     """
     scene_name = os.path.basename(scene_path)
     scene_out  = f"{OUTPUT_DIR}/{scene_name}"
 
-    # Đã có checkpoint 30000 hợp lệ hoặc PLY → skip ngay
     final_ckpt = f"{scene_out}/chkpnt{ITERATIONS}.pth"
     final_ply  = f"{scene_out}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
     if os.path.exists(final_ply) or is_valid_checkpoint(final_ckpt):
-        return 0  # Xử lý trước (skip nhanh, trả GPU về queue ngay)
+        return 0   # skip nhanh, trả GPU về queue ngay
 
-    # Có checkpoint 15000 hợp lệ trong output dir hoặc INPUT_CHECKPOINT_DIR
     has_15k = bool(glob.glob(f"{scene_out}/chkpnt15000.pth"))
     if INPUT_CHECKPOINT_DIR:
         has_15k = has_15k or bool(
@@ -536,15 +549,15 @@ def get_scene_priority(scene_path):
             glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt15000_{scene_name.lower()}.pth")
         )
     if has_15k:
-        return 2  # Resume từ 15000 (ưu tiên sau skip, trước from-scratch)
+        return 2   # resume từ 15000
 
-    return 1  # Không có gì → train từ đầu
+    return 1   # train từ đầu
+
 
 print("=" * 60)
-print("Sorting scenes by priority (scenes without checkpoints first)...")
+print("Sorting scenes by priority...")
 all_scenes = sorted(all_scenes, key=get_scene_priority)
 
-# Chạy song song: queue-based GPU scheduler (GPU nào rảnh sẽ nhận scene tiếp theo)
 print("=" * 60)
 print(f"Starting training for {len(all_scenes)} scenes on 2x GPU T4...")
 print("=" * 60)
@@ -554,11 +567,11 @@ gpu_queue.put(0)
 gpu_queue.put(1)
 
 def train_scene_wrapper(scene_path):
-    gpu_id = gpu_queue.get()  # block cho đến khi có GPU rảnh
+    gpu_id = gpu_queue.get()   # block cho đến khi có GPU rảnh
     try:
         return train_scene(scene_path, gpu_id)
     finally:
-        gpu_queue.put(gpu_id)  # trả GPU về queue sau khi xong
+        gpu_queue.put(gpu_id)   # trả GPU về queue sau khi xong
 
 with ThreadPoolExecutor(max_workers=2) as executor:
     futures = {
@@ -571,19 +584,18 @@ with ThreadPoolExecutor(max_workers=2) as executor:
 print("\nAll training jobs completed!")
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CELL 8 — Render test poses (sinh ảnh submission)
 # ─────────────────────────────────────────────────────────────────────────────
-def render_scene(scene_path: str, gpu_id: int) -> str:
+def render_scene(scene_path: str, gpu_id: int) -> tuple:
     scene_name = os.path.basename(scene_path)
     scene_out  = f"{OUTPUT_DIR}/{scene_name}"
     log_file   = f"{OUTPUT_DIR}/{scene_name}_render.log"
 
-    # Tự động phát hiện iteration cao nhất (Phase 2 nếu đã chạy, Phase 1 nếu không)
+    # Tự động phát hiện iteration cao nhất
     final_iter = get_final_iteration(scene_out)
 
-    # Kiểm tra point_cloud.ply tồn tại trước khi render để tránh crash
+    # Kiểm tra point_cloud.ply tồn tại trước khi render
     ply_path = f"{scene_out}/point_cloud/iteration_{final_iter}/point_cloud.ply"
     if not os.path.exists(ply_path):
         print(f"  ⚠️  [{scene_name}] Skipping render — point_cloud.ply not found: {ply_path}")
@@ -603,7 +615,7 @@ def render_scene(scene_path: str, gpu_id: int) -> str:
 
     status = "✅ DONE" if result.returncode == 0 else f"❌ FAILED (rc={result.returncode})"
     print(f"  [{scene_name}] {status}")
-    
+
     if result.returncode != 0:
         print(f"\n{'='*20} ERROR LOG FOR {scene_name} (Last 50 lines) {'='*20}")
         try:
@@ -621,13 +633,13 @@ print("=" * 60)
 print("Rendering test views for all scenes...")
 print("=" * 60)
 
-# Kiểm tra trạng thái training trước khi render (hỗ trợ cả Phase 1 và Phase 2)
+# Kiểm tra trạng thái training trước khi render
 print("\n📊 Training status check:")
 trained_scenes = []
-failed_scenes = []
+failed_scenes  = []
 for scene_path in all_scenes:
-    scene_name = os.path.basename(scene_path)
-    scene_out_path = f"{OUTPUT_DIR}/{scene_name}"
+    scene_name      = os.path.basename(scene_path)
+    scene_out_path  = f"{OUTPUT_DIR}/{scene_name}"
     final_iter_check = get_final_iteration(scene_out_path)
     ply_path = f"{scene_out_path}/point_cloud/iteration_{final_iter_check}/point_cloud.ply"
     if os.path.exists(ply_path):
@@ -641,7 +653,7 @@ print(f"\n  → {len(trained_scenes)}/{len(all_scenes)} scenes ready to render")
 if failed_scenes:
     print(f"  → Skipping: {failed_scenes}")
 
-# Khởi tạo lại queue cho quá trình render
+# Khởi tạo lại GPU queue cho render
 render_gpu_queue = queue.Queue()
 render_gpu_queue.put(0)
 render_gpu_queue.put(1)
@@ -656,7 +668,7 @@ def render_scene_wrapper(scene_path):
 with ThreadPoolExecutor(max_workers=2) as executor:
     futures = {
         executor.submit(render_scene_wrapper, scene): scene
-        # BUG FIX: Chỉ render những scene đã train xong (có point_cloud.ply)
+        # Chỉ render những scene đã train xong (có point_cloud.ply)
         for scene in trained_scenes
     }
     for future in as_completed(futures):
@@ -665,11 +677,10 @@ with ThreadPoolExecutor(max_workers=2) as executor:
 print("\nAll renders completed!")
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CELL 9 — Đóng gói submission.zip
 # ─────────────────────────────────────────────────────────────────────────────
-import zipfile  # shutil đã import ở Cell 7
+import zipfile   # shutil đã import ở Cell 7
 
 SUBMISSION_DIR = "/kaggle/working/submission"
 SUBMISSION_ZIP = "/kaggle/working/submission.zip"
@@ -683,7 +694,6 @@ missing_scenes = []
 
 for scene_path in all_scenes:
     scene_name  = os.path.basename(scene_path)
-    # Tự động dùng iteration cao nhất (Phase 2 nếu có, Phase 1 nếu không)
     final_iter  = get_final_iteration(f"{OUTPUT_DIR}/{scene_name}")
     render_path = f"{OUTPUT_DIR}/{scene_name}/test/ours_{final_iter}/renders"
 

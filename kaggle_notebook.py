@@ -250,14 +250,14 @@ def get_scene_config(scene_path: str) -> dict:
     print(f"  [Config] Số ảnh train: {n_imgs}")
 
     if n_imgs <= 120:
-        # Scene nhỏ (HCM1439: 103 ảnh)
-        return {"resolution": 2, "densify_until_iter": 22000, "densify_grad_threshold": 0.00008}
+        # Scene nhỏ: ngưỡng nhạy hơn một chút để bắt chi tiết
+        return {"resolution": 2, "densify_until_iter": 15000, "densify_grad_threshold": 0.00015}
     elif n_imgs <= 220:
-        # Scene vừa (HNI0265: 205, HNI0437: 224 ảnh)
-        return {"resolution": 2, "densify_until_iter": 22000, "densify_grad_threshold": 0.0001}
+        # Scene vừa
+        return {"resolution": 2, "densify_until_iter": 15000, "densify_grad_threshold": 0.0002}
     else:
-        # Scene đầy đủ (~240 ảnh)
-        return {"resolution": 2, "densify_until_iter": 22000, "densify_grad_threshold": 0.00015}
+        # Scene đầy đủ: ngưỡng chuẩn của 3DGS
+        return {"resolution": 2, "densify_until_iter": 15000, "densify_grad_threshold": 0.00025}
 
 
 def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:

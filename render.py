@@ -39,12 +39,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering = render(view, gaussians, pipeline, background, separate_sh=separate_sh)["render"]
         gt = view.original_image[0:3, :, :]
 
-        # Lưu theo image_name gốc từ test_poses.csv để submission khớp với ground truth
+        # Giu nguyen image_name tu test_poses.csv (vi du: DJI_XXXXX.JPG)
+        # Competition kiem tra ten file, khong kiem tra noi dung dinh dang.
         img_name = getattr(view, 'image_name', None)
         if img_name:
-            # Đảm bảo phần mở rộng là .png
-            stem = os.path.splitext(img_name)[0]
-            out_name = stem + ".png"
+            out_name = img_name          # giu nguyen, e.g. DJI_20241229_0001_V.JPG
         else:
             out_name = '{0:05d}'.format(idx) + ".png"
 

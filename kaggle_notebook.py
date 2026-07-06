@@ -463,6 +463,7 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         f"-s {scene_path} "
         f"-m {scene_out} "
         f"-r {scene_cfg['resolution']} "
+        f"--sh_degree 1 "                    # SH degree 1: giảm 2.5x kích thước checkpoint
         f"--data_device cpu "
         f"--use_wandb "
         f"--wandb_project bts-digital-twin "
@@ -470,13 +471,13 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         f"--iterations {ITERATIONS} "
         f"--lambda_dssim 0.3 "
         # NOTE: --train_test_exp REMOVED — exposure compensation disabled for BTS.
-        #       BTS drone data chụp cùng điều kiện ánh sáng → không cần bù trừ.
         # NOTE: --exposure_lr_* REMOVED — exposure optimizer không còn tồn tại.
         f"--depth_weight_init 0.1 "          # Hybrid Depth Scheduler: base weight cho DA-v2
         f"--antialiasing "
         f"--densify_grad_threshold {scene_cfg['densify_grad_threshold']} "
         f"--densify_until_iter {scene_cfg['densify_until_iter']} "
-        f"--checkpoint_iterations 7500 15000 {ITERATIONS} "
+        f"--opacity_reset_interval 2000 "    # Prune Gaussians chết sớn để kiểm soát số lượng điểm
+        f"--checkpoint_iterations 15000 {ITERATIONS} "  # Bỏ 7500: checkpoint nhỏ ít cần thiết
         f"--save_iterations {ITERATIONS} "
         f"--disable_viewer "
         f"{resume_flag}"

@@ -679,12 +679,15 @@ print("\nAll renders completed!")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CELL 9 — Đóng gói submission.zip
+# CELL 9 — Dong goi submission.zip (smart packer: <= 350 MB)
 # ─────────────────────────────────────────────────────────────────────────────
-import zipfile   # shutil đã import ở Cell 7
+import zipfile, io   # shutil da import o Cell 7
+from PIL import Image
 
 SUBMISSION_DIR = "/kaggle/working/submission"
 SUBMISSION_ZIP = "/kaggle/working/submission.zip"
+ZIP_TARGET_MB  = 350
+ZIP_TARGET     = ZIP_TARGET_MB * 1024 * 1024
 
 print("=" * 60)
 print("Packaging submission.zip ...")
@@ -699,7 +702,7 @@ for scene_path in all_scenes:
     render_path = f"{OUTPUT_DIR}/{scene_name}/test/ours_{final_iter}/renders"
 
     if not os.path.isdir(render_path):
-        print(f"  ⚠️  [{scene_name}] Render path not found: {render_path}")
+        print(f"  [{scene_name}] Render path not found: {render_path}")
         missing_scenes.append(scene_name)
         continue
 
@@ -710,26 +713,81 @@ for scene_path in all_scenes:
     for img in imgs:
         shutil.copy(img, dest)
 
-    # Log mẫu tên ảnh để xác nhận khớp với test_poses.csv
     sample_names = [os.path.basename(p) for p in imgs[:3]]
-    print(f"  ✅ [{scene_name}] Copied {len(imgs)} images  (samples: {sample_names})")
+    print(f"  [{scene_name}] Copied {len(imgs)} images  (samples: {sample_names})")
 
-# Zip
-if os.path.exists(SUBMISSION_ZIP):
-    os.remove(SUBMISSION_ZIP)
+# -- Ham tien ich ---------------------------------------------------------------
 
-with zipfile.ZipFile(SUBMISSION_ZIP, "w", zipfile.ZIP_DEFLATED) as zf:
-    for root, _, files in os.walk(SUBMISSION_DIR):
-        for file in files:
-            full_path = os.path.join(root, file)
-            arcname   = os.path.relpath(full_path, SUBMISSION_DIR)
-            zf.write(full_path, arcname)
+def _collect_images(src_dir):
+    pairs = []
+    for root, _, files in os.walk(src_dir):
+        for f in sorted(files):
+            if f.lower().endswith((".png", ".jpg", ".jpeg")):
+                full    = os.path.join(root, f)
+                arcname = os.path.relpath(full, src_dir)
+                pairs.append((full, arcname))
+    return pairs
 
-zip_size_mb = os.path.getsize(SUBMISSION_ZIP) / 1024 / 1024
-print(f"\n✅ submission.zip created: {SUBMISSION_ZIP} ({zip_size_mb:.1f} MB)")
+def _pack_png_lossless(pairs, dst):
+    if os.path.exists(dst):
+        os.remove(dst)
+    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        for full, arcname in pairs:
+            zf.write(full, arcname)
+    return os.path.getsize(dst)
+
+def _pack_jpeg(pairs, dst, quality):
+    """Chuyen PNG -> JPEG in-memory, giu extension .png de khop ten nop bai."""
+    n_ok = n_err = 0
+    if os.path.exists(dst):
+        os.remove(dst)
+    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        for full, arcname in pairs:
+            try:
+                img = Image.open(full).convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True, subsampling=0)
+                buf.seek(0)
+                zf.writestr(arcname, buf.read())
+                n_ok += 1
+            except Exception as e:
+                zf.write(full, arcname)
+                n_err += 1
+                print(f"    WARNING {arcname}: {e}")
+    sz = os.path.getsize(dst)
+    print(f"  [JPEG q={quality}] OK={n_ok} ERR={n_err} -> {sz/1024/1024:.1f} MB")
+    return sz
+
+# -- Smart packer ---------------------------------------------------------------
+
+pairs   = _collect_images(SUBMISSION_DIR)
+raw_mb  = sum(os.path.getsize(p) for p, _ in pairs) / 1024 / 1024
+print(f"\nTong {len(pairs)} anh ({raw_mb:.1f} MB raw). Target: <= {ZIP_TARGET_MB} MB\n")
+
+# Buoc 1: Thu PNG lossless
+print("Buoc 1: PNG lossless (DEFLATE level=9)...")
+zip_size = _pack_png_lossless(pairs, SUBMISSION_ZIP)
+zip_mb   = zip_size / 1024 / 1024
+print(f"  PNG lossless -> {zip_mb:.1f} MB")
+
+if zip_size <= ZIP_TARGET:
+    print(f"OK {zip_mb:.1f} MB <= {ZIP_TARGET_MB} MB -> {SUBMISSION_ZIP}")
+else:
+    print(f"Qua lon ({zip_mb:.1f} MB). Chuyen sang JPEG...\n")
+    for q in [92, 88, 85, 82, 80]:
+        print(f"Buoc 2: JPEG quality={q}...")
+        zip_size = _pack_jpeg(pairs, SUBMISSION_ZIP, quality=q)
+        zip_mb   = zip_size / 1024 / 1024
+        if zip_size <= ZIP_TARGET:
+            nen_pct = (1 - zip_size / (raw_mb * 1024 * 1024)) * 100
+            print(f"OK JPEG q={q}: {zip_mb:.1f} MB <= {ZIP_TARGET_MB} MB (nen {nen_pct:.0f}%)")
+            print(f"-> {SUBMISSION_ZIP}")
+            break
+    else:
+        print(f"FAILED: van {zip_mb:.1f} MB > {ZIP_TARGET_MB} MB o JPEG q=80. Giu file nho nhat.")
 
 if missing_scenes:
-    print(f"\n⚠️  Missing renders for: {missing_scenes}")
+    print(f"\nMissing renders: {missing_scenes}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

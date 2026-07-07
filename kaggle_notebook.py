@@ -686,7 +686,10 @@ def process_scene_pipeline(scene_path):
         render_path = f"{scene_out}/test/ours_{final_iter}/renders"
         if os.path.isdir(render_path):
             os.makedirs(submission_dest, exist_ok=True)
-            imgs = sorted(glob.glob(f"{render_path}/*.png"))
+            imgs = []
+            for ext in ('*.png', '*.jpg', '*.jpeg', '*.JPG', '*.JPEG'):
+                imgs.extend(glob.glob(f"{render_path}/{ext}"))
+            imgs = sorted(imgs)
             for img in imgs:
                 shutil.move(img, submission_dest)
             

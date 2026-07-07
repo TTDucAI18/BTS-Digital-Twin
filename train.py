@@ -165,14 +165,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # ── TASK 2: Hybrid Depth Regularization (DA-v2 + Two-Phase Scheduler) ────
         # Only renders depth tensor and computes gradient graph when weight > 0.
         # From iteration 25 000+, this block is skipped entirely → saves VRAM & time.
+        #
+        # FIX BUG 1: render_pkg["depth"] returns LINEAR depth (Z distance from camera).
+        # mono_invdepth stores INVERSE depth (1/Z). We must convert before comparing.
+        # FIX BUG 2: Use masked mean — divide only by the number of valid mask pixels
+        #            to avoid gradient dilution from sky/unreliable regions.
         Ll1depth_pure = 0.0
         current_depth_weight = get_depth_weight(iteration, base_weight=opt.depth_weight_init)
         if current_depth_weight > 0.0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
+            rendered_linear_depth = render_pkg["depth"]
+            # Convert linear depth → inverse depth (same space as mono depth estimator output)
+            rendered_inv_depth = 1.0 / rendered_linear_depth.clamp(min=1e-4)
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
-            Ll1depth_pure = torch.abs((invDepth - mono_invdepth) * depth_mask).mean()
+            # Masked L1: sum over valid pixels, divide by count of valid pixels
+            diff = torch.abs((rendered_inv_depth - mono_invdepth) * depth_mask)
+            Ll1depth_pure = diff.sum() / (depth_mask.sum() + 1e-6)
             Ll1depth = current_depth_weight * Ll1depth_pure
             loss += Ll1depth
             Ll1depth = Ll1depth.item()
@@ -192,6 +201,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 free_space_gb = shutil.disk_usage(scene.model_path).free / (1024**3)
                 if free_space_gb < 3.5:
                     print(f"\n[ITER {iteration}] WARNING: Disk space low ({free_space_gb:.2f} GB left). Stopping training early.")
+                    torch.cuda.empty_cache()  # Prevent OOM before emergency save
                     scene.save(iteration)
                     new_ckpt_path = scene.model_path + "/chkpnt" + str(iteration) + ".pth"
                     torch.save((gaussians.capture(), iteration), new_ckpt_path)
@@ -227,6 +237,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE), val_cameras)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
+                # FIX BUG 4: Free VRAM before writing large PLY to disk.
+                # At iter 30000, Gaussian count can be very large (>1M points).
+                # Keeping optimizer tensors in VRAM while writing causes OOM (rc=137).
+                torch.cuda.empty_cache()
                 scene.save(iteration)
 
             # Densification
@@ -370,13 +384,14 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[25_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
     parser.add_argument("--wandb_project", type=str, default="bts-digital-twin")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (username or team)")
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
+    if args.iterations not in args.save_iterations:
+        args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
 

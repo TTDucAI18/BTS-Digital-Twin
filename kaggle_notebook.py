@@ -148,7 +148,11 @@ args = parser.parse_args()
 gaussians = GaussianModel(args.sh_degree, 'default')
 model_params, _ = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
 
-# Trực tiếp gán các tensors từ checkpoint vào mô hình (bỏ qua optimizer để tránh lỗi trên CPU)
+# capture() returns a 12-element tuple:
+# (active_sh_degree, _xyz, _features_dc, _features_rest, _scaling,
+#  _rotation, _opacity, max_radii2D, xyz_gradient_accum, denom, optimizer_state, spatial_lr_scale)
+# We restore the model fields directly to bypass the optimizer (CPU-safe).
+gaussians.active_sh_degree = model_params[0]  # Restore SH degree so colors render correctly
 gaussians._xyz = model_params[1]
 gaussians._features_dc = model_params[2]
 gaussians._features_rest = model_params[3]
@@ -158,7 +162,7 @@ gaussians._opacity = model_params[6]
 
 os.makedirs(os.path.dirname(args.out_ply), exist_ok=True)
 gaussians.save_ply(args.out_ply)
-print(f"Extracted PLY to {args.out_ply}")
+print(f"Extracted PLY to {args.out_ply} (active_sh_degree={gaussians.active_sh_degree})")
 """)
 
 # Thư mục chứa checkpoint từ Kaggle Input dataset (để resume nếu có)
@@ -269,7 +273,8 @@ def get_scene_config(scene_path: str) -> dict:
     Chiến lược -r 1 (full resolution):
     - Huấn luyện ở độ phân giải gốc để tránh mismatch khi render test.
     - Điều chỉnh densify_grad_threshold theo số ảnh để cân bằng chi tiết vs VRAM.
-    - densify_until_iter = 15000 để densification hoàn thành trước nửa quá trình.
+    - densify_until_iter = 27000: densification chạy qua cả giai đoạn Depth Loss
+      tắt (iter 25k), cho phép model sinh điểm mới khi tinh chỉnh màu sắc.
     """
     # BTS structure: scene_path/train/images
     img_dir = os.path.join(scene_path, "train", "images")
@@ -284,13 +289,13 @@ def get_scene_config(scene_path: str) -> dict:
 
     if n_imgs <= 120:
         # Scene nhỏ: ngưỡng nhạy hơn một chút để bắt chi tiết mỏng (cáp)
-        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.00012}
+        return {"resolution": 1, "densify_until_iter": 27000, "densify_grad_threshold": 0.00012}
     elif n_imgs <= 220:
         # Scene vừa
-        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.00015}
+        return {"resolution": 1, "densify_until_iter": 27000, "densify_grad_threshold": 0.00015}
     else:
         # Scene đầy đủ
-        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.0002}
+        return {"resolution": 1, "densify_until_iter": 27000, "densify_grad_threshold": 0.0002}
 
 
 def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:
@@ -528,8 +533,8 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         f"--antialiasing "
         f"--densify_grad_threshold {scene_cfg['densify_grad_threshold']} "
         f"--densify_until_iter {scene_cfg['densify_until_iter']} "
-        f"--opacity_reset_interval 2000 "    # Prune Gaussians chết sớn để kiểm soát số lượng điểm
-        f"--checkpoint_iterations 15000 {ITERATIONS} "  # Bỏ 7500: checkpoint nhỏ ít cần thiết
+        f"--opacity_reset_interval 3000 "    # OPT: giảm tần suất reset để tránh over-prune khi densify kéo dài đến 27k
+        f"--checkpoint_iterations 7500 15000 25000 {ITERATIONS} "  # BUG 4: thêm 25000 để có safety net khi OOM ở iter 30000
         f"--save_iterations {ITERATIONS} "
         f"--disable_viewer "
         f"{resume_flag}"
@@ -580,10 +585,12 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
 
 def get_scene_priority(scene_path):
     """Sắp xếp thứ tự train để tối ưu disk và thời gian:
-      0 = đã có chkpnt30000 hợp lệ hoặc PLY → skip ngay
-      2 = có checkpoint 15000 hợp lệ → resume (ưu tiên cao, gần xong)
+      2 = có checkpoint trung gian hợp lệ → resume (ưu tiên cao nhất, gần xong)
       1 = không có gì → train từ đầu
-    Ascending → priority 0 xử lý trước (skip nhanh), 2 tiếp theo, 1 cuối.
+      0 = đã có chkpnt30000 hợp lệ hoặc PLY → skip ngay (xử lý cuối)
+    Descending sort → priority 2 được chạy trước (resume tận dụng GPU),
+                    priority 1 tiếp theo (train mới hoàn toàn),
+                    priority 0 cuối cùng (skip nhanh — để GPU rảnh xử lý 2 loại trên trước).
     """
     scene_name = os.path.basename(scene_path)
     scene_out  = f"{OUTPUT_DIR}/{scene_name}"
@@ -591,24 +598,40 @@ def get_scene_priority(scene_path):
     final_ckpt = f"{scene_out}/chkpnt{ITERATIONS}.pth"
     final_ply  = f"{scene_out}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
     if os.path.exists(final_ply) or is_valid_checkpoint(final_ckpt):
-        return 0   # skip nhanh, trả GPU về queue ngay
+        return 0   # skip nhanh
 
-    has_15k = bool(glob.glob(f"{scene_out}/chkpnt15000.pth"))
-    if INPUT_CHECKPOINT_DIR:
-        has_15k = has_15k or bool(
-            glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt15000.pth") +
-            glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt15000_{scene_name}.pth") +
-            glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt15000_{scene_name.lower()}.pth")
-        )
-    if has_15k:
-        return 2   # resume từ 15000
+    has_intermediate = False
+    for ckpt in glob.glob(f"{scene_out}/chkpnt*.pth"):
+        try:
+            it = int(os.path.basename(ckpt).replace("chkpnt", "").replace(".pth", ""))
+            if 0 < it < ITERATIONS:
+                has_intermediate = True
+                break
+        except:
+            pass
+
+    if INPUT_CHECKPOINT_DIR and not has_intermediate:
+        for ckpt in glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth") + \
+                    glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name}.pth") + \
+                    glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name.lower()}.pth"):
+            try:
+                name_part = os.path.basename(ckpt).split('_')[0]
+                it = int(name_part.replace("chkpnt", "").replace(".pth", ""))
+                if 0 < it < ITERATIONS:
+                    has_intermediate = True
+                    break
+            except:
+                pass
+
+    if has_intermediate:
+        return 2   # resume từ checkpoint trung gian
 
     return 1   # train từ đầu
 
 
 print("=" * 60)
 print("Sorting scenes by priority...")
-all_scenes = sorted(all_scenes, key=get_scene_priority)
+all_scenes = sorted(all_scenes, key=get_scene_priority, reverse=True)
 
 print("=" * 60)
 print(f"Starting unified pipeline for {len(all_scenes)} scenes on 2x GPU T4...")
@@ -680,13 +703,20 @@ def process_scene_pipeline(scene_path):
             return scene_name, 0
 
         # 2. Train or extract ply
-        train_scene(scene_path, gpu_id)
+        _, train_rc = train_scene(scene_path, gpu_id)
 
-        # 3. Render
+        # 3. Render (chỉ render khi train thành công hoặc đã có PLY)
+        final_iter = get_final_iteration(scene_out)
+        ply_path = f"{scene_out}/point_cloud/iteration_{final_iter}/point_cloud.ply"
+        if not os.path.exists(ply_path):
+            print(f"  ⚠️  [{scene_name}] Không có PLY để render — bỏ qua.")
+            # BUG 5 FIX: KHÔNG xóa scene_out khi fail — giữ lại checkpoints để resume
+            print(f"  💾 [{scene_name}] Giữ nguyên output dir để resume lần sau.")
+            return scene_name, train_rc
+
         render_scene(scene_path, gpu_id)
 
         # 4. Move renders to submission
-        final_iter = get_final_iteration(scene_out)
         render_path = f"{scene_out}/test/ours_{final_iter}/renders"
         if os.path.isdir(render_path):
             os.makedirs(submission_dest, exist_ok=True)
@@ -702,12 +732,21 @@ def process_scene_pipeline(scene_path):
         else:
             print(f"  ⚠️  [{scene_name}] No renders found at {render_path}")
 
-        # 5. Immediately delete scene_out to save disk space
-        try:
-            shutil.rmtree(scene_out)
-            print(f"  [{scene_name}] 🧹 Cleaned up output directory to free disk space.")
-        except Exception as e:
-            print(f"  [{scene_name}] ⚠️ Cleanup error: {e}")
+        # 5. BUG 5 FIX: Chỉ xóa scene_out khi render đã THÀNH CÔNG và ảnh đã copy xong
+        #    Nếu render fail hoặc không có ảnh, giữ lại output để debug / resume
+        submission_imgs = (
+            glob.glob(f"{submission_dest}/*.png") +
+            glob.glob(f"{submission_dest}/*.jpg") +
+            glob.glob(f"{submission_dest}/*.JPG")
+        )
+        if os.path.isdir(submission_dest) and len(submission_imgs) > 0:
+            try:
+                shutil.rmtree(scene_out)
+                print(f"  [{scene_name}] 🧹 Cleaned up output directory to free disk space.")
+            except Exception as e:
+                print(f"  [{scene_name}] ⚠️ Cleanup error: {e}")
+        else:
+            print(f"  [{scene_name}] ⚠️ Render chưa có ảnh — giữ nguyên output dir để resume.")
 
         return scene_name, 0
     finally:

@@ -39,14 +39,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering = render(view, gaussians, pipeline, background, separate_sh=separate_sh)["render"]
         gt = view.original_image[0:3, :, :]
 
-        img_name = getattr(view, 'image_name', None)
-        if img_name:
-            if "." in img_name:
-                out_name = os.path.splitext(img_name)[0] + ".png"
-            else:
-                out_name = img_name + ".png"
-        else:
-            out_name = '{0:05d}'.format(idx) + ".png"
+        # Kaggle requires exactly 4-digit 1-indexed filenames (e.g. 0001.png, 0002.png)
+        # regardless of the original image_name in test_poses.csv
+        out_name = '{0:04d}'.format(idx + 1) + ".png"
 
         torchvision.utils.save_image(rendering, os.path.join(render_path, out_name))
         torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))

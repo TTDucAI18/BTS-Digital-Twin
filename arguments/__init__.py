@@ -93,12 +93,13 @@ class OptimizationParams(ParamGroup):
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
-        self.densify_grad_threshold = 0.0002
+        self.densify_grad_threshold = 0.00015
         # Hybrid Depth Scheduler (TASK 2): base weight for DA-v2 depth regularization.
         # Phase 1 (0-5k iters): full strength to anchor Gaussians on BTS tower.
         # Phase 2 (5k-25k iters): linear decay to 0, freeing 3DGS to recover cable geometry.
         # Phase 3 (25k+ iters): depth loss disabled, color-only optimization for fine details.
-        self.depth_weight_init = 0.1
+        # NOTE: Giảm từ 0.1 → 0.02 để không kìm hãm cáp mỏng (COLMAP không đo được depth cáp trên nền trời).
+        self.depth_weight_init = 0.02
         self.random_background = False
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")

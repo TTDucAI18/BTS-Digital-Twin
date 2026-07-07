@@ -142,7 +142,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", type=str, required=True)
 parser.add_argument("--out_ply", type=str, required=True)
-parser.add_argument("--sh_degree", type=int, default=1)
+parser.add_argument("--sh_degree", type=int, default=3)
 args = parser.parse_args()
 
 gaussians = GaussianModel(args.sh_degree, 'default')
@@ -266,9 +266,10 @@ def get_final_iteration(scene_out: str) -> int:
 def get_scene_config(scene_path: str) -> dict:
     """Trả về config training tối ưu dựa trên số ảnh của scene.
 
-    Chiến lược -r 2:
-    - -r 2 → ảnh ~660×494, VRAM giảm ~4x, tốc độ tăng ~2-3x so với -r 1.
-    - Bù bằng: densify_grad_threshold thấp hơn, densify_until_iter cao hơn (22000).
+    Chiến lược -r 1 (full resolution):
+    - Huấn luyện ở độ phân giải gốc để tránh mismatch khi render test.
+    - Điều chỉnh densify_grad_threshold theo số ảnh để cân bằng chi tiết vs VRAM.
+    - densify_until_iter = 15000 để densification hoàn thành trước nửa quá trình.
     """
     # BTS structure: scene_path/train/images
     img_dir = os.path.join(scene_path, "train", "images")
@@ -415,13 +416,13 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         print(f"  ✅ [{scene_name}] Valid chkpnt{ITERATIONS}.pth found — skipping training")
         if not os.path.exists(final_ply):
             print(f"  ⚠️  [{scene_name}] point_cloud.ply missing — Extracting...")
-            cmd_extract = f"python /kaggle/working/extract_ply.py --checkpoint {final_ckpt} --out_ply {final_ply} --sh_degree 1"
+            cmd_extract = f"python /kaggle/working/extract_ply.py --checkpoint {final_ckpt} --out_ply {final_ply} --sh_degree 3"
             subprocess.run(cmd_extract, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=REPO_DIR)
         
         cfg_dest = os.path.join(scene_out, "cfg_args")
         if not os.path.exists(cfg_dest):
             with open(cfg_dest, "w") as f:
-                f.write("Namespace(sh_degree=1, source_path='', model_path='', images='images', resolution=-1, data_device='cuda', eval=False, white_background=False, depths='')")
+                f.write("Namespace(sh_degree=3, source_path='', model_path='', images='images', resolution=-1, data_device='cuda', eval=False, white_background=False, depths='')")
         
         return scene_name, 0
 
@@ -457,7 +458,7 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
             best_iter  = get_iter_from_ckpt(best_input)
             if best_iter >= ITERATIONS and is_valid_checkpoint(best_input):
                 print(f"  ✅ [{scene_name}] Valid chkpnt{best_iter} in INPUT_CHECKPOINT_DIR — Extracting PLY directly to output...")
-                cmd_extract = f"python /kaggle/working/extract_ply.py --checkpoint {best_input} --out_ply {final_ply} --sh_degree 1"
+                cmd_extract = f"python /kaggle/working/extract_ply.py --checkpoint {best_input} --out_ply {final_ply} --sh_degree 3"
                 subprocess.run(cmd_extract, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=REPO_DIR)
                 
                 cfg_src = os.path.join(os.path.dirname(best_input), "cfg_args")
@@ -466,7 +467,7 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
                     shutil.copy(cfg_src, cfg_dest)
                 elif not os.path.exists(cfg_dest):
                     with open(cfg_dest, "w") as f:
-                        f.write("Namespace(sh_degree=1, source_path='', model_path='', images='images', resolution=-1, data_device='cuda', eval=False, white_background=False, depths='')")
+                        f.write("Namespace(sh_degree=3, source_path='', model_path='', images='images', resolution=-1, data_device='cuda', eval=False, white_background=False, depths='')") 
                 
                 return scene_name, 0
             # Copy các checkpoint hợp lệ < 30000 sang output dir để resume
@@ -534,8 +535,7 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         f"{resume_flag}"
     )
 
-    print(f"\n🚀 Training [{scene_name}] -r {scene_cfg['resolution']} (≈660×494) on GPU {gpu_id} "
-          f"| thresh={scene_cfg['densify_grad_threshold']} densify_until={scene_cfg['densify_until_iter']} ...")
+    print(f"\n🚀 Training [{scene_name}] -r {scene_cfg['resolution']} on GPU {gpu_id} | sh_degree=3 depth_w=0.02 thresh={scene_cfg['densify_grad_threshold']} densify_until={scene_cfg['densify_until_iter']} ...")
     with open(log_file, "w") as lf:
         result = subprocess.run(cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT, cwd=REPO_DIR)
 
@@ -641,7 +641,7 @@ def render_scene(scene_path: str, gpu_id: int) -> tuple:
         f"-m {scene_out} "
         f"--skip_train "
         f"--iteration {final_iter} "
-        f"--sh_degree 1"
+        f"--sh_degree 3"
     )
 
     print(f"🎨 Rendering [{scene_name}] on GPU {gpu_id} ...")
@@ -671,7 +671,11 @@ def process_scene_pipeline(scene_path):
         submission_dest = f"{SUBMISSION_DIR}/{scene_name}"
 
         # 1. Skip if already submitted
-        if os.path.isdir(submission_dest) and len(glob.glob(f"{submission_dest}/*.png")) > 0:
+        if os.path.isdir(submission_dest) and len(
+                glob.glob(f"{submission_dest}/*.png") +
+                glob.glob(f"{submission_dest}/*.jpg") +
+                glob.glob(f"{submission_dest}/*.JPG")
+            ) > 0:
             print(f"  ✅ [{scene_name}] Already rendered in submission/. Skip.")
             return scene_name, 0
 
@@ -741,7 +745,7 @@ for scene_path in all_scenes:
     scene_name  = os.path.basename(scene_path)
     dest = f"{SUBMISSION_DIR}/{scene_name}"
 
-    if not os.path.isdir(dest) or len(glob.glob(f"{dest}/*.png")) == 0:
+    if not os.path.isdir(dest) or len(glob.glob(f"{dest}/*.png") + glob.glob(f"{dest}/*.jpg") + glob.glob(f"{dest}/*.JPG")) == 0:
         missing_scenes.append(scene_name)
 
 # -- Ham tien ich ---------------------------------------------------------------

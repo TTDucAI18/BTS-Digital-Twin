@@ -289,13 +289,13 @@ def get_scene_config(scene_path: str) -> dict:
 
     if n_imgs <= 120:
         # Scene nhỏ: ngưỡng nhạy hơn một chút để bắt chi tiết mỏng (cáp)
-        return {"resolution": 1, "densify_until_iter": 27000, "densify_grad_threshold": 0.00012}
+        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.00012}
     elif n_imgs <= 220:
         # Scene vừa
-        return {"resolution": 1, "densify_until_iter": 27000, "densify_grad_threshold": 0.00015}
+        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.00015}
     else:
         # Scene đầy đủ
-        return {"resolution": 1, "densify_until_iter": 27000, "densify_grad_threshold": 0.0002}
+        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.0002}
 
 
 def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:

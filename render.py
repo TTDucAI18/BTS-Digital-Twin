@@ -39,11 +39,12 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering = render(view, gaussians, pipeline, background, separate_sh=separate_sh)["render"]
         gt = view.original_image[0:3, :, :]
 
-        # Giu nguyen image_name tu test_poses.csv (vi du: DJI_XXXXX.JPG)
-        # Competition kiem tra ten file, khong kiem tra noi dung dinh dang.
         img_name = getattr(view, 'image_name', None)
         if img_name:
-            out_name = img_name          # giu nguyen, e.g. DJI_20241229_0001_V.JPG
+            if "." in img_name:
+                out_name = os.path.splitext(img_name)[0] + ".png"
+            else:
+                out_name = img_name + ".png"
         else:
             out_name = '{0:05d}'.format(idx) + ".png"
 

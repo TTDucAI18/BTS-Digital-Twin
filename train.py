@@ -356,6 +356,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
+    if first_iter > opt.iterations:
+        print("\n[INFO] Checkpoint already at target iteration. Saving point cloud...")
+        scene.save(opt.iterations)
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")

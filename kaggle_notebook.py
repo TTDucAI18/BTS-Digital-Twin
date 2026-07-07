@@ -129,6 +129,38 @@ FINETUNE_ITERS       = 0        # Fine-tune TẮT (Phase 2 gây regression trên
 KAGGLE_TIME_LIMIT_H  = 10.0     # Ngưỡng an toàn (12h limit Kaggle − 2h buffer)
 KAGGLE_SESSION_START = time.time()
 
+# Script nhẹ để trích xuất PLY mà không bị CPU OOM do load ảnh
+with open("/kaggle/working/extract_ply.py", "w") as f:
+    f.write("""import sys
+import os
+sys.path.append("/kaggle/working/BTS-Digital-Twin")
+
+import torch
+from scene.gaussian_model import GaussianModel
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--checkpoint", type=str, required=True)
+parser.add_argument("--out_ply", type=str, required=True)
+parser.add_argument("--sh_degree", type=int, default=1)
+args = parser.parse_args()
+
+gaussians = GaussianModel(args.sh_degree, 'default')
+model_params, _ = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+
+# Trực tiếp gán các tensors từ checkpoint vào mô hình (bỏ qua optimizer để tránh lỗi trên CPU)
+gaussians._xyz = model_params[1]
+gaussians._features_dc = model_params[2]
+gaussians._features_rest = model_params[3]
+gaussians._scaling = model_params[4]
+gaussians._rotation = model_params[5]
+gaussians._opacity = model_params[6]
+
+os.makedirs(os.path.dirname(args.out_ply), exist_ok=True)
+gaussians.save_ply(args.out_ply)
+print(f"Extracted PLY to {args.out_ply}")
+""")
+
 # Thư mục chứa checkpoint từ Kaggle Input dataset (để resume nếu có)
 INPUT_CHECKPOINT_DIR = "/kaggle/input/datasets/tdukaggle/ai-race-data"
 
@@ -382,7 +414,9 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
     if is_valid_checkpoint(final_ckpt):
         print(f"  ✅ [{scene_name}] Valid chkpnt{ITERATIONS}.pth found — skipping training")
         if not os.path.exists(final_ply):
-            print(f"  ⚠️  [{scene_name}] point_cloud.ply missing — sẽ được tạo khi render")
+            print(f"  ⚠️  [{scene_name}] point_cloud.ply missing — Extracting...")
+            cmd_extract = f"python /kaggle/working/extract_ply.py --checkpoint {final_ckpt} --out_ply {final_ply} --sh_degree 1"
+            subprocess.run(cmd_extract, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=REPO_DIR)
         return scene_name, 0
 
     # PLY tồn tại nhưng không có checkpoint (đã cleanup) → cũng skip
@@ -416,7 +450,9 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
             best_input = input_ckpts[-1]
             best_iter  = get_iter_from_ckpt(best_input)
             if best_iter >= ITERATIONS and is_valid_checkpoint(best_input):
-                print(f"  ✅ [{scene_name}] Valid chkpnt{best_iter} in INPUT_CHECKPOINT_DIR — skipping (no copy)")
+                print(f"  ✅ [{scene_name}] Valid chkpnt{best_iter} in INPUT_CHECKPOINT_DIR — Extracting PLY directly to output...")
+                cmd_extract = f"python /kaggle/working/extract_ply.py --checkpoint {best_input} --out_ply {final_ply} --sh_degree 1"
+                subprocess.run(cmd_extract, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=REPO_DIR)
                 return scene_name, 0
             # Copy các checkpoint hợp lệ < 30000 sang output dir để resume
             for inp_ckpt in input_ckpts:
@@ -560,34 +596,16 @@ print("Sorting scenes by priority...")
 all_scenes = sorted(all_scenes, key=get_scene_priority)
 
 print("=" * 60)
-print(f"Starting training for {len(all_scenes)} scenes on 2x GPU T4...")
+print(f"Starting unified pipeline for {len(all_scenes)} scenes on 2x GPU T4...")
 print("=" * 60)
+
+SUBMISSION_DIR = "/kaggle/working/submission"
+os.makedirs(SUBMISSION_DIR, exist_ok=True)
 
 gpu_queue = queue.Queue()
 gpu_queue.put(0)
 gpu_queue.put(1)
 
-def train_scene_wrapper(scene_path):
-    gpu_id = gpu_queue.get()   # block cho đến khi có GPU rảnh
-    try:
-        return train_scene(scene_path, gpu_id)
-    finally:
-        gpu_queue.put(gpu_id)   # trả GPU về queue sau khi xong
-
-with ThreadPoolExecutor(max_workers=2) as executor:
-    futures = {
-        executor.submit(train_scene_wrapper, scene): scene
-        for scene in all_scenes
-    }
-    for future in as_completed(futures):
-        scene_name, rc = future.result()
-
-print("\nAll training jobs completed!")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL 8 — Render test poses (sinh ảnh submission)
-# ─────────────────────────────────────────────────────────────────────────────
 def render_scene(scene_path: str, gpu_id: int) -> tuple:
     scene_name = os.path.basename(scene_path)
     scene_out  = f"{OUTPUT_DIR}/{scene_name}"
@@ -607,7 +625,8 @@ def render_scene(scene_path: str, gpu_id: int) -> tuple:
         f"-s {scene_path} "
         f"-m {scene_out} "
         f"--skip_train "
-        f"--iteration {final_iter}"
+        f"--iteration {final_iter} "
+        f"--sh_degree 1"
     )
 
     print(f"🎨 Rendering [{scene_name}] on GPU {gpu_id} ...")
@@ -629,53 +648,58 @@ def render_scene(scene_path: str, gpu_id: int) -> tuple:
 
     return scene_name, result.returncode
 
-
-print("=" * 60)
-print("Rendering test views for all scenes...")
-print("=" * 60)
-
-# Kiểm tra trạng thái training trước khi render
-print("\n📊 Training status check:")
-trained_scenes = []
-failed_scenes  = []
-for scene_path in all_scenes:
-    scene_name      = os.path.basename(scene_path)
-    scene_out_path  = f"{OUTPUT_DIR}/{scene_name}"
-    final_iter_check = get_final_iteration(scene_out_path)
-    ply_path = f"{scene_out_path}/point_cloud/iteration_{final_iter_check}/point_cloud.ply"
-    if os.path.exists(ply_path):
-        print(f"  ✅ [{scene_name}] point_cloud.ply found @ iter {final_iter_check}")
-        trained_scenes.append(scene_path)
-    else:
-        print(f"  ❌ [{scene_name}] point_cloud.ply MISSING — will skip render")
-        failed_scenes.append(scene_name)
-
-print(f"\n  → {len(trained_scenes)}/{len(all_scenes)} scenes ready to render")
-if failed_scenes:
-    print(f"  → Skipping: {failed_scenes}")
-
-# Khởi tạo lại GPU queue cho render
-render_gpu_queue = queue.Queue()
-render_gpu_queue.put(0)
-render_gpu_queue.put(1)
-
-def render_scene_wrapper(scene_path):
-    gpu_id = render_gpu_queue.get()
+def process_scene_pipeline(scene_path):
+    gpu_id = gpu_queue.get()   # block cho đến khi có GPU rảnh
     try:
-        return render_scene(scene_path, gpu_id)
+        scene_name = os.path.basename(scene_path)
+        scene_out  = f"{OUTPUT_DIR}/{scene_name}"
+        submission_dest = f"{SUBMISSION_DIR}/{scene_name}"
+
+        # 1. Skip if already submitted
+        if os.path.isdir(submission_dest) and len(glob.glob(f"{submission_dest}/*.png")) > 0:
+            print(f"  ✅ [{scene_name}] Already rendered in submission/. Skip.")
+            return scene_name, 0
+
+        # 2. Train or extract ply
+        train_scene(scene_path, gpu_id)
+
+        # 3. Render
+        render_scene(scene_path, gpu_id)
+
+        # 4. Move renders to submission
+        final_iter = get_final_iteration(scene_out)
+        render_path = f"{scene_out}/test/ours_{final_iter}/renders"
+        if os.path.isdir(render_path):
+            os.makedirs(submission_dest, exist_ok=True)
+            imgs = sorted(glob.glob(f"{render_path}/*.png"))
+            for img in imgs:
+                shutil.move(img, submission_dest)
+            
+            sample_names = [os.path.basename(p) for p in imgs[:3]]
+            print(f"  [{scene_name}] Copied {len(imgs)} images to submission/ (samples: {sample_names})")
+        else:
+            print(f"  ⚠️  [{scene_name}] No renders found at {render_path}")
+
+        # 5. Immediately delete scene_out to save disk space
+        try:
+            shutil.rmtree(scene_out)
+            print(f"  [{scene_name}] 🧹 Cleaned up output directory to free disk space.")
+        except Exception as e:
+            print(f"  [{scene_name}] ⚠️ Cleanup error: {e}")
+
+        return scene_name, 0
     finally:
-        render_gpu_queue.put(gpu_id)
+        gpu_queue.put(gpu_id)   # trả GPU về queue sau khi xong
 
 with ThreadPoolExecutor(max_workers=2) as executor:
     futures = {
-        executor.submit(render_scene_wrapper, scene): scene
-        # Chỉ render những scene đã train xong (có point_cloud.ply)
-        for scene in trained_scenes
+        executor.submit(process_scene_pipeline, scene): scene
+        for scene in all_scenes
     }
     for future in as_completed(futures):
         scene_name, rc = future.result()
 
-print("\nAll renders completed!")
+print("\nAll pipelines completed!")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -684,7 +708,6 @@ print("\nAll renders completed!")
 import zipfile, io   # shutil da import o Cell 7
 from PIL import Image
 
-SUBMISSION_DIR = "/kaggle/working/submission"
 SUBMISSION_ZIP = "/kaggle/working/submission.zip"
 ZIP_TARGET_MB  = 350
 ZIP_TARGET     = ZIP_TARGET_MB * 1024 * 1024
@@ -698,23 +721,10 @@ missing_scenes = []
 
 for scene_path in all_scenes:
     scene_name  = os.path.basename(scene_path)
-    final_iter  = get_final_iteration(f"{OUTPUT_DIR}/{scene_name}")
-    render_path = f"{OUTPUT_DIR}/{scene_name}/test/ours_{final_iter}/renders"
-
-    if not os.path.isdir(render_path):
-        print(f"  [{scene_name}] Render path not found: {render_path}")
-        missing_scenes.append(scene_name)
-        continue
-
     dest = f"{SUBMISSION_DIR}/{scene_name}"
-    os.makedirs(dest, exist_ok=True)
 
-    imgs = sorted(glob.glob(f"{render_path}/*.png"))
-    for img in imgs:
-        shutil.copy(img, dest)
-
-    sample_names = [os.path.basename(p) for p in imgs[:3]]
-    print(f"  [{scene_name}] Copied {len(imgs)} images  (samples: {sample_names})")
+    if not os.path.isdir(dest) or len(glob.glob(f"{dest}/*.png")) == 0:
+        missing_scenes.append(scene_name)
 
 # -- Ham tien ich ---------------------------------------------------------------
 

@@ -417,6 +417,12 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
             print(f"  ⚠️  [{scene_name}] point_cloud.ply missing — Extracting...")
             cmd_extract = f"python /kaggle/working/extract_ply.py --checkpoint {final_ckpt} --out_ply {final_ply} --sh_degree 1"
             subprocess.run(cmd_extract, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=REPO_DIR)
+        
+        cfg_dest = os.path.join(scene_out, "cfg_args")
+        if not os.path.exists(cfg_dest):
+            with open(cfg_dest, "w") as f:
+                f.write("Namespace(sh_degree=1, source_path='', model_path='', images='images', resolution=-1, data_device='cuda', eval=False, white_background=False, depths='')")
+        
         return scene_name, 0
 
     # PLY tồn tại nhưng không có checkpoint (đã cleanup) → cũng skip
@@ -453,6 +459,15 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
                 print(f"  ✅ [{scene_name}] Valid chkpnt{best_iter} in INPUT_CHECKPOINT_DIR — Extracting PLY directly to output...")
                 cmd_extract = f"python /kaggle/working/extract_ply.py --checkpoint {best_input} --out_ply {final_ply} --sh_degree 1"
                 subprocess.run(cmd_extract, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=REPO_DIR)
+                
+                cfg_src = os.path.join(os.path.dirname(best_input), "cfg_args")
+                cfg_dest = os.path.join(scene_out, "cfg_args")
+                if os.path.exists(cfg_src):
+                    shutil.copy(cfg_src, cfg_dest)
+                elif not os.path.exists(cfg_dest):
+                    with open(cfg_dest, "w") as f:
+                        f.write("Namespace(sh_degree=1, source_path='', model_path='', images='images', resolution=-1, data_device='cuda', eval=False, white_background=False, depths='')")
+                
                 return scene_name, 0
             # Copy các checkpoint hợp lệ < 30000 sang output dir để resume
             for inp_ckpt in input_ckpts:

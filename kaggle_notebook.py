@@ -822,11 +822,10 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 def preview_scene(scene_name: str, n: int = 3):
-    final_iter  = get_final_iteration(f"{OUTPUT_DIR}/{scene_name}")
-    render_path = f"{OUTPUT_DIR}/{scene_name}/test/ours_{final_iter}/renders"
+    render_path = f"{SUBMISSION_DIR}/{scene_name}"
     imgs = sorted(glob.glob(f"{render_path}/*.png"))[:n]
     if not imgs:
-        print(f"No renders found for {scene_name}")
+        print(f"No renders found for {scene_name} in submission/")
         return
     fig, axes = plt.subplots(1, len(imgs), figsize=(6 * len(imgs), 5))
     if len(imgs) == 1: axes = [axes]

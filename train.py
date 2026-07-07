@@ -261,7 +261,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             big_points_vs = gaussians.max_radii2D > size_threshold
                             big_points_ws = gaussians.get_scaling.max(dim=1).values > 0.1 * scene.cameras_extent
                             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+                        gaussians.tmp_radii = radii
                         gaussians.prune_points(prune_mask)
+                        gaussians.tmp_radii = None
                         torch.cuda.empty_cache()
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):

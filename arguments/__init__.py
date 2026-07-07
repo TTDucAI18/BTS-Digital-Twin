@@ -39,6 +39,9 @@ class ParamGroup:
 
     def extract(self, args):
         group = GroupParams()
+        for k, v in vars(self).items():
+            key = k[1:] if k.startswith("_") else k
+            setattr(group, key, v)
         for arg in vars(args).items():
             if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
                 setattr(group, arg[0], arg[1])

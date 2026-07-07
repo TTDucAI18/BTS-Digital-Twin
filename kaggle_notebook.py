@@ -282,14 +282,14 @@ def get_scene_config(scene_path: str) -> dict:
     print(f"  [Config] Số ảnh train: {n_imgs}")
 
     if n_imgs <= 120:
-        # Scene nhỏ: ngưỡng nhạy hơn một chút để bắt chi tiết
-        return {"resolution": 2, "densify_until_iter": 15000, "densify_grad_threshold": 0.00015}
+        # Scene nhỏ: ngưỡng nhạy hơn một chút để bắt chi tiết mỏng (cáp)
+        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.00012}
     elif n_imgs <= 220:
         # Scene vừa
-        return {"resolution": 2, "densify_until_iter": 15000, "densify_grad_threshold": 0.0002}
+        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.00015}
     else:
-        # Scene đầy đủ: ngưỡng chuẩn của 3DGS
-        return {"resolution": 2, "densify_until_iter": 15000, "densify_grad_threshold": 0.00025}
+        # Scene đầy đủ
+        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.0002}
 
 
 def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:
@@ -514,7 +514,7 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         f"-s {scene_path} "
         f"-m {scene_out} "
         f"-r {scene_cfg['resolution']} "
-        f"--sh_degree 1 "                    # SH degree 1: giảm 2.5x kích thước checkpoint
+        f"--sh_degree 3 "                    # SH degree 3: Khôi phục khả năng mô phỏng phản quang
         f"--data_device cpu "
         f"--use_wandb "
         f"--wandb_project bts-digital-twin "
@@ -523,7 +523,7 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         f"--lambda_dssim 0.3 "
         # NOTE: --train_test_exp REMOVED — exposure compensation disabled for BTS.
         # NOTE: --exposure_lr_* REMOVED — exposure optimizer không còn tồn tại.
-        f"--depth_weight_init 0.1 "          # Hybrid Depth Scheduler: base weight cho DA-v2
+        f"--depth_weight_init 0.02 "         # Giảm depth weight để không kìm hãm vùng cáp mỏng
         f"--antialiasing "
         f"--densify_grad_threshold {scene_cfg['densify_grad_threshold']} "
         f"--densify_until_iter {scene_cfg['densify_until_iter']} "

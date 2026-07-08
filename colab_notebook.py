@@ -180,7 +180,7 @@ for scene in pbar:
         # 3. Kéo dài thời gian sinh hạt: densify_until_iter lên 20000
         # 4. Giảm chu kỳ sinh hạt: densification_interval xuống 50
         cmd_train = (
-            f"python {os.path.join(REPO_DIR, 'train.py')} "
+            f"bash -c \"set -o pipefail; python {os.path.join(REPO_DIR, 'train.py')} "
             f"-s {scene} "
             f"-m {scene_out} "
             f"--iterations 30000 "
@@ -192,7 +192,7 @@ for scene in pbar:
             f"--lambda_dssim 0.2 "
             f"--sh_degree 3 "
             f"--disable_viewer "
-            f"2>&1 | tee train_scene.log"
+            f"2>&1 | tee train_scene.log\""
         )
         ret_train = run(cmd_train)
         if ret_train != 0:
@@ -220,16 +220,23 @@ for scene in pbar:
     if not os.path.exists(render_path) or len(glob.glob(f"{render_path}/*.*")) == 0:
         print(f"  [2/2] Đang render các góc nhìn Test (Novel Views)...")
         cmd_render = (
-            f"python {os.path.join(REPO_DIR, 'render.py')} "
+            f"bash -c \"set -o pipefail; python {os.path.join(REPO_DIR, 'render.py')} "
             f"-s {scene} "
             f"-m {scene_out} "
             f"--skip_train "
             f"--iteration 30000 "
-            f"--sh_degree 3"
+            f"--sh_degree 3 "
+            f"2>&1 | tee render_scene.log\""
         )
         ret_render = run(cmd_render)
         if ret_render != 0:
-            print(f"  ❌ Render thất bại. Bỏ qua copy submission.")
+            print(f"  ❌ Render thất bại. Bỏ qua copy submission. Chi tiết lỗi:")
+            try:
+                with open("render_scene.log", "r") as f:
+                    lines = f.readlines()
+                    print("".join(lines[-50:]))
+            except:
+                pass
             continue
         print(f"  ✅ Render Novel Views thành công.")
     else:

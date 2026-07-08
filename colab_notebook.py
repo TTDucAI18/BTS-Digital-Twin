@@ -63,7 +63,7 @@ if IN_COLAB:
         print("\n" + "=" * 60)
         print("📥 ĐANG TẢI MÃ NGUỒN VÀ CÀI ĐẶT CUDA KERNELS...")
         print("=" * 60)
-        run(f"git clone https://github.com/TTDucAI18/BTS-Digital-Twin.git {REPO_DIR}")
+        run(f"git clone --recursive https://github.com/TTDucAI18/BTS-Digital-Twin.git {REPO_DIR}")
         run(f"pip install -q plyfile tqdm")
         run(f"pip install -q -e {REPO_DIR}/submodules/diff-gaussian-rasterization")
         run(f"pip install -q -e {REPO_DIR}/submodules/simple-knn")
@@ -71,6 +71,10 @@ if IN_COLAB:
     else:
         print("🔄 Cập nhật mã nguồn mới nhất...")
         run(f"cd {REPO_DIR} && git pull")
+        run(f"cd {REPO_DIR} && git submodule update --init --recursive")
+        # Ensure they are installed if they were empty before
+        run(f"pip install -q -e {REPO_DIR}/submodules/diff-gaussian-rasterization")
+        run(f"pip install -q -e {REPO_DIR}/submodules/simple-knn")
 
 print("\n" + "=" * 60)
 print("2. BẮT ĐẦU HUẤN LUYỆN VÀ RENDER (TỐI ƯU CHO A100 40GB)")

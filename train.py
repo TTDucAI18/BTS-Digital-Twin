@@ -85,9 +85,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             return base_weight
         elif iteration < 25_000:
             progress = (iteration - 5_000) / (25_000 - 5_000)
-            return base_weight * (1.0 - progress)
+            # Không giảm về 0, giữ lại 5% trọng số để tránh floaters
+            return base_weight * ((1.0 - progress) * 0.95 + 0.05)
         else:
-            return 0.0
+            return base_weight * 0.05
+
+    # Phục hồi Exposure Compensation (giúp giảm mây mờ / floaters do chênh lệch độ sáng giữa các ảnh từ camera drone)
+    num_cams = max([c.uid for c in train_cameras]) + 1
+    exposure_embedding = torch.nn.Embedding(num_cams, 3).cuda()
+    exposure_embedding.weight.data.zero_() # Bắt đầu với bias = 0 (tương đương multiplier = 1.0)
+    exposure_optimizer = torch.optim.Adam(exposure_embedding.parameters(), lr=0.01)
 
     # Extract validation set (chỉ để monitor — KHÔNG loại khỏi training)
     import random
@@ -105,7 +112,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress", file=sys.stdout)
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn is None:
@@ -152,36 +159,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
 
+        # Áp dụng bù trừ phơi sáng cho từng ảnh
+        # Điều này giúp mô hình không phải tạo ra sương mù/floaters để bù sáng
+        cam_uid = torch.tensor([viewpoint_cam.uid], device="cuda", dtype=torch.long)
+        exp_modifier = torch.exp(exposure_embedding(cam_uid)).squeeze(0).unsqueeze(-1).unsqueeze(-1)
+        # Khóa lại ở [0, 1] trước khi tính loss
+        image_adj = torch.clamp(image * exp_modifier, 0.0, 1.0)
+
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
+        Ll1 = l1_loss(image_adj, gt_image)
         if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+            ssim_value = fused_ssim(image_adj.unsqueeze(0), gt_image.unsqueeze(0))
         else:
-            ssim_value = ssim(image, gt_image)
+            ssim_value = ssim(image_adj, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        # ── TASK 2: Hybrid Depth Regularization (DA-v2 + Two-Phase Scheduler) ────
-        # Only renders depth tensor and computes gradient graph when weight > 0.
-        # From iteration 25 000+, this block is skipped entirely → saves VRAM & time.
-        #
-        # FIX BUG 1: render_pkg["depth"] returns LINEAR depth (Z distance from camera).
-        # mono_invdepth stores INVERSE depth (1/Z). We must convert before comparing.
-        # FIX BUG 2: Use masked mean — divide only by the number of valid mask pixels
-        #            to avoid gradient dilution from sky/unreliable regions.
+        # ── KHẮC PHỤC LỖI TOÁN HỌC: Depth Regularization (Chống Exploding Gradients) ────
         Ll1depth_pure = 0.0
         current_depth_weight = get_depth_weight(iteration, base_weight=opt.depth_weight_init)
         if current_depth_weight > 0.0 and viewpoint_cam.depth_reliable:
             rendered_linear_depth = render_pkg["depth"]
-            # Convert linear depth → inverse depth (same space as mono depth estimator output)
-            rendered_inv_depth = 1.0 / rendered_linear_depth.clamp(min=1e-4)
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
-            # Masked L1: sum over valid pixels, divide by count of valid pixels
-            diff = torch.abs((rendered_inv_depth - mono_invdepth) * depth_mask)
-            Ll1depth_pure = diff.sum() / (depth_mask.sum() + 1e-6)
+            # CHỈNH SỬA QUAN TRỌNG:
+            # 1. Biến mono_invdepth thành linear depth thay vì làm ngược lại.
+            # 2. Đạo hàm của 1/x = -1/x^2 (gây bùng nổ gradient nếu tính nghịch đảo rendered_depth).
+            # Do đó, bắt buộc phải đổi ground_truth về linear space.
+            mono_linear_depth = 1.0 / mono_invdepth.clamp(min=1e-4)
+
+            # Tính Smooth L1 (Huber Loss) để giảm sự nhạy cảm với các nhiễu lớn từ mono_depth
+            diff = torch.nn.functional.smooth_l1_loss(
+                rendered_linear_depth * depth_mask, 
+                mono_linear_depth * depth_mask, 
+                reduction='sum'
+            )
+            Ll1depth_pure = diff / (depth_mask.sum() + 1e-6)
             Ll1depth = current_depth_weight * Ll1depth_pure
             loss += Ll1depth
             Ll1depth = Ll1depth.item()
@@ -198,6 +213,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
+                epoch = iteration // len(train_cameras)
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Epoch": epoch})
+                progress_bar.update(10)
+
+            if iteration % 2000 == 0:
                 free_space_gb = shutil.disk_usage(scene.model_path).free / (1024**3)
                 if free_space_gb < 3.5:
                     print(f"\n[ITER {iteration}] WARNING: Disk space low ({free_space_gb:.2f} GB left). Stopping training early.")
@@ -219,10 +239,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             except Exception:
                                 pass
                     break
-
-                epoch = iteration // len(train_cameras)
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Epoch": epoch})
-                progress_bar.update(10)
                 if wandb.run is not None:
                     wandb.log({
                         "train/loss": loss.item(),
@@ -251,7 +267,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    if gaussians.get_xyz.shape[0] < 3_000_000:
+                    if gaussians.get_xyz.shape[0] < 15_000_000:
                         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                     else:
                         print(f"\n[ITER {iteration}] WARNING: Max Gaussians reached ({gaussians.get_xyz.shape[0]}). Skipping densification to prevent OOM.")
@@ -271,7 +287,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                # TASK 1: exposure_optimizer step removed — no exposure tensor to update.
+                exposure_optimizer.step()
+                exposure_optimizer.zero_grad(set_to_none=True)
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])

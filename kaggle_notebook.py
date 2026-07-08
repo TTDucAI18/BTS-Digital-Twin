@@ -338,7 +338,7 @@ def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:
         f"--wandb_project bts-digital-twin "
         f"--wandb_entity {WANDB_ENTITY} "
         f"--iterations {finetune_total_iters} "
-        f"--lambda_dssim 0.4 "
+        f"--lambda_dssim 0.2 "
         # NOTE: --train_test_exp REMOVED — exposure compensation disabled for BTS.
         # NOTE: --exposure_lr_* REMOVED — no exposure optimizer in this pipeline.
         f"--depth_weight_init 0.0 "                  # Tắt depth loss ở Phase 2 fine-tune
@@ -526,9 +526,9 @@ def train_scene(scene_path: str, gpu_id: int) -> tuple:
         f"--wandb_project bts-digital-twin "
         f"--wandb_entity {WANDB_ENTITY} "
         f"--iterations {ITERATIONS} "
-        f"--lambda_dssim 0.4 "               # OPT: Tăng từ 0.3 lên 0.4 để ép SSIM tăng nhanh hơn
-        f"--position_lr_init 0.00032 "       # OPT: Tăng gấp đôi LR vị trí (mặc định 0.00016) để hội tụ cấu trúc nhanh
-        f"--densification_interval 50 "      # OPT: Nhân bản Gaussian mỗi 50 steps (mặc định 100) để lấp đầy chi tiết nhanh chóng
+        f"--lambda_dssim 0.2 "               # Trả về 0.2 (mặc định) để tránh mất ổn định Loss
+        f"--position_lr_init 0.00016 "       # Trả về 0.00016 (mặc định) để tránh gradient explosion (floaters)
+        f"--densification_interval 100 "     # Trả về 100 (mặc định) để không bùng nổ điểm Gaussian quá nhanh
         # NOTE: --train_test_exp REMOVED — exposure compensation disabled for BTS.
         # NOTE: --exposure_lr_* REMOVED — exposure optimizer không còn tồn tại.
         f"--depth_weight_init 0.02 "         # Giảm depth weight để không kìm hãm vùng cáp mỏng

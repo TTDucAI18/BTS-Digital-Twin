@@ -185,12 +185,9 @@ for scene in pbar:
             f"-m {scene_out} "
             f"--iterations 30000 "
             f"--save_iterations 30000 "
-            f"--densify_until_iter 20000 "
-            f"--densification_interval 50 "
-            f"--densify_grad_threshold 0.0001 "
-            f"--opacity_reset_interval 5000 "
             f"--lambda_dssim 0.2 "
             f"--sh_degree 3 "
+            f"--antialiasing "
             f"--disable_viewer "
             f"2>&1 | tee train_scene.log\""
         )
@@ -226,6 +223,7 @@ for scene in pbar:
             f"--skip_train "
             f"--iteration 30000 "
             f"--sh_degree 3 "
+            f"--antialiasing "
             f"--ensemble_scales 1.0 1.5 2.0 "
             f"2>&1 | tee render_scene.log\""
         )

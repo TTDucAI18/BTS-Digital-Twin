@@ -94,12 +94,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             return base_weight * 0.05
 
-    # Phục hồi Exposure Compensation (giúp giảm mây mờ / floaters do chênh lệch độ sáng giữa các ảnh từ camera drone)
-    num_cams = max([c.uid for c in train_cameras]) + 1
-    exposure_embedding = torch.nn.Embedding(num_cams, 3).cuda()
-    exposure_embedding.weight.data.zero_() # Bắt đầu với bias = 0 (tương đương multiplier = 1.0)
-    exposure_optimizer = torch.optim.Adam(exposure_embedding.parameters(), lr=0.01)
-
     # Extract validation set (chỉ để monitor — KHÔNG loại khỏi training)
     import random
     all_train_cams = scene.getTrainCameras()
@@ -110,6 +104,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     val_cameras = [c for i, c in enumerate(all_train_cams) if i in val_indices]
     # Dùng 100% ảnh để train (không loại bỏ val set ra)
     train_cameras = all_train_cams
+
+    # Phục hồi Exposure Compensation (giúp giảm mây mờ / floaters do chênh lệch độ sáng giữa các ảnh từ camera drone)
+    num_cams = max([c.uid for c in train_cameras]) + 1
+    exposure_embedding = torch.nn.Embedding(num_cams, 3).cuda()
+    exposure_embedding.weight.data.zero_() # Bắt đầu với bias = 0 (tương đương multiplier = 1.0)
+    exposure_optimizer = torch.optim.Adam(exposure_embedding.parameters(), lr=0.01)
 
     viewpoint_stack = train_cameras.copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))

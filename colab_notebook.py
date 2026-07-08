@@ -117,7 +117,6 @@ for scene in pbar:
             f"--opacity_reset_interval 5000 "
             f"--lambda_dssim 0.2 "
             f"--sh_degree 3 "
-            f"--resolution -1 "
             f"--disable_viewer"
         )
         ret_train = run(cmd_train)

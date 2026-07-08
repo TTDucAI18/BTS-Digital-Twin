@@ -72,7 +72,11 @@ if IN_COLAB:
             ret = run(f"pip wheel {module_path} --no-build-isolation -w {WHEEL_DIR} > build_{module_name}.log 2>&1")
             if ret != 0:
                 print(f"⚠️ Build wheel thất bại cho {module_name}. Log lỗi:")
-                run(f"cat build_{module_name}.log")
+                try:
+                    with open(f"build_{module_name}.log", "r") as f:
+                        print(f.read())
+                except:
+                    pass
                 
             new_wheels = glob.glob(os.path.join(WHEEL_DIR, f"{wheel_prefix}*.whl"))
             if new_wheels:
@@ -82,7 +86,11 @@ if IN_COLAB:
                 ret2 = run(f"pip install -e {module_path} --no-build-isolation > install_{module_name}.log 2>&1")
                 if ret2 != 0:
                     print(f"⚠️ Install thất bại cho {module_name}. Log lỗi:")
-                    run(f"cat install_{module_name}.log")
+                    try:
+                        with open(f"install_{module_name}.log", "r") as f:
+                            print(f.read())
+                    except:
+                        pass
 
     if not os.path.exists(REPO_DIR):
         print("\n" + "=" * 60)

@@ -1,14 +1,3 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-
 import torch
 from scene import Scene
 import os
@@ -27,7 +16,7 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, separate_sh):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, separate_sh, ssaa=1):
     # TASK 1: train_test_exp param removed — exposure compensation disabled for BTS.
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -35,8 +24,34 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
 
+    import torch.nn.functional as F
+
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        # --- SSAA (Super-Sampling Anti-Aliasing) ---
+        original_width = view.image_width
+        original_height = view.image_height
+        
+        if ssaa > 1:
+            view.image_width = int(original_width * ssaa)
+            view.image_height = int(original_height * ssaa)
+
         rendering = render(view, gaussians, pipeline, background, separate_sh=separate_sh)["render"]
+        
+        if ssaa > 1:
+            # Khôi phục view
+            view.image_width = original_width
+            view.image_height = original_height
+            # Downscale bằng Bicubic
+            rendering = F.interpolate(
+                rendering.unsqueeze(0), 
+                size=(original_height, original_width), 
+                mode='bicubic', 
+                align_corners=False
+            ).squeeze(0)
+            # Giới hạn giá trị pixel sau bicubic để tránh lỗi lưu ảnh
+            rendering = rendering.clamp(0.0, 1.0)
+        # -------------------------------------------
+
         gt = view.original_image[0:3, :, :]
 
         img_name = getattr(view, 'image_name', None)
@@ -56,7 +71,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             torchvision.utils.save_image(rendering, os.path.join(render_path, out_name))
             torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool, ssaa: int):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -65,10 +80,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         if not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, separate_sh)
+             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, separate_sh, ssaa)
 
         if not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, separate_sh)
+             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, separate_sh, ssaa)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -79,10 +94,11 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--ssaa", default=1, type=int, help="Super-Sampling Anti-Aliasing scale factor (e.g. 2, 3)")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE, args.ssaa)

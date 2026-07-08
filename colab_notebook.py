@@ -226,6 +226,7 @@ for scene in pbar:
             f"--skip_train "
             f"--iteration 30000 "
             f"--sh_degree 3 "
+            f"--ensemble_scales 1.0 1.5 2.0 "
             f"2>&1 | tee render_scene.log\""
         )
         ret_render = run(cmd_render)

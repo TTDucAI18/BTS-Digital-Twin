@@ -16,7 +16,7 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, separate_sh, ssaa=1):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, separate_sh, ensemble_scales=[1.0]):
     # TASK 1: train_test_exp param removed — exposure compensation disabled for BTS.
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -27,29 +27,42 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     import torch.nn.functional as F
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        # --- SSAA (Super-Sampling Anti-Aliasing) ---
+        # --- Multi-Scale Render Ensembling ---
         original_width = view.image_width
         original_height = view.image_height
         
-        if ssaa > 1:
-            view.image_width = int(original_width * ssaa)
-            view.image_height = int(original_height * ssaa)
-
-        rendering = render(view, gaussians, pipeline, background, separate_sh=separate_sh)["render"]
+        accumulated_render = None
         
-        if ssaa > 1:
-            # Khôi phục view
-            view.image_width = original_width
-            view.image_height = original_height
-            # Downscale bằng Bicubic
-            rendering = F.interpolate(
-                rendering.unsqueeze(0), 
-                size=(original_height, original_width), 
-                mode='bicubic', 
-                align_corners=False
-            ).squeeze(0)
-            # Giới hạn giá trị pixel sau bicubic để tránh lỗi lưu ảnh
-            rendering = rendering.clamp(0.0, 1.0)
+        for scale in ensemble_scales:
+            if scale != 1.0:
+                view.image_width = int(original_width * scale)
+                view.image_height = int(original_height * scale)
+            else:
+                view.image_width = original_width
+                view.image_height = original_height
+
+            current_render = render(view, gaussians, pipeline, background, separate_sh=separate_sh)["render"]
+            
+            if scale != 1.0:
+                # Downscale bằng Bicubic về kích thước gốc
+                current_render = F.interpolate(
+                    current_render.unsqueeze(0), 
+                    size=(original_height, original_width), 
+                    mode='bicubic', 
+                    align_corners=False
+                ).squeeze(0)
+            
+            if accumulated_render is None:
+                accumulated_render = current_render
+            else:
+                accumulated_render += current_render
+                
+        # Khôi phục view an toàn
+        view.image_width = original_width
+        view.image_height = original_height
+        
+        # Tính trung bình cộng của tất cả các scale
+        final_rendering = (accumulated_render / len(ensemble_scales)).clamp(0.0, 1.0)
         # -------------------------------------------
 
         gt = view.original_image[0:3, :, :]
@@ -63,15 +76,15 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         if out_name.lower().endswith(".jpg") or out_name.lower().endswith(".jpeg"):
             from PIL import Image
             # Convert tensor to numpy array [H, W, C] in uint8
-            rendering_np = rendering.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
+            rendering_np = final_rendering.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
             gt_np = gt.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
             Image.fromarray(rendering_np).save(os.path.join(render_path, out_name), quality=98, optimize=True)
             Image.fromarray(gt_np).save(os.path.join(gts_path, out_name), quality=98, optimize=True)
         else:
-            torchvision.utils.save_image(rendering, os.path.join(render_path, out_name))
+            torchvision.utils.save_image(final_rendering, os.path.join(render_path, out_name))
             torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool, ssaa: int):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool, ensemble_scales: list):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -80,10 +93,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         if not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, separate_sh, ssaa)
+             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, separate_sh, ensemble_scales)
 
         if not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, separate_sh, ssaa)
+             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, separate_sh, ensemble_scales)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -94,11 +107,11 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--ssaa", default=1, type=int, help="Super-Sampling Anti-Aliasing scale factor (e.g. 2, 3)")
+    parser.add_argument("--ensemble_scales", nargs="+", type=float, default=[1.0], help="List of scales for Multi-Scale Render Ensembling (e.g. 1.0 1.5 2.0)")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE, args.ssaa)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE, args.ensemble_scales)

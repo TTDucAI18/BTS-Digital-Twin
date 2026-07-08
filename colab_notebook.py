@@ -69,7 +69,19 @@ if IN_COLAB:
             run(f"pip install -q {wheels[0]}")
         else:
             print(f"⚙️ Đang biên dịch và tạo wheel cho {module_name} (lưu vào Drive)...")
-            ret = run(f"pip wheel {module_path} --no-build-isolation -w {WHEEL_DIR} > build_{module_name}.log 2>&1")
+            if module_name == "fused-ssim":
+                print(f"⚙️ Cài đặt trực tiếp {module_name} bằng setup.py (bỏ qua pip)...")
+                ret2 = run(f"cd {module_path} && python setup.py install > install_{module_name}.log 2>&1")
+                if ret2 != 0:
+                    print(f"⚠️ Install thất bại cho {module_name}. Log lỗi:")
+                    try:
+                        with open(f"{module_path}/install_{module_name}.log", "r") as f:
+                            print(f.read())
+                    except:
+                        pass
+                return
+                
+            ret = run(f"pip wheel -v {module_path} --no-build-isolation -w {WHEEL_DIR} > build_{module_name}.log 2>&1")
             if ret != 0:
                 print(f"⚠️ Build wheel thất bại cho {module_name}. Log lỗi:")
                 try:
@@ -83,7 +95,7 @@ if IN_COLAB:
                 run(f"pip install --no-build-isolation -q {new_wheels[0]}")
             else:
                 print(f"⚠️ Không thể tạo wheel cho {module_name}, cài đặt thông thường.")
-                ret2 = run(f"pip install -e {module_path} --no-build-isolation > install_{module_name}.log 2>&1")
+                ret2 = run(f"pip install -v -e {module_path} --no-build-isolation > install_{module_name}.log 2>&1")
                 if ret2 != 0:
                     print(f"⚠️ Install thất bại cho {module_name}. Log lỗi:")
                     try:

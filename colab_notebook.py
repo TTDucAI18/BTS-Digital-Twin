@@ -99,6 +99,9 @@ if IN_COLAB:
         run(f"git clone --recursive https://github.com/TTDucAI18/BTS-Digital-Twin.git {REPO_DIR}")
         run(f"pip install -q plyfile tqdm wandb ninja")
         
+        # Xóa pyproject.toml của fused-ssim để ép pip dùng legacy setup.py (tránh lỗi PEP 517 metadata trên Colab)
+        run(f"rm -f {REPO_DIR}/submodules/fused-ssim/pyproject.toml")
+        
         install_or_build_module("diff-gaussian-rasterization", f"{REPO_DIR}/submodules/diff-gaussian-rasterization", "diff_gaussian_rasterization")
         install_or_build_module("simple-knn", f"{REPO_DIR}/submodules/simple-knn", "simple_knn")
         install_or_build_module("fused-ssim", f"{REPO_DIR}/submodules/fused-ssim", "fused_ssim")
@@ -108,6 +111,9 @@ if IN_COLAB:
         print("🔄 Cập nhật mã nguồn mới nhất...")
         run(f"cd {REPO_DIR} && git pull")
         run(f"cd {REPO_DIR} && git submodule update --init --recursive")
+        
+        # Xóa pyproject.toml trong trường hợp cập nhật lại source
+        run(f"rm -f {REPO_DIR}/submodules/fused-ssim/pyproject.toml")
         
         install_or_build_module("diff-gaussian-rasterization", f"{REPO_DIR}/submodules/diff-gaussian-rasterization", "diff_gaussian_rasterization")
         install_or_build_module("simple-knn", f"{REPO_DIR}/submodules/simple-knn", "simple_knn")

@@ -191,11 +191,18 @@ for scene in pbar:
             f"--opacity_reset_interval 5000 "
             f"--lambda_dssim 0.2 "
             f"--sh_degree 3 "
-            f"--disable_viewer"
+            f"--disable_viewer "
+            f"2>&1 | tee train_scene.log"
         )
         ret_train = run(cmd_train)
         if ret_train != 0:
-            print(f"  ❌ Huấn luyện 3DGS thất bại. Bỏ qua scene này.")
+            print(f"  ❌ Huấn luyện 3DGS thất bại. Bỏ qua scene này. Chi tiết lỗi:")
+            try:
+                with open("train_scene.log", "r") as f:
+                    lines = f.readlines()
+                    print("".join(lines[-50:]))
+            except:
+                pass
             continue
         print(f"  ✅ Huấn luyện 3DGS hoàn tất ở iter 30000.")
         

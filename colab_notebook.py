@@ -249,16 +249,22 @@ for scene in pbar:
         for img_path in glob.glob(os.path.join(render_path, "*.*")):
             if img_path.lower().endswith(('.png', '.jpg', '.jpeg')):
                 img_name = os.path.basename(img_path)
-                base_name = os.path.splitext(img_name)[0]
-                # Chuyển đổi sang JPG quality=90 để đảm bảo dung lượng file ZIP tổng < 350MB
-                out_jpg_path = os.path.join(submission_dest, f"{base_name}.jpg")
-                try:
-                    with Image.open(img_path) as img:
-                        rgb_im = img.convert('RGB')
-                        rgb_im.save(out_jpg_path, 'JPEG', quality=90)
-                except Exception as e:
-                    print(f"Lỗi khi chuyển đổi {img_name}: {e}")
-        print(f"  ✅ Đã đóng gói các ảnh test (JPEG) vào thư mục nộp bài.")
+                out_jpg_path = os.path.join(submission_dest, img_name)
+                
+                # Nếu ảnh đã là JPEG (render.py đã lưu ở Q=98), chỉ cần copy trực tiếp để tránh nén lossy 2 lần
+                if img_path.lower().endswith(('.jpg', '.jpeg')):
+                    shutil.copy(img_path, out_jpg_path)
+                else:
+                    # Nếu là PNG thì mới convert sang JPEG để tiết kiệm dung lượng
+                    try:
+                        base_name = os.path.splitext(img_name)[0]
+                        out_jpg_path = os.path.join(submission_dest, f"{base_name}.jpg")
+                        with Image.open(img_path) as img:
+                            rgb_im = img.convert('RGB')
+                            rgb_im.save(out_jpg_path, 'JPEG', quality=98)
+                    except Exception as e:
+                        print(f"Lỗi khi chuyển đổi {img_name}: {e}")
+        print(f"  ✅ Đã đóng gói các ảnh test vào thư mục nộp bài.")
 
 print("\n" + "=" * 60)
 print("3. ĐÓNG GÓI SUBMISSION")

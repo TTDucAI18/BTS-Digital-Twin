@@ -180,7 +180,7 @@ for scene in pbar:
         # 3. Kéo dài thời gian sinh hạt: densify_until_iter lên 20000
         # 4. Giảm chu kỳ sinh hạt: densification_interval xuống 50
         cmd_train = (
-            f"bash -c \"set -o pipefail; python {os.path.join(REPO_DIR, 'train.py')} "
+            f"bash -c \"export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; set -o pipefail; python {os.path.join(REPO_DIR, 'train.py')} "
             f"-s {scene} "
             f"-m {scene_out} "
             f"--iterations 30000 "

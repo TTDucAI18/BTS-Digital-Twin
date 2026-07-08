@@ -45,8 +45,16 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         else:
             out_name = '{0:05d}'.format(idx) + ".png"
 
-        torchvision.utils.save_image(rendering, os.path.join(render_path, out_name))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))
+        if out_name.lower().endswith(".jpg") or out_name.lower().endswith(".jpeg"):
+            from PIL import Image
+            # Convert tensor to numpy array [H, W, C] in uint8
+            rendering_np = rendering.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
+            gt_np = gt.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
+            Image.fromarray(rendering_np).save(os.path.join(render_path, out_name), quality=98, optimize=True)
+            Image.fromarray(gt_np).save(os.path.join(gts_path, out_name), quality=98, optimize=True)
+        else:
+            torchvision.utils.save_image(rendering, os.path.join(render_path, out_name))
+            torchvision.utils.save_image(gt, os.path.join(gts_path, out_name))
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool):
     with torch.no_grad():

@@ -179,7 +179,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # ── KHẮC PHỤC LỖI TOÁN HỌC: Depth Regularization (Chống Exploding Gradients) ────
         Ll1depth_pure = 0.0
         current_depth_weight = get_depth_weight(iteration, base_weight=opt.depth_weight_init)
-        if current_depth_weight > 0.0 and viewpoint_cam.depth_reliable:
+        if opt.depth_weight_init > 0.0 and current_depth_weight > 0.0 and viewpoint_cam.invdepthmap is not None:
             rendered_linear_depth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()

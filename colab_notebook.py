@@ -57,6 +57,21 @@ def run(cmd, **kwargs):
         print(f"❌ Lệnh thất bại với mã lỗi {result.returncode}")
     return result.returncode
 
+# Tự động clone repo và cài đặt trên Colab
+if IN_COLAB:
+    if not os.path.exists(REPO_DIR):
+        print("\n" + "=" * 60)
+        print("📥 ĐANG TẢI MÃ NGUỒN VÀ CÀI ĐẶT CUDA KERNELS...")
+        print("=" * 60)
+        run(f"git clone https://github.com/TTDucAI18/BTS-Digital-Twin.git {REPO_DIR}")
+        run(f"pip install -q plyfile tqdm")
+        run(f"pip install -q -e {REPO_DIR}/submodules/diff-gaussian-rasterization")
+        run(f"pip install -q -e {REPO_DIR}/submodules/simple-knn")
+        print("✅ Cài đặt môi trường hoàn tất!")
+    else:
+        print("🔄 Cập nhật mã nguồn mới nhất...")
+        run(f"cd {REPO_DIR} && git pull")
+
 print("\n" + "=" * 60)
 print("2. BẮT ĐẦU HUẤN LUYỆN VÀ RENDER (TỐI ƯU CHO A100 40GB)")
 print("=" * 60)

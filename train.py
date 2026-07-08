@@ -24,7 +24,11 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-import wandb
+try:
+    import wandb
+    WANDB_FOUND = True
+except ImportError:
+    WANDB_FOUND = False
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -239,7 +243,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             except Exception:
                                 pass
                     break
-                if wandb.run is not None:
+                if WANDB_FOUND and wandb.run is not None:
                     wandb.log({
                         "train/loss": loss.item(),
                         "train/l1_loss": Ll1.item(),
@@ -369,7 +373,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                             if iteration == testing_iterations[0]:
                                 tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                        if wandb.run is not None and (idx < 5):
+                        if WANDB_FOUND and wandb.run is not None and (idx < 5):
                             has_gt = (hasattr(viewpoint, 'original_image') 
                                       and viewpoint.original_image is not None
                                       and viewpoint.original_image.shape[0] == 3)
@@ -389,7 +393,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-                if wandb.run is not None:
+                if WANDB_FOUND and wandb.run is not None:
                     wandb.log({
                         f"{config['name']}/l1_loss": l1_test,
                         f"{config['name']}/psnr": psnr_test

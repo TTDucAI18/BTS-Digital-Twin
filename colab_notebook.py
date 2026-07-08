@@ -59,22 +59,51 @@ def run(cmd, **kwargs):
 
 # Tự động clone repo và cài đặt trên Colab
 if IN_COLAB:
+    WHEEL_DIR = "/content/drive/MyDrive/wheels"
+    os.makedirs(WHEEL_DIR, exist_ok=True)
+    
+    def install_or_build_module(module_name, module_path, wheel_prefix):
+        wheels = glob.glob(os.path.join(WHEEL_DIR, f"{wheel_prefix}*.whl"))
+        if wheels:
+            print(f"📦 Đã tìm thấy wheel cho {module_name} trên Drive. Tiến hành cài đặt...")
+            run(f"pip install -q {wheels[0]}")
+        else:
+            print(f"⚙️ Đang biên dịch và tạo wheel cho {module_name} (lưu vào Drive)...")
+            ret = run(f"pip wheel {module_path} -w {WHEEL_DIR} > build_{module_name}.log 2>&1")
+            if ret != 0:
+                print(f"⚠️ Build wheel thất bại cho {module_name}. Log lỗi:")
+                run(f"cat build_{module_name}.log")
+                
+            new_wheels = glob.glob(os.path.join(WHEEL_DIR, f"{wheel_prefix}*.whl"))
+            if new_wheels:
+                run(f"pip install -q {new_wheels[0]}")
+            else:
+                print(f"⚠️ Không thể tạo wheel cho {module_name}, cài đặt thông thường.")
+                ret2 = run(f"pip install -e {module_path} > install_{module_name}.log 2>&1")
+                if ret2 != 0:
+                    print(f"⚠️ Install thất bại cho {module_name}. Log lỗi:")
+                    run(f"cat install_{module_name}.log")
+
     if not os.path.exists(REPO_DIR):
         print("\n" + "=" * 60)
         print("📥 ĐANG TẢI MÃ NGUỒN VÀ CÀI ĐẶT CUDA KERNELS...")
         print("=" * 60)
         run(f"git clone --recursive https://github.com/TTDucAI18/BTS-Digital-Twin.git {REPO_DIR}")
-        run(f"pip install -q plyfile tqdm")
-        run(f"pip install -q -e {REPO_DIR}/submodules/diff-gaussian-rasterization")
-        run(f"pip install -q -e {REPO_DIR}/submodules/simple-knn")
+        run(f"pip install -q plyfile tqdm wandb ninja")
+        
+        install_or_build_module("diff-gaussian-rasterization", f"{REPO_DIR}/submodules/diff-gaussian-rasterization", "diff_gaussian_rasterization")
+        install_or_build_module("simple-knn", f"{REPO_DIR}/submodules/simple-knn", "simple_knn")
+        install_or_build_module("fused-ssim", f"{REPO_DIR}/submodules/fused-ssim", "fused_ssim")
+        
         print("✅ Cài đặt môi trường hoàn tất!")
     else:
         print("🔄 Cập nhật mã nguồn mới nhất...")
         run(f"cd {REPO_DIR} && git pull")
         run(f"cd {REPO_DIR} && git submodule update --init --recursive")
-        # Ensure they are installed if they were empty before
-        run(f"pip install -q -e {REPO_DIR}/submodules/diff-gaussian-rasterization")
-        run(f"pip install -q -e {REPO_DIR}/submodules/simple-knn")
+        
+        install_or_build_module("diff-gaussian-rasterization", f"{REPO_DIR}/submodules/diff-gaussian-rasterization", "diff_gaussian_rasterization")
+        install_or_build_module("simple-knn", f"{REPO_DIR}/submodules/simple-knn", "simple_knn")
+        install_or_build_module("fused-ssim", f"{REPO_DIR}/submodules/fused-ssim", "fused_ssim")
 
 print("\n" + "=" * 60)
 print("2. BẮT ĐẦU HUẤN LUYỆN VÀ RENDER (TỐI ƯU CHO A100 40GB)")

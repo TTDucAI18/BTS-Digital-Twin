@@ -212,6 +212,32 @@ for scene in pbar:
     else:
         print(f"  ✅ Scene {scene_name} đã được huấn luyện đủ 30000 iterations từ trước.")
 
+    # Thực hiện dọn rác (Floaters) trước khi render
+    ply_path = os.path.join(scene_out, "point_cloud", "iteration_30000", "point_cloud.ply")
+    if os.path.exists(ply_path):
+        cleaned_ply_path = os.path.join(scene_out, "point_cloud", "iteration_30000", "point_cloud_cleaned.ply")
+        print("  🧹 Đang dọn dẹp rác (Floaters) trong Point Cloud...")
+        cmd_clean = (
+            f"python {os.path.join(REPO_DIR, 'utils', 'clean_pointcloud.py')} "
+            f"--input {ply_path} "
+            f"--output {cleaned_ply_path} "
+            f"--max_scale 100.0 "
+            f"--min_opacity 0.05 "
+            f"--knn_n 15 "
+            f"--knn_r 0.5"
+        )
+        ret_clean = run(cmd_clean)
+        if ret_clean == 0 and os.path.exists(cleaned_ply_path):
+            backup_ply_path = os.path.join(scene_out, "point_cloud", "iteration_30000", "point_cloud_original.ply")
+            if not os.path.exists(backup_ply_path):
+                os.rename(ply_path, backup_ply_path)
+            else:
+                os.remove(ply_path)
+            os.rename(cleaned_ply_path, ply_path)
+            print("  ✅ Đã thay thế point cloud gốc bằng phiên bản đã làm sạch.")
+        else:
+            print("  ⚠️ Không thể làm sạch Point Cloud, tiếp tục với file gốc.")
+
     # Render Test Views
     render_path = os.path.join(scene_out, "test", "ours_30000", "renders")
     if not os.path.exists(render_path) or len(glob.glob(f"{render_path}/*.*")) == 0:
@@ -241,28 +267,15 @@ for scene in pbar:
     else:
         print(f"  ✅ Đã có sẵn ảnh render từ trước.")
 
-    # Copy ảnh render vào Submission với định dạng JPEG để tối ưu dung lượng (< 350MB)
+    # Copy toàn bộ ảnh render vào Submission (render.py đã lưu ở JPEG Quality 98 nhưng giữ nguyên tên gốc)
     submission_dest = os.path.join(SUBMISSION_DIR, scene_name)
     if os.path.exists(render_path):
         os.makedirs(submission_dest, exist_ok=True)
-        for img_path in glob.glob(os.path.join(render_path, "*.*")):
-            if img_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+        for img_path in glob.glob(os.path.join(render_path, "*")):
+            if os.path.isfile(img_path):
                 img_name = os.path.basename(img_path)
-                out_jpg_path = os.path.join(submission_dest, img_name)
-                
-                # Nếu ảnh đã là JPEG (render.py đã lưu ở Q=98), chỉ cần copy trực tiếp để tránh nén lossy 2 lần
-                if img_path.lower().endswith(('.jpg', '.jpeg')):
-                    shutil.copy(img_path, out_jpg_path)
-                else:
-                    # Nếu là PNG thì mới convert sang JPEG để tiết kiệm dung lượng
-                    try:
-                        base_name = os.path.splitext(img_name)[0]
-                        out_jpg_path = os.path.join(submission_dest, f"{base_name}.jpg")
-                        with Image.open(img_path) as img:
-                            rgb_im = img.convert('RGB')
-                            rgb_im.save(out_jpg_path, 'JPEG', quality=98)
-                    except Exception as e:
-                        print(f"Lỗi khi chuyển đổi {img_name}: {e}")
+                out_path = os.path.join(submission_dest, img_name)
+                shutil.copy(img_path, out_path)
         print(f"  ✅ Đã đóng gói các ảnh test vào thư mục nộp bài.")
 
 print("\n" + "=" * 60)

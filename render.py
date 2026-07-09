@@ -80,16 +80,16 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         render_file_path = os.path.join(render_path, out_name)
         gt_file_path = os.path.join(gts_path, out_name)
 
-        # HACK: Lưu ảnh bằng thuật toán nén Lossless WebP để:
-        # 1. Dung lượng cực nhỏ (< 350MB cho toàn bộ 13 scenes)
-        # 2. Pixel 100% giống hệ PNG (Bảo toàn tuyệt đối LPIPS/PSNR)
-        # 3. Giữ nguyên đuôi file gốc (Dù là .jpg) để lách luật hệ thống Test tự động
         from PIL import Image
         rendering_np = final_rendering.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-        Image.fromarray(rendering_np).save(render_file_path, format="WebP", lossless=True)
+        
+        # Bắt buộc lưu bằng định dạng JPEG Quality 98 để giữ dung lượng < 350MB
+        # Việc dùng format="JPEG" giúp tránh lỗi "unknown extension" nếu out_name không có đuôi
+        # Đồng thời tuân thủ tuyệt đối tên gốc trong test_poses.csv (phải đúng tên)
+        Image.fromarray(rendering_np).save(render_file_path, format="JPEG", quality=98)
         
         gt_np = gt.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-        Image.fromarray(gt_np).save(gt_file_path, format="WebP", lossless=True)
+        Image.fromarray(gt_np).save(gt_file_path, format="JPEG", quality=98)
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool, ensemble_scales: list):
     with torch.no_grad():

@@ -83,13 +83,13 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         from PIL import Image
         rendering_np = final_rendering.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
         
-        # Bắt buộc lưu bằng định dạng JPEG Quality 98 để giữ dung lượng < 350MB
+        # Bắt buộc lưu bằng định dạng JPEG Quality 95 để giữ dung lượng an toàn < 350MB (thực tế Q95 vẫn cực nét)
         # Việc dùng format="JPEG" giúp tránh lỗi "unknown extension" nếu out_name không có đuôi
         # Đồng thời tuân thủ tuyệt đối tên gốc trong test_poses.csv (phải đúng tên)
-        Image.fromarray(rendering_np).save(render_file_path, format="JPEG", quality=98)
+        Image.fromarray(rendering_np).save(render_file_path, format="JPEG", quality=95)
         
         gt_np = gt.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-        Image.fromarray(gt_np).save(gt_file_path, format="JPEG", quality=98)
+        Image.fromarray(gt_np).save(gt_file_path, format="JPEG", quality=95)
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool, ensemble_scales: list):
     with torch.no_grad():

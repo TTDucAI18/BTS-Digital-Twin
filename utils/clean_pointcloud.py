@@ -83,13 +83,17 @@ def main():
         print(f"[3/3] KNN Culling: Đang xây dựng cây KDTree cho {len(pts)} điểm...")
         tree = cKDTree(pts)
         
-        print(f"[3/3] KNN Culling: Đang tìm số lượng hàng xóm trong bán kính {args.knn_r}...")
-        # count_neighbors = số điểm nằm trong bán kính (bao gồm cả chính nó)
-        num_neighbors = tree.query_ball_point(pts, r=args.knn_r, return_length=True)
-        knn_mask = num_neighbors >= args.knn_n
+        print(f"[3/3] KNN Culling: Đang tính khoảng cách đến {args.knn_n} hàng xóm (chạy đa luồng CPU)...")
+        # Thay vì query_ball_point (rất chậm và tốn RAM với dữ liệu lớn),
+        # ta tìm khoảng cách tới hàng xóm thứ knn_n. Nếu khoảng cách này <= knn_r
+        # nghĩa là chắc chắn có ít nhất knn_n hàng xóm trong bán kính knn_r.
+        distances, _ = tree.query(pts, k=args.knn_n, workers=-1)
+        
+        # distances[:, -1] là khoảng cách tới hàng xóm xa nhất trong K hàng xóm
+        knn_mask = distances[:, -1] <= args.knn_r
         
         filtered_vertices = filtered_vertices[knn_mask]
-        print(f"[3/3] KNN Culling: Đã xóa {np.sum(~knn_mask)} Gaussians mồ côi (hàng xóm < {args.knn_n})")
+        print(f"[3/3] KNN Culling: Đã xóa {np.sum(~knn_mask)} Gaussians mồ côi (khoảng cách tới hàng xóm thứ {args.knn_n} > {args.knn_r})")
     else:
         print("[3/3] KNN Culling: Bỏ qua do tham số không hợp lệ hoặc không còn Gaussians.")
         

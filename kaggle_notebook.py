@@ -1,890 +1,731 @@
 # =============================================================================
-# BTS Digital Twin — Kaggle Notebook
-# Copy từng cell vào Kaggle Notebook (Code cell)
+# BTS Digital Twin - Kaggle notebook script
+#
+# Copy this file into Kaggle as code cells, or run it as one Python script.
+# The pipeline is tuned for Kaggle 2x T4, 16 GB VRAM per GPU:
+#   1. clone/update repo and submodules
+#   2. install CUDA extensions once
+#   3. discover scenes
+#   4. train one scene per GPU
+#   5. render test poses at full output resolution
+#   6. package submission.zip
 # =============================================================================
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL 1 — Kiểm tra môi trường
-# ─────────────────────────────────────────────────────────────────────────────
-import os, subprocess
+import glob
+import io
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-def run(cmd, **kwargs):
-    """Helper: chạy shell command và print output realtime."""
-    result = subprocess.run(cmd, shell=True, text=True, capture_output=True, **kwargs)
-    if result.stdout: print(result.stdout)
-    if result.stderr: print(result.stderr)
+
+# =============================================================================
+# CELL 1 - Configuration
+# =============================================================================
+
+REPO_URL = os.environ.get("BTS_REPO_URL", "https://github.com/TTDucAI18/BTS-Digital-Twin.git")
+REPO_DIR = Path(os.environ.get("BTS_REPO_DIR", "/kaggle/working/BTS-Digital-Twin"))
+OUTPUT_DIR = Path(os.environ.get("BTS_OUTPUT_DIR", "/kaggle/working/output"))
+SUBMISSION_DIR = Path(os.environ.get("BTS_SUBMISSION_DIR", "/kaggle/working/submission"))
+SUBMISSION_ZIP = Path(os.environ.get("BTS_SUBMISSION_ZIP", "/kaggle/working/submission.zip"))
+
+DATA_ROOT_CANDIDATES = [
+    Path(os.environ["BTS_DATA_DIR"]) if os.environ.get("BTS_DATA_DIR") else None,
+    Path("/kaggle/input/datasets/tdukaggle/ai-race-data/phase1"),
+    Path("/kaggle/input/bts-digital-twin-phase1/phase1"),
+    Path("/kaggle/input/ai-race-data/phase1"),
+]
+
+ITERATIONS = int(os.environ.get("BTS_ITERATIONS", "30000"))
+TRAIN_RESOLUTION = int(os.environ.get("BTS_TRAIN_RESOLUTION", "2"))
+RENDER_RESOLUTION = int(os.environ.get("BTS_RENDER_RESOLUTION", "1"))
+MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "2500000"))
+MAX_WORKERS = int(os.environ.get("BTS_MAX_WORKERS", "2"))
+KAGGLE_TIME_LIMIT_H = float(os.environ.get("BTS_TIME_LIMIT_H", "11.0"))
+SCENE_FILTER = os.environ.get("BTS_SCENES", "").strip()
+
+WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "").strip()
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "").strip()
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "bts-digital-twin")
+USE_WANDB = bool(WANDB_API_KEY)
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
+
+SESSION_START = time.time()
+
+
+def run(cmd, cwd=None, log_file=None, check=False, env=None):
+    """Run a command and stream or capture output."""
+    cwd = str(cwd) if cwd is not None else None
+    printable = " ".join(str(x) for x in cmd)
+    print(f"\n$ {printable}")
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+
+    if log_file:
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(log_file, "w", encoding="utf-8", errors="replace") as f:
+            result = subprocess.run(
+                [str(x) for x in cmd],
+                cwd=cwd,
+                env=merged_env,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+    else:
+        result = subprocess.run(
+            [str(x) for x in cmd],
+            cwd=cwd,
+            env=merged_env,
+            text=True,
+            capture_output=True,
+        )
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(result.stderr)
+
+    if check and result.returncode != 0:
+        raise RuntimeError(f"Command failed with rc={result.returncode}: {printable}")
     return result.returncode
 
-print("=" * 60)
-print("CUDA & PyTorch versions")
-print("=" * 60)
-run("nvcc --version")
-run("python -c \"import torch; print(f'PyTorch {torch.__version__} | CUDA {torch.version.cuda}')\"")
-run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader")
+
+def tail(path, n=80):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return "".join(lines[-n:])
+    except Exception as exc:
+        return f"<could not read {path}: {exc}>"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL 2 — Sử dụng PyTorch mặc định của Kaggle (tránh lỗi mismatch với NVCC 12.x)
-# ─────────────────────────────────────────────────────────────────────────────
-print("=" * 60)
-print("Sử dụng PyTorch mặc định của Kaggle để đảm bảo khớp với NVCC...")
-print("=" * 60)
+def disk_free_gb(path="/kaggle/working"):
+    total, used, free = shutil.disk_usage(path)
+    return free / (1024**3), total / (1024**3)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL 3 — Clone repo và cài dependencies
-# ─────────────────────────────────────────────────────────────────────────────
-REPO_URL  = "https://github.com/TTDucAI18/BTS-Digital-Twin.git"
-REPO_DIR  = "/kaggle/working/BTS-Digital-Twin"
+def hours_remaining():
+    elapsed = (time.time() - SESSION_START) / 3600.0
+    return KAGGLE_TIME_LIMIT_H - elapsed
 
-print("=" * 60)
-print("Cloning BTS-Digital-Twin repo...")
-print("=" * 60)
 
-if os.path.exists(REPO_DIR):
-    print(f"Repo already exists at {REPO_DIR}, pulling latest...")
-    run(f"git -C {REPO_DIR} pull origin main")
-    run(f"git -C {REPO_DIR} submodule update --init --recursive")
+print("=" * 80)
+print("Environment")
+print("=" * 80)
+run(["nvidia-smi"])
+run([sys.executable, "-c", "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'gpus', torch.cuda.device_count())"])
+free_gb, total_gb = disk_free_gb()
+print(f"Disk: {free_gb:.1f} GB free / {total_gb:.1f} GB total")
+
+
+# =============================================================================
+# CELL 2 - Repo and dependencies
+# =============================================================================
+
+if REPO_DIR.exists():
+    run(["git", "-C", REPO_DIR, "pull", "--ff-only"], check=False)
+    run(["git", "-C", REPO_DIR, "submodule", "update", "--init", "--recursive"], check=True)
 else:
-    run(f"git clone --recurse-submodules {REPO_URL} {REPO_DIR}")
+    run(["git", "clone", "--recurse-submodules", REPO_URL, REPO_DIR], check=True)
 
 os.chdir(REPO_DIR)
-print(f"\nWorking directory: {os.getcwd()}")
-run("git log --oneline -3")
+run(["git", "log", "--oneline", "-3"], cwd=REPO_DIR, check=False)
 
+print("=" * 80)
+print("Installing Python deps and CUDA extensions")
+print("=" * 80)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL 4 — Cài đặt submodules (diff-gaussian-rasterization, simple-knn, fused-ssim)
-# ─────────────────────────────────────────────────────────────────────────────
-print("=" * 60)
-print("Installing Python dependencies & submodules...")
-print("=" * 60)
+run([sys.executable, "-m", "pip", "install", "-q", "plyfile", "tqdm", "opencv-python-headless", "ninja", "Pillow", "matplotlib", "setuptools<70.0.0"], check=True)
+if USE_WANDB:
+    run([sys.executable, "-m", "pip", "install", "-q", "wandb"], check=True)
 
-# Base deps — setuptools<70 tránh lỗi distutils khi compile CUDA extension
-run("pip install plyfile tqdm wandb opencv-python ninja \"setuptools<70.0.0\"")
-
-# Compile submodules
-for submod in [
-    "submodules/diff-gaussian-rasterization",
-    "submodules/simple-knn",
-    "submodules/fused-ssim",
+for submodule in [
+    REPO_DIR / "submodules" / "diff-gaussian-rasterization",
+    REPO_DIR / "submodules" / "simple-knn",
+    REPO_DIR / "submodules" / "fused-ssim",
 ]:
-    print(f"\n[Building] {submod} ...")
-    rc = run(f"pip install --no-build-isolation -e {submod}", cwd=REPO_DIR)
-    status = "✅ OK" if rc == 0 else "❌ FAILED"
-    print(f"  → {status}")
+    if submodule.exists():
+        run([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", submodule], cwd=REPO_DIR, check=True)
+    else:
+        print(f"WARNING: missing submodule {submodule}")
 
-# Verify import
-run("python -c \"from diff_gaussian_rasterization import GaussianRasterizer; print('Rasterizer OK')\"", cwd=REPO_DIR)
-run("python -c \"import simple_knn; print('simple_knn OK')\"", cwd=REPO_DIR)
+verify_code = (
+    "from diff_gaussian_rasterization import GaussianRasterizer; "
+    "from simple_knn._C import distCUDA2; "
+    "print('CUDA extensions OK')"
+)
+run([sys.executable, "-c", verify_code], cwd=REPO_DIR, check=True)
 
+if USE_WANDB:
+    import wandb
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL 5 — WandB login
-# ─────────────────────────────────────────────────────────────────────────────
-import wandb
+    wandb.login(key=WANDB_API_KEY)
+    if not WANDB_ENTITY:
+        try:
+            WANDB_ENTITY = wandb.Api().viewer.username
+        except Exception:
+            WANDB_ENTITY = ""
+    print(f"WandB enabled: project={WANDB_PROJECT}, entity={WANDB_ENTITY or '<default>'}")
+else:
+    print("WandB disabled. Set WANDB_API_KEY in Kaggle Secrets to enable it.")
 
-print("=" * 60)
-print("Logging in to Weights & Biases...")
-print("=" * 60)
-wandb.login(key="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")
-print("WandB login OK ✅")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL 6 — Cấu hình đường dẫn data & output
-# ─────────────────────────────────────────────────────────────────────────────
-import glob
-
-DATA_DIR   = "/kaggle/input/datasets/tdukaggle/ai-race-data/phase1"
-OUTPUT_DIR = "/kaggle/working/output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Thu thập tất cả scenes (bỏ qua .DS_Store và __MACOSX)
-public_scenes  = sorted([
-    p for p in glob.glob(f"{DATA_DIR}/public_set/*")
-    if os.path.isdir(p) and not os.path.basename(p).startswith(".")
-])
-private_scenes = sorted([
-    p for p in glob.glob(f"{DATA_DIR}/private_set1/*")
-    if os.path.isdir(p) and not os.path.basename(p).startswith(".")
-])
-all_scenes = public_scenes + private_scenes
-
-print(f"Public  scenes ({len(public_scenes)}): {[os.path.basename(s) for s in public_scenes]}")
-print(f"Private scenes ({len(private_scenes)}): {[os.path.basename(s) for s in private_scenes]}")
-print(f"Total: {len(all_scenes)} scenes")
+ARGUMENTS_TEXT = (REPO_DIR / "arguments" / "__init__.py").read_text(encoding="utf-8", errors="replace")
+SUPPORTS_MAX_GAUSSIANS = "max_gaussians" in ARGUMENTS_TEXT
+SUPPORTS_MASKS = "_masks" in ARGUMENTS_TEXT or "self._masks" in ARGUMENTS_TEXT
+SUPPORTS_FOREGROUND_WEIGHT = "foreground_loss_weight" in ARGUMENTS_TEXT
+print(
+    "Repo feature flags:",
+    {
+        "max_gaussians": SUPPORTS_MAX_GAUSSIANS,
+        "masks": SUPPORTS_MASKS,
+        "foreground_loss_weight": SUPPORTS_FOREGROUND_WEIGHT,
+    },
+)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL 7 — Training Multi-GPU (queue-based: GPU nào rảnh nhận scene tiếp theo)
-# ─────────────────────────────────────────────────────────────────────────────
-import subprocess, queue, shutil, time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+# =============================================================================
+# CELL 3 - Data discovery and scene diagnostics
+# =============================================================================
 
-REPO_DIR             = "/kaggle/working/BTS-Digital-Twin"
-OUTPUT_DIR           = "/kaggle/working/output"
-ITERATIONS           = 30_000   # Train đầy đủ 30k iters
-FINETUNE_ITERS       = 0        # Fine-tune TẮT (Phase 2 gây regression trên BTS data)
-KAGGLE_TIME_LIMIT_H  = 10.0     # Ngưỡng an toàn (12h limit Kaggle − 2h buffer)
-KAGGLE_SESSION_START = time.time()
+def find_data_root():
+    for candidate in DATA_ROOT_CANDIDATES:
+        if candidate and candidate.exists():
+            if (candidate / "public_set").exists() or (candidate / "private_set1").exists():
+                return candidate
+    raise FileNotFoundError(
+        "Could not find phase1 data root. Set BTS_DATA_DIR to the folder containing public_set/private_set1."
+    )
 
-# Script nhẹ để trích xuất PLY mà không bị CPU OOM do load ảnh
-with open("/kaggle/working/extract_ply.py", "w") as f:
-    f.write("""import sys
-import os
-sys.path.append("/kaggle/working/BTS-Digital-Twin")
 
-import torch
-from scene.gaussian_model import GaussianModel
+def is_scene_dir(path):
+    path = Path(path)
+    return (path / "train" / "sparse").exists() or (path / "sparse").exists()
+
+
+def discover_scenes(data_root):
+    scenes = []
+    for split in ["public_set", "private_set1"]:
+        split_dir = data_root / split
+        if split_dir.exists():
+            scenes.extend([p for p in sorted(split_dir.iterdir()) if p.is_dir() and is_scene_dir(p)])
+
+    if SCENE_FILTER:
+        wanted = {x.strip() for x in SCENE_FILTER.split(",") if x.strip()}
+        scenes = [p for p in scenes if p.name in wanted]
+
+    if not scenes:
+        raise RuntimeError(f"No scenes found under {data_root}")
+    return scenes
+
+
+DATA_ROOT = find_data_root()
+ALL_SCENES = discover_scenes(DATA_ROOT)
+print(f"DATA_ROOT: {DATA_ROOT}")
+print(f"Scenes ({len(ALL_SCENES)}): {[p.name for p in ALL_SCENES]}")
+
+
+def train_root(scene_path):
+    scene_path = Path(scene_path)
+    return scene_path / "train" if (scene_path / "train" / "sparse").exists() else scene_path
+
+
+def count_images(scene_path):
+    image_dir = train_root(scene_path) / "images"
+    exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp"}
+    if not image_dir.exists():
+        return 0
+    return sum(1 for p in image_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+
+
+def optional_depth_args(scene_path):
+    root = train_root(scene_path)
+    depth_params = root / "sparse" / "0" / "depth_params.json"
+    if not depth_params.exists():
+        return []
+    for name in ["depths_any", "depth_anything", "depths", "depth"]:
+        if (root / name).is_dir():
+            return ["--depths", name]
+    return []
+
+
+def optional_mask_args(scene_path):
+    if not SUPPORTS_MASKS:
+        return []
+    root = train_root(scene_path)
+    for name in ["masks", "mask", "foreground_masks", "foreground"]:
+        if (root / name).is_dir():
+            args = ["--masks", name]
+            if SUPPORTS_FOREGROUND_WEIGHT:
+                args.extend(["--foreground_loss_weight", "4.0"])
+            return args
+    return []
+
+
+for scene in ALL_SCENES:
+    diagnose_script = REPO_DIR / "utils" / "diagnose_colmap_images.py"
+    if diagnose_script.exists():
+        log = OUTPUT_DIR / f"{scene.name}_diagnose.log"
+        run([sys.executable, diagnose_script, "--scene", scene], cwd=REPO_DIR, log_file=log, check=False)
+        print(tail(log, 20))
+    else:
+        print(f"[{scene.name}] diagnose script not found; skipping COLMAP/image report.")
+
+
+# =============================================================================
+# CELL 4 - Training and rendering helpers
+# =============================================================================
+
+def get_gpu_ids():
+    try:
+        import torch
+
+        n = torch.cuda.device_count()
+        return list(range(min(n, MAX_WORKERS)))
+    except Exception:
+        return [0]
+
+
+GPU_IDS = get_gpu_ids()
+if not GPU_IDS:
+    raise RuntimeError("No CUDA GPU visible.")
+print(f"Using GPUs: {GPU_IDS}")
+
+
+def scene_output(scene_path):
+    return OUTPUT_DIR / Path(scene_path).name
+
+
+def checkpoint_iter(path):
+    try:
+        return int(Path(path).name.replace("chkpnt", "").replace(".pth", ""))
+    except ValueError:
+        return -1
+
+
+def is_valid_checkpoint(path):
+    path = Path(path)
+    if not path.exists() or path.stat().st_size < 1024:
+        return False
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            return zf.testzip() is None
+    except Exception:
+        return False
+
+
+def latest_checkpoint(out_dir, max_iter=None):
+    ckpts = sorted(Path(out_dir).glob("chkpnt*.pth"), key=checkpoint_iter, reverse=True)
+    for ckpt in ckpts:
+        it = checkpoint_iter(ckpt)
+        if max_iter is not None and it > max_iter:
+            continue
+        if is_valid_checkpoint(ckpt):
+            return ckpt
+    return None
+
+
+def final_iteration(out_dir):
+    pc_dir = Path(out_dir) / "point_cloud"
+    iters = []
+    if pc_dir.exists():
+        for p in pc_dir.glob("iteration_*"):
+            try:
+                if (p / "point_cloud.ply").exists():
+                    iters.append(int(p.name.replace("iteration_", "")))
+            except ValueError:
+                pass
+    ckpt = latest_checkpoint(out_dir)
+    if ckpt:
+        iters.append(checkpoint_iter(ckpt))
+    return max(iters) if iters else ITERATIONS
+
+
+def ensure_ply_from_checkpoint(out_dir, iteration):
+    out_dir = Path(out_dir)
+    ply = out_dir / "point_cloud" / f"iteration_{iteration}" / "point_cloud.ply"
+    if ply.exists():
+        return True
+
+    ckpt = out_dir / f"chkpnt{iteration}.pth"
+    if not is_valid_checkpoint(ckpt):
+        return False
+
+    helper = Path("/kaggle/working/extract_checkpoint_ply.py")
+    helper.write_text(
+        """
 import argparse
+import os
+import sys
+import torch
+
+sys.path.insert(0, "/kaggle/working/BTS-Digital-Twin")
+from scene.gaussian_model import GaussianModel
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--checkpoint", type=str, required=True)
-parser.add_argument("--out_ply", type=str, required=True)
+parser.add_argument("--checkpoint", required=True)
+parser.add_argument("--out_ply", required=True)
 parser.add_argument("--sh_degree", type=int, default=3)
 args = parser.parse_args()
 
-gaussians = GaussianModel(args.sh_degree, 'default')
-model_params, _ = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-
-# capture() returns a 12-element tuple:
-# (active_sh_degree, _xyz, _features_dc, _features_rest, _scaling,
-#  _rotation, _opacity, max_radii2D, xyz_gradient_accum, denom, optimizer_state, spatial_lr_scale)
-# We restore the model fields directly to bypass the optimizer (CPU-safe).
-gaussians.active_sh_degree = model_params[0]  # Restore SH degree so colors render correctly
+gaussians = GaussianModel(args.sh_degree, "default")
+model_params, _ = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+gaussians.active_sh_degree = model_params[0]
 gaussians._xyz = model_params[1]
 gaussians._features_dc = model_params[2]
 gaussians._features_rest = model_params[3]
 gaussians._scaling = model_params[4]
 gaussians._rotation = model_params[5]
 gaussians._opacity = model_params[6]
-
 os.makedirs(os.path.dirname(args.out_ply), exist_ok=True)
 gaussians.save_ply(args.out_ply)
-print(f"Extracted PLY to {args.out_ply} (active_sh_degree={gaussians.active_sh_degree})")
-""")
-
-# Thư mục chứa checkpoint từ Kaggle Input dataset (để resume nếu có)
-INPUT_CHECKPOINT_DIR = "/kaggle/input/datasets/tdukaggle/ai-race-data"
-
-
-def check_disk_space(label: str = ""):
-    """In dung lượng còn trống trên /kaggle/working."""
-    total, used, free = shutil.disk_usage("/kaggle/working")
-    free_gb  = free  / (1024 ** 3)
-    total_gb = total / (1024 ** 3)
-    tag  = f"[{label}] " if label else ""
-    flag = "⚠️ LOW DISK" if free_gb < 3 else "💾"
-    print(f"  {flag} {tag}Disk: {free_gb:.1f} GB free / {total_gb:.1f} GB total")
-    return free_gb
-
-
-def cleanup_after_train(scene_out: str, scene_name: str, final_iter: int = None):
-    """Giải phóng disk sau khi train xong một scene.
-    - Xoá thư mục point_cloud của iteration cũ (chỉ giữ mới nhất)
-    - Xoá tensorboard event files
-    - KHÔNG xoá checkpoint — đã được xử lý trong train_scene() sau khi verify.
-    """
-    if final_iter is None:
-        final_iter = get_final_iteration(scene_out)
-    freed = 0
-
-    # Xóa Tensorboard event files (nếu vô tình sinh ra)
-    for tfevent in glob.glob(f"{scene_out}/events.out.tfevents*"):
-        try:
-            size = os.path.getsize(tfevent)
-            os.remove(tfevent)
-            freed += size
-        except: pass
-
-    # Xoá wandb offline run directories để nhẹ máy
-    wandb_dir = "/kaggle/working/wandb"
-    if os.path.exists(wandb_dir):
-        for run_dir in os.listdir(wandb_dir):
-            if run_dir.startswith("run-") or run_dir.startswith("offline-"):
-                try:
-                    shutil.rmtree(os.path.join(wandb_dir, run_dir))
-                except: pass
-
-    # Xoá point_cloud của iteration cũ, chỉ giữ iteration mới nhất
-    pc_base   = f"{scene_out}/point_cloud"
-    keep_iter = f"iteration_{final_iter}"
-    if os.path.isdir(pc_base):
-        for iter_dir in os.listdir(pc_base):
-            if iter_dir != keep_iter:
-                full = os.path.join(pc_base, iter_dir)
-                try:
-                    size = sum(os.path.getsize(os.path.join(dp, f))
-                               for dp, _, fs in os.walk(full) for f in fs)
-                    shutil.rmtree(full)
-                    freed += size
-                    print(f"    🗑  Removed old PLY dir: point_cloud/{iter_dir}")
-                except Exception as e:
-                    print(f"    ⚠️  Could not remove {full}: {e}")
-
-    if freed > 0:
-        print(f"  [{scene_name}] 🧹 Cleanup freed: {freed / (1024**3):.2f} GB")
-    check_disk_space(scene_name)
-
-
-def is_valid_checkpoint(path: str) -> bool:
-    """Kiểm tra checkpoint có phải ZIP hợp lệ không (PyTorch .pth là zip archive).
-    File bị truncate do disk-full sẽ thiếu magic bytes và central directory.
-    """
-    import zipfile
-    try:
-        with zipfile.ZipFile(path, 'r') as zf:
-            bad = zf.testzip()   # None nếu tất cả OK
-            return bad is None
-    except (zipfile.BadZipFile, EOFError, OSError):
-        return False
-
-
-def has_time_remaining(hours_needed: float) -> bool:
-    """Kiểm tra session còn đủ thời gian để chạy thêm bước không."""
-    elapsed_h   = (time.time() - KAGGLE_SESSION_START) / 3600
-    remaining_h = KAGGLE_TIME_LIMIT_H - elapsed_h
-    if remaining_h < hours_needed:
-        print(f"  ⏱ Thời gian còn lại: {remaining_h:.1f}h < cần {hours_needed:.1f}h → bỏ qua bước này.")
-        return False
-    print(f"  ⏱ Thời gian còn lại: {remaining_h:.1f}h → đủ để chạy thêm {hours_needed:.1f}h")
-    return True
-
-
-def get_final_iteration(scene_out: str) -> int:
-    """Tìm iteration cao nhất có sẵn trong thư mục point_cloud."""
-    pc_base = os.path.join(scene_out, "point_cloud")
-    if not os.path.isdir(pc_base):
-        return ITERATIONS
-    iters = []
-    for d in os.listdir(pc_base):
-        if d.startswith("iteration_"):
-            try:
-                iters.append(int(d.replace("iteration_", "")))
-            except ValueError:
-                pass
-    return max(iters) if iters else ITERATIONS
-
-
-def get_scene_config(scene_path: str) -> dict:
-    """Trả về config training tối ưu dựa trên số ảnh của scene.
-
-    Chiến lược -r 1 (full resolution):
-    - Huấn luyện ở độ phân giải gốc để tránh mismatch khi render test.
-    - Điều chỉnh densify_grad_threshold theo số ảnh để cân bằng chi tiết vs VRAM.
-    - densify_until_iter = 27000: densification chạy qua cả giai đoạn Depth Loss
-      tắt (iter 25k), cho phép model sinh điểm mới khi tinh chỉnh màu sắc.
-    """
-    # BTS structure: scene_path/train/images
-    img_dir = os.path.join(scene_path, "train", "images")
-    if not os.path.isdir(img_dir):
-        img_dir = os.path.join(scene_path, "images")   # fallback
-    if os.path.isdir(img_dir):
-        n_imgs = len([f for f in os.listdir(img_dir)
-                      if f.lower().endswith((".jpg", ".jpeg", ".png"))])
-    else:
-        n_imgs = 240   # Không detect được → assume trung bình
-    print(f"  [Config] Số ảnh train: {n_imgs}")
-
-    if n_imgs <= 120:
-        # Scene nhỏ: ngưỡng nhạy hơn một chút để bắt chi tiết mỏng (cáp)
-        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.00012}
-    elif n_imgs <= 220:
-        # Scene vừa
-        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.00015}
-    else:
-        # Scene đầy đủ
-        return {"resolution": 1, "densify_until_iter": 15000, "densify_grad_threshold": 0.0002}
-
-
-def finetune_scene(scene_path: str, scene_out: str, gpu_id: int) -> int:
-    """Phase 2: Fine-tune tại -r 1 (full resolution) sau khi Phase 1 xong.
-
-    Tại sao an toàn về VRAM:
-    - densify_until_iter=0 → không chạy densification → VRAM tiết kiệm đáng kể.
-    - Gaussians đã ở đúng vị trí từ Phase 1; Phase 2 chỉ tinh chỉnh
-      màu sắc/opacity tại full-res → gains về PSNR/SSIM.
-    - Exposure compensation BỊ TẮT (giống Phase 1) vì BTS data đồng đều ánh sáng.
-    """
-    scene_name = os.path.basename(scene_path)
-    if FINETUNE_ITERS <= 0:
-        return 0
-
-    # Ước tính ~8-12 phút/scene cho 5000 iters → cần ít nhất 0.25h buffer
-    if not has_time_remaining(0.25):
-        print(f"  [{scene_name}] Phase 2 bị bỏ qua do sắp hết thời gian.")
-        return 0
-
-    # Tìm checkpoint Phase 1
-    p1_ckpt = f"{scene_out}/chkpnt{ITERATIONS}.pth"
-    if not is_valid_checkpoint(p1_ckpt):
-        print(f"  [{scene_name}] ⚠️ Không tìm thấy checkpoint Phase 1 hợp lệ → bỏ qua fine-tune.")
-        return 1
-
-    finetune_total_iters = ITERATIONS + FINETUNE_ITERS   # e.g. 35000
-    log_file = f"{scene_out}/{scene_name}_finetune.log"
-    check_disk_space(scene_name)
-
-    env_prefix = "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
-    cmd = (
-        f"{env_prefix}"
-        f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/train.py "
-        f"-s {scene_path} "
-        f"-m {scene_out} "
-        f"-r 1 "                                     # Full resolution
-        f"--data_device cpu "
-        f"--use_wandb "
-        f"--wandb_project bts-digital-twin "
-        f"--wandb_entity {WANDB_ENTITY} "
-        f"--iterations {finetune_total_iters} "
-        f"--lambda_dssim 0.2 "
-        # NOTE: --train_test_exp REMOVED — exposure compensation disabled for BTS.
-        # NOTE: --exposure_lr_* REMOVED — no exposure optimizer in this pipeline.
-        f"--depth_weight_init 0.0 "                  # Tắt depth loss ở Phase 2 fine-tune
-        f"--densify_grad_threshold 0.0002 "
-        f"--densify_until_iter 0 "                   # QUAN TRỌNG: Tắt hoàn toàn densification
-        f"--checkpoint_iterations {finetune_total_iters} "
-        f"--save_iterations {finetune_total_iters} "
-        f"--disable_viewer "
-        f"--start_checkpoint {p1_ckpt}"
+print(f"Extracted {args.out_ply}")
+""".lstrip(),
+        encoding="utf-8",
     )
-
-    print(f"\n🔬 [Phase 2] Fine-tuning [{scene_name}] tại -r 1 trên GPU {gpu_id} (+{FINETUNE_ITERS} iters)...")
-    with open(log_file, "w") as lf:
-        result = subprocess.run(cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT, cwd=REPO_DIR)
-
-    status = "✅ DONE" if result.returncode == 0 else f"❌ FAILED (rc={result.returncode})"
-    print(f"  [{scene_name}] Phase 2 {status}")
-
-    if result.returncode != 0:
-        print(f"\n{'='*20} FINE-TUNE ERROR LOG ({scene_name}) — Last 30 lines {'='*20}")
-        try:
-            with open(log_file, "r") as f:
-                lines = f.readlines()
-                print("".join(lines[-30:]))
-        except Exception as e:
-            print(f"Could not read log: {e}")
-        print("=" * 60 + "\n")
-    else:
-        # Cleanup: xoá checkpoint Phase 1 và PLY cũ, chỉ giữ Phase 2
-        cleanup_after_train(scene_out, scene_name, final_iter=finetune_total_iters)
-
-    return result.returncode
+    rc = run([sys.executable, helper, "--checkpoint", ckpt, "--out_ply", ply], cwd=REPO_DIR, check=False)
+    return rc == 0 and ply.exists()
 
 
-# ── Xác định WandB entity ─────────────────────────────────────────────────────
-import wandb
-try:
-    viewer = wandb.Api().viewer
-    teams  = [t for t in getattr(viewer, 'teams', [])]
-    if 'ai_race' in teams or viewer.username == 'ai_race':
-        WANDB_ENTITY = 'ai_race'
-    else:
-        WANDB_ENTITY = viewer.username
-    print(f"✅ Đã chốt WandB Entity: {WANDB_ENTITY}")
-except Exception:
-    WANDB_ENTITY = "ai_race"
-    print(f"⚠️ Không thể lấy thông tin, ép dùng mặc định: {WANDB_ENTITY}")
-
-
-def train_scene(scene_path: str, gpu_id: int) -> tuple:
-    """Train một scene. Trả về (scene_name, return_code).
-
-    Chiến lược checkpoint (theo thứ tự ưu tiên kiểm tra):
-      1. Tìm checkpoint 30000 hợp lệ → bỏ qua NGAY, không load.
-      2. Tìm checkpoint hợp lệ cao nhất < 30000 → resume từ đó.
-      3. Không có checkpoint nào → train từ đầu.
-
-    Sau khi train xong 30000:
-      - Xác nhận checkpoint 30000 hợp lệ.
-      - Xóa checkpoint cũ để giải phóng disk (~500 MB/scene).
-    """
-    scene_name = os.path.basename(scene_path)
-    scene_out  = f"{OUTPUT_DIR}/{scene_name}"
-    log_file   = f"{OUTPUT_DIR}/{scene_name}_train.log"
-    os.makedirs(scene_out, exist_ok=True)
-
-    def get_iter_from_ckpt(ckpt_path):
-        """Trả về số iteration từ tên file checkpoint."""
-        try:
-            name = os.path.basename(ckpt_path).replace("chkpnt", "").replace(".pth", "")
-            return int(name.split("_")[0])
-        except:
-            return 0
-
-    # ── BƯỚC 1: Kiểm tra checkpoint 30000 trong output dir ────────────────────
-    final_ckpt = f"{scene_out}/chkpnt{ITERATIONS}.pth"
-    final_ply  = f"{scene_out}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
-
-    if is_valid_checkpoint(final_ckpt):
-        print(f"  ✅ [{scene_name}] Valid chkpnt{ITERATIONS}.pth found — skipping training")
-        if not os.path.exists(final_ply):
-            print(f"  ⚠️  [{scene_name}] point_cloud.ply missing — Extracting...")
-            cmd_extract = f"python /kaggle/working/extract_ply.py --checkpoint {final_ckpt} --out_ply {final_ply} --sh_degree 3"
-            subprocess.run(cmd_extract, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=REPO_DIR)
-        
-        cfg_dest = os.path.join(scene_out, "cfg_args")
-        if not os.path.exists(cfg_dest):
-            with open(cfg_dest, "w") as f:
-                f.write("Namespace(sh_degree=3, source_path='', model_path='', images='images', resolution=-1, data_device='cuda', eval=False, white_background=False, depths='')")
-        
-        return scene_name, 0
-
-    # PLY tồn tại nhưng không có checkpoint (đã cleanup) → cũng skip
-    if os.path.exists(final_ply):
-        print(f"  ✅ [{scene_name}] point_cloud.ply found — skipping training")
-        return scene_name, 0
-
-    # Xóa checkpoint 30000 nếu bị corrupt (tránh resume sai)
-    if os.path.exists(final_ckpt):
-        print(f"  🗑  [{scene_name}] Corrupt chkpnt{ITERATIONS}.pth detected → removing")
-        try:
-            os.remove(final_ckpt)
-        except Exception as e:
-            print(f"    Could not remove: {e}")
-
-    # ── BƯỚC 2: Tìm checkpoint để resume (ưu tiên iter cao nhất < 30000) ──────
-    all_local_ckpts = sorted(
-        glob.glob(f"{scene_out}/chkpnt*.pth"),
-        key=get_iter_from_ckpt
-    )
-
-    # Tìm checkpoint từ INPUT_CHECKPOINT_DIR (Kaggle Input dataset)
-    if INPUT_CHECKPOINT_DIR:
-        input_ckpts = sorted(
-            glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth") +
-            glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name}.pth") +
-            glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name.lower()}.pth"),
-            key=get_iter_from_ckpt
-        )
-        if input_ckpts:
-            best_input = input_ckpts[-1]
-            best_iter  = get_iter_from_ckpt(best_input)
-            if best_iter >= ITERATIONS and is_valid_checkpoint(best_input):
-                print(f"  ✅ [{scene_name}] Valid chkpnt{best_iter} in INPUT_CHECKPOINT_DIR — Extracting PLY directly to output...")
-                cmd_extract = f"python /kaggle/working/extract_ply.py --checkpoint {best_input} --out_ply {final_ply} --sh_degree 3"
-                subprocess.run(cmd_extract, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=REPO_DIR)
-                
-                cfg_src = os.path.join(os.path.dirname(best_input), "cfg_args")
-                cfg_dest = os.path.join(scene_out, "cfg_args")
-                if os.path.exists(cfg_src):
-                    shutil.copy(cfg_src, cfg_dest)
-                elif not os.path.exists(cfg_dest):
-                    with open(cfg_dest, "w") as f:
-                        f.write("Namespace(sh_degree=3, source_path='', model_path='', images='images', resolution=-1, data_device='cuda', eval=False, white_background=False, depths='')") 
-                
-                return scene_name, 0
-            # Copy các checkpoint hợp lệ < 30000 sang output dir để resume
-            for inp_ckpt in input_ckpts:
-                if get_iter_from_ckpt(inp_ckpt) < ITERATIONS and is_valid_checkpoint(inp_ckpt):
-                    dst = f"{scene_out}/chkpnt{get_iter_from_ckpt(inp_ckpt)}.pth"
-                    if not os.path.exists(dst):
-                        shutil.copy2(inp_ckpt, dst)
-                        print(f"  [{scene_name}] Copied: {os.path.basename(inp_ckpt)} → {os.path.basename(dst)}")
-            all_local_ckpts = sorted(glob.glob(f"{scene_out}/chkpnt*.pth"), key=get_iter_from_ckpt)
-
-    # Lọc checkpoint hợp lệ (không bị corrupt, iter < 30000)
-    resumable_ckpts = []
-    for ckpt in all_local_ckpts:
-        it = get_iter_from_ckpt(ckpt)
-        if it >= ITERATIONS:
-            continue   # checkpoint 30000 đã xử lý ở trên
-        if is_valid_checkpoint(ckpt):
-            resumable_ckpts.append(ckpt)
-        else:
-            print(f"  🗑  [{scene_name}] Corrupt checkpoint → removing: {os.path.basename(ckpt)}")
-            try:
-                os.remove(ckpt)
-            except Exception as e:
-                print(f"    Could not remove: {e}")
-
-    # Chọn checkpoint cao nhất để resume
-    if resumable_ckpts:
-        best_ckpt   = resumable_ckpts[-1]
-        iter_num    = get_iter_from_ckpt(best_ckpt)
-        resume_flag = f"--start_checkpoint {best_ckpt}"
-        print(f"  [{scene_name}] Resuming from chkpnt{iter_num} → còn {ITERATIONS - iter_num} iters")
-    else:
-        resume_flag = ""
-        print(f"  [{scene_name}] No valid checkpoint — training from scratch")
-
-    # ── BƯỚC 3: Chạy training ─────────────────────────────────────────────────
-    scene_cfg  = get_scene_config(scene_path)
-    check_disk_space(scene_name)
-    env_prefix = "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
-
-    cmd = (
-        f"{env_prefix}"
-        f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/train.py "
-        f"-s {scene_path} "
-        f"-m {scene_out} "
-        f"-r {scene_cfg['resolution']} "
-        f"--sh_degree 3 "                    # SH degree 3: Khôi phục khả năng mô phỏng phản quang
-        f"--data_device cpu "
-        f"--use_wandb "
-        f"--wandb_project bts-digital-twin "
-        f"--wandb_entity {WANDB_ENTITY} "
-        f"--iterations {ITERATIONS} "
-        f"--lambda_dssim 0.2 "               # Trả về 0.2 (mặc định) để tránh mất ổn định Loss
-        f"--position_lr_init 0.00016 "       # Trả về 0.00016 (mặc định) để tránh gradient explosion (floaters)
-        f"--densification_interval 100 "     # Trả về 100 (mặc định) để không bùng nổ điểm Gaussian quá nhanh
-        # NOTE: --train_test_exp REMOVED — exposure compensation disabled for BTS.
-        # NOTE: --exposure_lr_* REMOVED — exposure optimizer không còn tồn tại.
-        f"--depth_weight_init 0.02 "         # Giảm depth weight để không kìm hãm vùng cáp mỏng
-        f"--antialiasing "
-        f"--densify_grad_threshold {scene_cfg['densify_grad_threshold']} "
-        f"--densify_until_iter {scene_cfg['densify_until_iter']} "
-        f"--opacity_reset_interval 3000 "    # OPT: giảm tần suất reset để tránh over-prune khi densify kéo dài đến 27k
-        f"--checkpoint_iterations 7500 15000 25000 {ITERATIONS} "  # BUG 4: thêm 25000 để có safety net khi OOM ở iter 30000
-        f"--save_iterations {ITERATIONS} "
-        f"--disable_viewer "
-        f"{resume_flag}"
-    )
-
-    print(f"\n🚀 Training [{scene_name}] -r {scene_cfg['resolution']} on GPU {gpu_id} | sh_degree=3 depth_w=0.02 thresh={scene_cfg['densify_grad_threshold']} densify_until={scene_cfg['densify_until_iter']} ...")
-    with open(log_file, "w") as lf:
-        result = subprocess.run(cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT, cwd=REPO_DIR)
-
-    status = "✅ DONE" if result.returncode == 0 else f"❌ FAILED (rc={result.returncode})"
-    print(f"  [{scene_name}] {status} — log: {log_file}")
-
-    if result.returncode != 0:
-        # In 50 dòng cuối log để debug
-        print(f"\n{'='*20} ERROR LOG FOR {scene_name} (Last 50 lines) {'='*20}")
-        try:
-            with open(log_file, "r") as f:
-                lines = f.readlines()
-                print("".join(lines[-50:]))
-        except Exception as e:
-            print(f"Could not read log: {e}")
-        print("=" * 60 + "\n")
-    else:
-        # ── BƯỚC 4: Sau khi train xong, xác nhận checkpoint 30000 hợp lệ ─────
-        # rồi mới xóa checkpoint cũ để giải phóng disk (~500 MB/scene)
-        if is_valid_checkpoint(final_ckpt):
-            print(f"  ✅ [{scene_name}] chkpnt{ITERATIONS}.pth verified OK — xóa toàn bộ checkpoint cũ")
-            total_freed = 0
-            for ckpt in glob.glob(f"{scene_out}/chkpnt*.pth"):
-                if get_iter_from_ckpt(ckpt) < ITERATIONS:
-                    try:
-                        sz = os.path.getsize(ckpt)
-                        os.remove(ckpt)
-                        total_freed += sz
-                        print(f"  🗑  [{scene_name}] Deleted: {os.path.basename(ckpt)} ({sz/1024/1024:.0f} MB)")
-                    except Exception as e:
-                        print(f"  ⚠️  Could not delete {os.path.basename(ckpt)}: {e}")
-            if total_freed > 0:
-                print(f"  💾 [{scene_name}] Freed {total_freed/1024/1024:.0f} MB from intermediate checkpoints")
-        else:
-            print(f"  ⚠️  [{scene_name}] chkpnt{ITERATIONS}.pth MISSING or CORRUPT — GIỮ NGUYÊN mọi checkpoint cũ làm backup")
-
-        # Cleanup PLY cũ và Tensorboard logs
-        cleanup_after_train(scene_out, scene_name)
-
-    return scene_name, result.returncode
-
-
-def get_scene_priority(scene_path):
-    """Sắp xếp thứ tự train để tối ưu disk và thời gian:
-      2 = có checkpoint trung gian hợp lệ → resume (ưu tiên cao nhất, gần xong)
-      1 = không có gì → train từ đầu
-      0 = đã có chkpnt30000 hợp lệ hoặc PLY → skip ngay (xử lý cuối)
-    Descending sort → priority 2 được chạy trước (resume tận dụng GPU),
-                    priority 1 tiếp theo (train mới hoàn toàn),
-                    priority 0 cuối cùng (skip nhanh — để GPU rảnh xử lý 2 loại trên trước).
-    """
-    scene_name = os.path.basename(scene_path)
-    scene_out  = f"{OUTPUT_DIR}/{scene_name}"
-
-    final_ckpt = f"{scene_out}/chkpnt{ITERATIONS}.pth"
-    final_ply  = f"{scene_out}/point_cloud/iteration_{ITERATIONS}/point_cloud.ply"
-    if os.path.exists(final_ply) or is_valid_checkpoint(final_ckpt):
-        return 0   # skip nhanh
-
-    has_intermediate = False
-    for ckpt in glob.glob(f"{scene_out}/chkpnt*.pth"):
-        try:
-            it = int(os.path.basename(ckpt).replace("chkpnt", "").replace(".pth", ""))
-            if 0 < it < ITERATIONS:
-                has_intermediate = True
-                break
-        except:
-            pass
-
-    if INPUT_CHECKPOINT_DIR and not has_intermediate:
-        for ckpt in glob.glob(f"{INPUT_CHECKPOINT_DIR}/{scene_name}/chkpnt*.pth") + \
-                    glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name}.pth") + \
-                    glob.glob(f"{INPUT_CHECKPOINT_DIR}/chkpnt*_{scene_name.lower()}.pth"):
-            try:
-                name_part = os.path.basename(ckpt).split('_')[0]
-                it = int(name_part.replace("chkpnt", "").replace(".pth", ""))
-                if 0 < it < ITERATIONS:
-                    has_intermediate = True
-                    break
-            except:
-                pass
-
-    if has_intermediate:
-        return 2   # resume từ checkpoint trung gian
-
-    return 1   # train từ đầu
-
-
-print("=" * 60)
-print("Sorting scenes by priority...")
-all_scenes = sorted(all_scenes, key=get_scene_priority, reverse=True)
-
-print("=" * 60)
-print(f"Starting unified pipeline for {len(all_scenes)} scenes on 2x GPU T4...")
-print("=" * 60)
-
-SUBMISSION_DIR = "/kaggle/working/submission"
-os.makedirs(SUBMISSION_DIR, exist_ok=True)
-
-gpu_queue = queue.Queue()
-gpu_queue.put(0)
-gpu_queue.put(1)
-
-def render_scene(scene_path: str, gpu_id: int) -> tuple:
-    scene_name = os.path.basename(scene_path)
-    scene_out  = f"{OUTPUT_DIR}/{scene_name}"
-    log_file   = f"{OUTPUT_DIR}/{scene_name}_render.log"
-
-    # Tự động phát hiện iteration cao nhất
-    final_iter = get_final_iteration(scene_out)
-
-    # Kiểm tra point_cloud.ply tồn tại trước khi render
-    ply_path = f"{scene_out}/point_cloud/iteration_{final_iter}/point_cloud.ply"
-    if not os.path.exists(ply_path):
-        print(f"  ⚠️  [{scene_name}] Skipping render — point_cloud.ply not found: {ply_path}")
-        return scene_name, 1
-
-    cmd = (
-        f"CUDA_VISIBLE_DEVICES={gpu_id} python {REPO_DIR}/render.py "
-        f"-s {scene_path} "
-        f"-m {scene_out} "
-        f"--skip_train "
-        f"--iteration {final_iter} "
-        f"--sh_degree 3"
-    )
-
-    print(f"🎨 Rendering [{scene_name}] on GPU {gpu_id} ...")
-    with open(log_file, "w") as lf:
-        result = subprocess.run(cmd, shell=True, stdout=lf, stderr=subprocess.STDOUT, cwd=REPO_DIR)
-
-    status = "✅ DONE" if result.returncode == 0 else f"❌ FAILED (rc={result.returncode})"
-    print(f"  [{scene_name}] {status}")
-
-    if result.returncode != 0:
-        print(f"\n{'='*20} ERROR LOG FOR {scene_name} (Last 50 lines) {'='*20}")
-        try:
-            with open(log_file, "r") as f:
-                lines = f.readlines()
-                print("".join(lines[-50:]))
-        except Exception as e:
-            print(f"Could not read log: {e}")
-        print("=" * 60 + "\n")
-
-    return scene_name, result.returncode
-
-def process_scene_pipeline(scene_path):
-    gpu_id = gpu_queue.get()   # block cho đến khi có GPU rảnh
-    try:
-        scene_name = os.path.basename(scene_path)
-        scene_out  = f"{OUTPUT_DIR}/{scene_name}"
-        submission_dest = f"{SUBMISSION_DIR}/{scene_name}"
-
-        # 1. Skip if already submitted
-        if os.path.isdir(submission_dest) and len(
-                glob.glob(f"{submission_dest}/*.png") +
-                glob.glob(f"{submission_dest}/*.jpg") +
-                glob.glob(f"{submission_dest}/*.JPG")
-            ) > 0:
-            print(f"  ✅ [{scene_name}] Already rendered in submission/. Skip.")
-            return scene_name, 0
-
-        # 2. Train or extract ply
-        _, train_rc = train_scene(scene_path, gpu_id)
-
-        # 3. Render (chỉ render khi train thành công hoặc đã có PLY)
-        final_iter = get_final_iteration(scene_out)
-        ply_path = f"{scene_out}/point_cloud/iteration_{final_iter}/point_cloud.ply"
-        if not os.path.exists(ply_path):
-            print(f"  ⚠️  [{scene_name}] Không có PLY để render — bỏ qua.")
-            # BUG 5 FIX: KHÔNG xóa scene_out khi fail — giữ lại checkpoints để resume
-            print(f"  💾 [{scene_name}] Giữ nguyên output dir để resume lần sau.")
-            return scene_name, train_rc
-
-        render_scene(scene_path, gpu_id)
-
-        # 4. Move renders to submission
-        render_path = f"{scene_out}/test/ours_{final_iter}/renders"
-        if os.path.isdir(render_path):
-            os.makedirs(submission_dest, exist_ok=True)
-            imgs = []
-            for ext in ('*.png', '*.jpg', '*.jpeg', '*.JPG', '*.JPEG'):
-                imgs.extend(glob.glob(f"{render_path}/{ext}"))
-            imgs = sorted(imgs)
-            for img in imgs:
-                shutil.move(img, submission_dest)
-            
-            sample_names = [os.path.basename(p) for p in imgs[:3]]
-            print(f"  [{scene_name}] Copied {len(imgs)} images to submission/ (samples: {sample_names})")
-        else:
-            print(f"  ⚠️  [{scene_name}] No renders found at {render_path}")
-
-        # 5. BUG 5 FIX: Chỉ xóa scene_out khi render đã THÀNH CÔNG và ảnh đã copy xong
-        #    Nếu render fail hoặc không có ảnh, giữ lại output để debug / resume
-        submission_imgs = (
-            glob.glob(f"{submission_dest}/*.png") +
-            glob.glob(f"{submission_dest}/*.jpg") +
-            glob.glob(f"{submission_dest}/*.JPG")
-        )
-        if os.path.isdir(submission_dest) and len(submission_imgs) > 0:
-            try:
-                shutil.rmtree(scene_out)
-                print(f"  [{scene_name}] 🧹 Cleaned up output directory to free disk space.")
-            except Exception as e:
-                print(f"  [{scene_name}] ⚠️ Cleanup error: {e}")
-        else:
-            print(f"  [{scene_name}] ⚠️ Render chưa có ảnh — giữ nguyên output dir để resume.")
-
-        return scene_name, 0
-    finally:
-        gpu_queue.put(gpu_id)   # trả GPU về queue sau khi xong
-
-with ThreadPoolExecutor(max_workers=2) as executor:
-    futures = {
-        executor.submit(process_scene_pipeline, scene): scene
-        for scene in all_scenes
+def scene_train_config(scene_path):
+    n = count_images(scene_path)
+    cfg = {
+        "resolution": TRAIN_RESOLUTION,
+        "densify_grad_threshold": 0.00020,
+        "densify_until_iter": min(12000, ITERATIONS),
+        "checkpoint_iterations": sorted({7500, 15000, 25000, ITERATIONS}),
+        "max_gaussians": MAX_GAUSSIANS,
     }
+    if n <= 180:
+        cfg["densify_grad_threshold"] = 0.00016
+        cfg["densify_until_iter"] = min(15000, ITERATIONS)
+    elif n >= 280:
+        cfg["densify_grad_threshold"] = 0.00024
+        cfg["densify_until_iter"] = min(10000, ITERATIONS)
+    return cfg
+
+
+def build_train_cmd(scene_path, gpu_id):
+    out_dir = scene_output(scene_path)
+    cfg = scene_train_config(scene_path)
+    resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1)
+
+    cmd = [
+        sys.executable,
+        REPO_DIR / "train.py",
+        "-s",
+        scene_path,
+        "-m",
+        out_dir,
+        "-r",
+        str(cfg["resolution"]),
+        "--sh_degree",
+        "3",
+        "--data_device",
+        "cpu",
+        "--iterations",
+        str(ITERATIONS),
+        "--lambda_dssim",
+        "0.2",
+        "--position_lr_init",
+        "0.00016",
+        "--densification_interval",
+        "100",
+        "--densify_grad_threshold",
+        str(cfg["densify_grad_threshold"]),
+        "--densify_until_iter",
+        str(cfg["densify_until_iter"]),
+        "--opacity_reset_interval",
+        "3000",
+        "--depth_weight_init",
+        "0.02",
+        "--checkpoint_iterations",
+        *[str(x) for x in cfg["checkpoint_iterations"]],
+        "--save_iterations",
+        str(ITERATIONS),
+        "--disable_viewer",
+        "--quiet",
+        *optional_depth_args(scene_path),
+        *optional_mask_args(scene_path),
+    ]
+
+    if SUPPORTS_MAX_GAUSSIANS:
+        cmd.extend(["--max_gaussians", str(cfg["max_gaussians"])])
+
+    if resume:
+        cmd.extend(["--start_checkpoint", resume])
+    if USE_WANDB:
+        cmd.extend(["--use_wandb", "--wandb_project", WANDB_PROJECT])
+        if WANDB_ENTITY:
+            cmd.extend(["--wandb_entity", WANDB_ENTITY])
+
+    env = {"CUDA_VISIBLE_DEVICES": str(gpu_id)}
+    return cmd, env
+
+
+def build_render_cmd(scene_path, gpu_id, iteration):
+    out_dir = scene_output(scene_path)
+    return [
+        sys.executable,
+        REPO_DIR / "render.py",
+        "-s",
+        scene_path,
+        "-m",
+        out_dir,
+        "-r",
+        str(RENDER_RESOLUTION),
+        "--skip_train",
+        "--iteration",
+        str(iteration),
+        "--sh_degree",
+        "3",
+        "--quiet",
+    ], {"CUDA_VISIBLE_DEVICES": str(gpu_id)}
+
+
+def cleanup_intermediate(out_dir, keep_iter):
+    out_dir = Path(out_dir)
+    for event in out_dir.glob("events.out.tfevents*"):
+        event.unlink(missing_ok=True)
+
+    pc_dir = out_dir / "point_cloud"
+    if pc_dir.exists():
+        for p in pc_dir.glob("iteration_*"):
+            if p.name != f"iteration_{keep_iter}":
+                shutil.rmtree(p, ignore_errors=True)
+
+    for ckpt in out_dir.glob("chkpnt*.pth"):
+        if checkpoint_iter(ckpt) < keep_iter:
+            ckpt.unlink(missing_ok=True)
+
+
+def copy_renders_to_submission(scene_path, iteration):
+    scene_name = Path(scene_path).name
+    out_dir = scene_output(scene_path)
+    render_dir = out_dir / "test" / f"ours_{iteration}" / "renders"
+    dest = SUBMISSION_DIR / scene_name
+    if not render_dir.exists():
+        print(f"[{scene_name}] missing render dir: {render_dir}")
+        return 0
+
+    dest.mkdir(parents=True, exist_ok=True)
+    images = []
+    for ext in ["*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG"]:
+        images.extend(sorted(render_dir.glob(ext)))
+
+    for img in images:
+        shutil.copy2(img, dest / img.name)
+    print(f"[{scene_name}] copied {len(images)} renders to {dest}")
+    return len(images)
+
+
+def train_and_render_scene(scene_path, gpu_id):
+    scene_path = Path(scene_path)
+    scene_name = scene_path.name
+    out_dir = scene_output(scene_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if hours_remaining() < 0.25:
+        print(f"[{scene_name}] time budget exhausted, skipping.")
+        return scene_name, 2
+
+    final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
+    final_ckpt = out_dir / f"chkpnt{ITERATIONS}.pth"
+
+    if final_ply.exists() or is_valid_checkpoint(final_ckpt):
+        print(f"[{scene_name}] final model exists, skipping training.")
+    else:
+        cmd, env = build_train_cmd(scene_path, gpu_id)
+        log = OUTPUT_DIR / f"{scene_name}_train.log"
+        print(f"[{scene_name}] train on GPU {gpu_id} | images={count_images(scene_path)} | log={log}")
+        rc = run(cmd, cwd=REPO_DIR, env=env, log_file=log, check=False)
+        if rc != 0:
+            print(f"[{scene_name}] training failed rc={rc}")
+            print(tail(log, 80))
+            return scene_name, rc
+
+    it = final_iteration(out_dir)
+    if not ensure_ply_from_checkpoint(out_dir, it):
+        ply = out_dir / "point_cloud" / f"iteration_{it}" / "point_cloud.ply"
+        print(f"[{scene_name}] no PLY found after training: {ply}")
+        return scene_name, 3
+
+    cmd, env = build_render_cmd(scene_path, gpu_id, it)
+    log = OUTPUT_DIR / f"{scene_name}_render.log"
+    print(f"[{scene_name}] render iteration {it} on GPU {gpu_id} | log={log}")
+    rc = run(cmd, cwd=REPO_DIR, env=env, log_file=log, check=False)
+    if rc != 0:
+        print(f"[{scene_name}] render failed rc={rc}")
+        print(tail(log, 80))
+        return scene_name, rc
+
+    n = copy_renders_to_submission(scene_path, it)
+    if n > 0:
+        cleanup_intermediate(out_dir, it)
+        free_gb, total_gb = disk_free_gb()
+        print(f"[{scene_name}] done. Disk: {free_gb:.1f}/{total_gb:.1f} GB free")
+        return scene_name, 0
+
+    return scene_name, 4
+
+
+# =============================================================================
+# CELL 5 - Run two-GPU queue
+# =============================================================================
+
+def scene_priority(scene_path):
+    out_dir = scene_output(scene_path)
+    final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
+    if final_ply.exists() or is_valid_checkpoint(out_dir / f"chkpnt{ITERATIONS}.pth"):
+        return 0
+    if latest_checkpoint(out_dir, max_iter=ITERATIONS - 1):
+        return 2
+    return 1
+
+
+ALL_SCENES = sorted(ALL_SCENES, key=scene_priority, reverse=True)
+gpu_queue = queue.Queue()
+for gpu in GPU_IDS:
+    gpu_queue.put(gpu)
+
+
+def worker(scene):
+    gpu = gpu_queue.get()
+    try:
+        return train_and_render_scene(scene, gpu)
+    finally:
+        gpu_queue.put(gpu)
+
+
+print("=" * 80)
+print(f"Starting pipeline: {len(ALL_SCENES)} scenes, GPUs={GPU_IDS}, iterations={ITERATIONS}")
+print("=" * 80)
+
+results = []
+with ThreadPoolExecutor(max_workers=len(GPU_IDS)) as executor:
+    futures = {executor.submit(worker, scene): scene for scene in ALL_SCENES}
     for future in as_completed(futures):
-        scene_name, rc = future.result()
+        scene = futures[future]
+        try:
+            result = future.result()
+        except Exception as exc:
+            result = (Path(scene).name, 99)
+            print(f"[{Path(scene).name}] unhandled error: {exc}")
+        results.append(result)
+        print(f"Completed: {result}")
 
-print("\nAll pipelines completed!")
+print("Pipeline results:", results)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL 9 — Dong goi submission.zip (smart packer: <= 350 MB)
-# ─────────────────────────────────────────────────────────────────────────────
-import zipfile, io   # shutil da import o Cell 7
-from PIL import Image
+# =============================================================================
+# CELL 6 - Package submission.zip
+# =============================================================================
 
-SUBMISSION_ZIP = "/kaggle/working/submission.zip"
-ZIP_TARGET_MB  = 350
-ZIP_TARGET     = ZIP_TARGET_MB * 1024 * 1024
-
-print("=" * 60)
-print("Packaging submission.zip ...")
-print("=" * 60)
-
-os.makedirs(SUBMISSION_DIR, exist_ok=True)
-missing_scenes = []
-
-for scene_path in all_scenes:
-    scene_name  = os.path.basename(scene_path)
-    dest = f"{SUBMISSION_DIR}/{scene_name}"
-
-    if not os.path.isdir(dest) or len(glob.glob(f"{dest}/*.png") + glob.glob(f"{dest}/*.jpg") + glob.glob(f"{dest}/*.JPG")) == 0:
-        missing_scenes.append(scene_name)
-
-# -- Ham tien ich ---------------------------------------------------------------
-
-def _collect_images(src_dir):
+def collect_submission_images():
     pairs = []
-    for root, _, files in os.walk(src_dir):
-        for f in sorted(files):
-            if f.lower().endswith((".png", ".jpg", ".jpeg")):
-                full    = os.path.join(root, f)
-                arcname = os.path.relpath(full, src_dir)
+    for root, _, files in os.walk(SUBMISSION_DIR):
+        for name in sorted(files):
+            if name.lower().endswith((".png", ".jpg", ".jpeg")):
+                full = Path(root) / name
+                arcname = full.relative_to(SUBMISSION_DIR).as_posix()
                 pairs.append((full, arcname))
     return pairs
 
-def _pack_png_lossless(pairs, dst):
-    if os.path.exists(dst):
-        os.remove(dst)
-    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+
+def pack_lossless(pairs):
+    if SUBMISSION_ZIP.exists():
+        SUBMISSION_ZIP.unlink()
+    with zipfile.ZipFile(SUBMISSION_ZIP, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for full, arcname in pairs:
             zf.write(full, arcname)
-    return os.path.getsize(dst)
+    return SUBMISSION_ZIP.stat().st_size
 
-def _pack_jpeg(pairs, dst, quality):
-    """Chuyen PNG -> JPEG in-memory, giu extension .png de khop ten nop bai."""
-    n_ok = n_err = 0
-    if os.path.exists(dst):
-        os.remove(dst)
-    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+
+def pack_as_jpeg(pairs, quality):
+    from PIL import Image
+
+    if SUBMISSION_ZIP.exists():
+        SUBMISSION_ZIP.unlink()
+    with zipfile.ZipFile(SUBMISSION_ZIP, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for full, arcname in pairs:
             try:
                 img = Image.open(full).convert("RGB")
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=quality, optimize=True, subsampling=0)
-                buf.seek(0)
-                zf.writestr(arcname, buf.read())
-                n_ok += 1
-            except Exception as e:
+                zf.writestr(arcname, buf.getvalue())
+            except Exception:
                 zf.write(full, arcname)
-                n_err += 1
-                print(f"    WARNING {arcname}: {e}")
-    sz = os.path.getsize(dst)
-    print(f"  [JPEG q={quality}] OK={n_ok} ERR={n_err} -> {sz/1024/1024:.1f} MB")
-    return sz
+    return SUBMISSION_ZIP.stat().st_size
 
-# -- Smart packer ---------------------------------------------------------------
 
-pairs   = _collect_images(SUBMISSION_DIR)
-raw_mb  = sum(os.path.getsize(p) for p, _ in pairs) / 1024 / 1024
-print(f"\nTong {len(pairs)} anh ({raw_mb:.1f} MB raw). Target: <= {ZIP_TARGET_MB} MB\n")
+pairs = collect_submission_images()
+missing = []
+for scene in ALL_SCENES:
+    scene_dir = SUBMISSION_DIR / scene.name
+    if not scene_dir.exists() or not any(scene_dir.glob("*")):
+        missing.append(scene.name)
 
-# Buoc 1: Thu PNG lossless
-print("Buoc 1: PNG lossless (DEFLATE level=9)...")
-zip_size = _pack_png_lossless(pairs, SUBMISSION_ZIP)
-zip_mb   = zip_size / 1024 / 1024
-print(f"  PNG lossless -> {zip_mb:.1f} MB")
+print(f"Submission images: {len(pairs)}")
+if missing:
+    print(f"WARNING: missing rendered scenes: {missing}")
 
-if zip_size <= ZIP_TARGET:
-    print(f"OK {zip_mb:.1f} MB <= {ZIP_TARGET_MB} MB -> {SUBMISSION_ZIP}")
+if pairs:
+    target = 350 * 1024 * 1024
+    size = pack_lossless(pairs)
+    print(f"submission.zip lossless: {size / 1024 / 1024:.1f} MB")
+    if size > target:
+        for quality in [95, 92, 88, 85, 82, 80]:
+            size = pack_as_jpeg(pairs, quality)
+            print(f"submission.zip JPEG q={quality}: {size / 1024 / 1024:.1f} MB")
+            if size <= target:
+                break
+    print(f"Saved: {SUBMISSION_ZIP}")
 else:
-    print(f"Qua lon ({zip_mb:.1f} MB). Chuyen sang JPEG...\n")
-    for q in [92, 88, 85, 82, 80]:
-        print(f"Buoc 2: JPEG quality={q}...")
-        zip_size = _pack_jpeg(pairs, SUBMISSION_ZIP, quality=q)
-        zip_mb   = zip_size / 1024 / 1024
-        if zip_size <= ZIP_TARGET:
-            nen_pct = (1 - zip_size / (raw_mb * 1024 * 1024)) * 100
-            print(f"OK JPEG q={q}: {zip_mb:.1f} MB <= {ZIP_TARGET_MB} MB (nen {nen_pct:.0f}%)")
-            print(f"-> {SUBMISSION_ZIP}")
-            break
-    else:
-        print(f"FAILED: van {zip_mb:.1f} MB > {ZIP_TARGET_MB} MB o JPEG q=80. Giu file nho nhat.")
-
-if missing_scenes:
-    print(f"\nMissing renders: {missing_scenes}")
+    print("No images found; submission.zip was not created.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CELL 10 (tuỳ chọn) — Xem preview một số ảnh render
-# ─────────────────────────────────────────────────────────────────────────────
-import matplotlib.pyplot as plt
-from PIL import Image
+# =============================================================================
+# CELL 7 - Optional preview
+# =============================================================================
 
-def preview_scene(scene_name: str, n: int = 3):
-    render_path = f"{SUBMISSION_DIR}/{scene_name}"
-    imgs = sorted(glob.glob(f"{render_path}/*.png"))[:n]
+def preview_scene(scene_name=None, n=3):
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    if scene_name is None:
+        scene_dirs = sorted([p for p in SUBMISSION_DIR.iterdir() if p.is_dir()])
+        if not scene_dirs:
+            print("No submission scene folders to preview.")
+            return
+        scene_name = scene_dirs[0].name
+
+    imgs = []
+    for ext in ["*.png", "*.jpg", "*.jpeg"]:
+        imgs.extend(sorted((SUBMISSION_DIR / scene_name).glob(ext)))
+    imgs = imgs[:n]
     if not imgs:
-        print(f"No renders found for {scene_name} in submission/")
+        print(f"No images for {scene_name}")
         return
+
     fig, axes = plt.subplots(1, len(imgs), figsize=(6 * len(imgs), 5))
-    if len(imgs) == 1: axes = [axes]
+    if len(imgs) == 1:
+        axes = [axes]
     for ax, img_path in zip(axes, imgs):
         ax.imshow(Image.open(img_path))
-        ax.set_title(os.path.basename(img_path))
+        ax.set_title(img_path.name)
         ax.axis("off")
-    plt.suptitle(f"Scene: {scene_name}", fontsize=14, fontweight="bold")
     plt.tight_layout()
     plt.show()
 
-# Preview scene đầu tiên
-if all_scenes:
-    preview_scene(os.path.basename(all_scenes[0]))
+
+print("Notebook pipeline finished.")

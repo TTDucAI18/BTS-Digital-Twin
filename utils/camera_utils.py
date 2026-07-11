@@ -25,10 +25,14 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
 
     if cam_info.depth_path != "":
         try:
-            if is_nerf_synthetic:
-                invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / 512
+            depth_img = cv2.imread(cam_info.depth_path, -1)
+            if depth_img is None:
+                print(f"Warning: Depth file {cam_info.depth_path} not found or unreadable. Skipping depth for {cam_info.image_name}.")
+                invdepthmap = None
+            elif is_nerf_synthetic:
+                invdepthmap = depth_img.astype(np.float32) / 512
             else:
-                invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / float(2**16)
+                invdepthmap = depth_img.astype(np.float32) / float(2**16)
 
         except FileNotFoundError:
             print(f"Error: The depth file at path '{cam_info.depth_path}' was not found.")
@@ -41,6 +45,12 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
             raise
     else:
         invdepthmap = None
+
+    foreground_mask = None
+    if getattr(cam_info, "mask_path", "") != "":
+        foreground_mask = cv2.imread(cam_info.mask_path, cv2.IMREAD_UNCHANGED)
+        if foreground_mask is None:
+            print(f"Warning: Mask file {cam_info.mask_path} not found or unreadable. Ignoring mask for {cam_info.image_name}.")
         
     orig_w, orig_h = image.size
     if args.resolution in [1, 2, 4, 8]:
@@ -66,7 +76,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
     return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
                   image=image, invdepthmap=invdepthmap,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, foreground_mask=foreground_mask, data_device=args.data_device)
                   # TASK 1: train_test_exp / is_test_dataset / is_test_view removed from Camera()
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):

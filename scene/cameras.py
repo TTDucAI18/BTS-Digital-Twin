@@ -18,7 +18,7 @@ import cv2
 
 class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
-                 image_name, uid,
+                 image_name, uid, foreground_mask=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
                  ):
         # NOTE: train_test_exp / is_test_dataset / is_test_view removed.
@@ -51,11 +51,20 @@ class Camera(nn.Module):
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
+        self.foreground_mask = None
+        if foreground_mask is not None:
+            foreground_mask = cv2.resize(foreground_mask, resolution, interpolation=cv2.INTER_NEAREST)
+            if foreground_mask.ndim != 2:
+                foreground_mask = foreground_mask[..., 0]
+            foreground_mask = foreground_mask.astype(np.float32)
+            if foreground_mask.max() > 1.0:
+                foreground_mask /= 255.0
+            foreground_mask = np.clip(foreground_mask, 0.0, 1.0)
+            self.foreground_mask = torch.from_numpy(foreground_mask[None]).to(self.data_device)
 
         self.invdepthmap = None
         self.depth_reliable = False
         if invdepthmap is not None:
-            self.depth_mask = torch.ones_like(self.alpha_mask)
             self.invdepthmap = cv2.resize(invdepthmap, resolution)
             self.invdepthmap[self.invdepthmap < 0] = 0
             self.depth_reliable = True
@@ -70,6 +79,27 @@ class Camera(nn.Module):
 
             if self.invdepthmap.ndim != 2:
                 self.invdepthmap = self.invdepthmap[..., 0]
+
+            depth_mask_np = np.isfinite(self.invdepthmap) & (self.invdepthmap > 1e-6)
+            valid_depth = self.invdepthmap[depth_mask_np]
+            if valid_depth.size > 32:
+                lo, hi = np.percentile(valid_depth, [1.0, 99.0])
+                depth_mask_np &= (self.invdepthmap >= lo) & (self.invdepthmap <= hi)
+                grad_x = cv2.Sobel(self.invdepthmap.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+                grad_y = cv2.Sobel(self.invdepthmap.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+                grad_mag = np.sqrt(grad_x * grad_x + grad_y * grad_y)
+                valid_grad = grad_mag[depth_mask_np]
+                if valid_grad.size > 32:
+                    edge_hi = np.percentile(valid_grad, 95.0)
+                    depth_mask_np &= grad_mag <= edge_hi
+            else:
+                depth_mask_np[:] = False
+
+            if depth_mask_np.mean() < 0.05:
+                self.depth_reliable = False
+                depth_mask_np[:] = False
+
+            self.depth_mask = torch.from_numpy(depth_mask_np.astype(np.float32)[None]).to(self.data_device)
             self.invdepthmap = torch.from_numpy(self.invdepthmap[None]).to(self.data_device)
 
         self.zfar = 100.0
@@ -95,4 +125,3 @@ class MiniCam:
         self.full_proj_transform = full_proj_transform
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
-

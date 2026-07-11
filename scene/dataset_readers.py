@@ -44,6 +44,7 @@ class CameraInfo(NamedTuple):
     image_path: str
     image_name: str
     depth_path: str
+    mask_path: str
     width: int
     height: int
     is_test: bool
@@ -79,8 +80,19 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
+def find_optional_image(folder, stem, original_name):
+    if folder == "":
+        return ""
+
+    for name in [original_name, f"{stem}.png", f"{stem}.jpg", f"{stem}.jpeg"]:
+        candidate = get_actual_path(os.path.join(folder, name))
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, masks_folder, test_cam_names_list):
     cam_infos = []
+    missing_images = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -127,17 +139,23 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         image_path = get_actual_path(os.path.join(images_folder, extr.name))
         if not os.path.exists(image_path):
-            print(f"Warning: Image {extr.name} not found in {images_folder}. Skipping camera.")
+            missing_images.append(extr.name)
             continue
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
+        mask_path = find_optional_image(masks_folder, extr.name[:-n_remove], extr.name)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
-                              image_path=image_path, image_name=image_name, depth_path=depth_path,
+                              image_path=image_path, image_name=image_name, depth_path=depth_path, mask_path=mask_path,
                               width=width, height=height, is_test=image_name in test_cam_names_list)
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
+    if missing_images:
+        preview = ", ".join(missing_images[:8])
+        suffix = "..." if len(missing_images) > 8 else ""
+        print(f"[WARN] Skipped {len(missing_images)} COLMAP cameras with no matching image in {images_folder}: {preview}{suffix}")
+    print(f"[INFO] Matched {len(cam_infos)}/{len(cam_extrinsics)} COLMAP cameras to image files.")
     return cam_infos
 
 def fetchPly(path):
@@ -195,12 +213,12 @@ def readKaggleTestCameras(test_poses_file):
             FovX = focal2fov(fx, width)
             
             cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=None,
-                                  image_path="", image_name=image_name, depth_path="",
+                                  image_path="", image_name=image_name, depth_path="", mask_path="",
                                   width=width, height=height, is_test=True)
             cam_infos.append(cam_info)
     return cam_infos
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def readColmapSceneInfo(path, images, depths, eval, train_test_exp, masks="", llffhold=8):
     # Auto-detect BTS/Kaggle nested structure: scene_root/train/{images,sparse}
     # vs standard 3DGS structure: source_path/{images,sparse}
     if os.path.exists(os.path.join(path, "train", "sparse")):
@@ -262,7 +280,9 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(train_root, reading_dir), 
-        depths_folder=os.path.join(train_root, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
+        depths_folder=os.path.join(train_root, depths) if depths != "" else "",
+        masks_folder=os.path.join(train_root, masks) if masks != "" else "",
+        test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
@@ -346,7 +366,7 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
                             image_path=image_path, image_name=image_name,
-                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
+                            width=image.size[0], height=image.size[1], depth_path=depth_path, mask_path="", depth_params=None, is_test=is_test))
             
     return cam_infos
 

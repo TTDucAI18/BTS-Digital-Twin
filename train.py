@@ -172,7 +172,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image_adj, gt_image)
+        if opt.foreground_loss_weight > 0.0 and viewpoint_cam.foreground_mask is not None:
+            fg_mask = viewpoint_cam.foreground_mask.cuda()
+            pixel_l1 = torch.abs(image_adj - gt_image).mean(dim=0, keepdim=True)
+            pixel_weight = 1.0 + opt.foreground_loss_weight * fg_mask
+            Ll1 = (pixel_l1 * pixel_weight).sum() / (pixel_weight.sum() + 1e-6)
+        else:
+            Ll1 = l1_loss(image_adj, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image_adj.unsqueeze(0), gt_image.unsqueeze(0))
         else:
@@ -183,7 +189,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # ── KHẮC PHỤC LỖI TOÁN HỌC: Depth Regularization (Chống Exploding Gradients) ────
         Ll1depth_pure = 0.0
         current_depth_weight = get_depth_weight(iteration, base_weight=opt.depth_weight_init)
-        if opt.depth_weight_init > 0.0 and current_depth_weight > 0.0 and viewpoint_cam.invdepthmap is not None:
+        if opt.depth_weight_init > 0.0 and current_depth_weight > 0.0 and viewpoint_cam.invdepthmap is not None and viewpoint_cam.depth_reliable:
             rendered_linear_depth = render_pkg["depth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
@@ -271,10 +277,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    if gaussians.get_xyz.shape[0] < 15_000_000:
+                    if opt.max_gaussians <= 0 or gaussians.get_xyz.shape[0] < opt.max_gaussians:
                         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                     else:
-                        print(f"\n[ITER {iteration}] WARNING: Max Gaussians reached ({gaussians.get_xyz.shape[0]}). Skipping densification to prevent OOM.")
+                        print(f"\n[ITER {iteration}] WARNING: Max Gaussians reached ({gaussians.get_xyz.shape[0]}/{opt.max_gaussians}). Skipping densification to prevent OOM.")
                         # Still prune to remove transparent ones
                         prune_mask = (gaussians.get_opacity < 0.005).squeeze()
                         if size_threshold:

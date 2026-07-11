@@ -54,6 +54,7 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._images = "images"
         self._depths = ""
+        self._masks = ""
         self._resolution = -1
         self._white_background = False
         # train_test_exp removed: BTS drone data captured in uniform lighting,
@@ -94,6 +95,8 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.00015
+        self.max_gaussians = 0
+        self.foreground_loss_weight = 0.0
         # Hybrid Depth Scheduler (TASK 2): base weight for DA-v2 depth regularization.
         # Phase 1 (0-5k iters): full strength to anchor Gaussians on BTS tower.
         # Phase 2 (5k-25k iters): linear decay to 0, freeing 3DGS to recover cable geometry.

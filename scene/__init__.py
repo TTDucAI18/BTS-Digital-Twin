@@ -90,7 +90,11 @@ class Scene:
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        os.makedirs(point_cloud_path, exist_ok=True)
+        final_path = os.path.join(point_cloud_path, "point_cloud.ply")
+        temporary_path = final_path + ".tmp"
+        self.gaussians.save_ply(temporary_path)
+        os.replace(temporary_path, final_path)
         # TASK 1: exposure.json saving removed — no exposure tensors exist.
 
     def getTrainCameras(self, scale=1.0):

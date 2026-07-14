@@ -12,6 +12,8 @@
 import os
 import glob as _glob
 import shutil
+import tempfile
+import zipfile
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -46,6 +48,46 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+
+
+def checkpoint_is_complete(path):
+    """Validate a checkpoint archive before it replaces an older checkpoint."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < 1024:
+            return False
+        with zipfile.ZipFile(path, "r") as archive:
+            return archive.testzip() is None
+    except Exception:
+        return False
+
+
+def save_checkpoint_atomically(model_path, gaussians, iteration):
+    """Write, CRC-validate, then atomically publish a checkpoint."""
+    final_path = os.path.join(model_path, f"chkpnt{iteration}.pth")
+    fd, temporary_path = tempfile.mkstemp(prefix=f".chkpnt{iteration}.", suffix=".tmp", dir=model_path)
+    os.close(fd)
+    try:
+        torch.save((gaussians.capture(), iteration), temporary_path)
+        if not checkpoint_is_complete(temporary_path):
+            raise RuntimeError(f"Checkpoint validation failed: {temporary_path}")
+        os.replace(temporary_path, final_path)
+        return final_path
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def remove_superseded_checkpoints(model_path, keep_path):
+    if not checkpoint_is_complete(keep_path):
+        raise RuntimeError(f"Refusing to remove older checkpoints; invalid replacement: {keep_path}")
+    for old_ckpt in _glob.glob(os.path.join(model_path, "chkpnt*.pth")):
+        if os.path.abspath(old_ckpt) == os.path.abspath(keep_path):
+            continue
+        try:
+            os.remove(old_ckpt)
+            print("Deleted old checkpoint: {}".format(os.path.basename(old_ckpt)))
+        except OSError as exc:
+            print("Could not delete {}: {}".format(os.path.basename(old_ckpt), exc))
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
 
@@ -227,35 +269,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Epoch": epoch})
                 progress_bar.update(10)
 
-            if iteration % 2000 == 0:
+            if WANDB_FOUND and wandb.run is not None and iteration % args.wandb_log_interval == 0:
+                wandb.log({
+                    "iteration": iteration,
+                    "train/loss": loss.item(),
+                    "train/l1_loss": Ll1.item(),
+                    "train/ssim": ssim_value.item(),
+                    "train/depth_loss": Ll1depth,
+                    "train/depth_loss_raw": Ll1depth_pure.item() if hasattr(Ll1depth_pure, "item") else float(Ll1depth_pure),
+                    "train/depth_weight": current_depth_weight,
+                    "train/epoch": epoch,
+                    "scene/total_points": gaussians.get_xyz.shape[0],
+                }, step=iteration)
+
+            if iteration % args.disk_check_interval == 0:
                 free_space_gb = shutil.disk_usage(scene.model_path).free / (1024**3)
-                if free_space_gb < 3.5:
-                    print(f"\n[ITER {iteration}] WARNING: Disk space low ({free_space_gb:.2f} GB left). Stopping training early.")
-                    torch.cuda.empty_cache()  # Prevent OOM before emergency save
-                    scene.save(iteration)
-                    new_ckpt_path = scene.model_path + "/chkpnt" + str(iteration) + ".pth"
-                    torch.save((gaussians.capture(), iteration), new_ckpt_path)
-                    
-                    def _ckpt_iter(p):
-                        try:
-                            return int(os.path.basename(p).replace("chkpnt", "").replace(".pth", ""))
-                        except:
-                            return 0
-                    all_ckpts = sorted(_glob.glob(os.path.join(scene.model_path, "chkpnt*.pth")), key=_ckpt_iter)
-                    for old_ckpt in all_ckpts:
-                        if old_ckpt != new_ckpt_path:
-                            try:
-                                os.remove(old_ckpt)
-                            except Exception:
-                                pass
+                if free_space_gb < args.min_free_disk_gb:
+                    print(f"\n[ITER {iteration}] Disk free {free_space_gb:.2f} GB < {args.min_free_disk_gb:.2f} GB. Stopping early; the last verified checkpoint is retained.")
                     break
-                if WANDB_FOUND and wandb.run is not None:
-                    wandb.log({
-                        "train/loss": loss.item(),
-                        "train/l1_loss": Ll1.item(),
-                        "train/ssim": ssim_value.item(),
-                        "train/epoch": epoch
-                    }, step=iteration)
             if iteration == opt.iterations:
                 progress_bar.close()
 
@@ -308,9 +339,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
-                new_ckpt_path = scene.model_path + "/chkpnt" + str(iteration) + ".pth"
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), new_ckpt_path)
+                try:
+                    new_ckpt_path = save_checkpoint_atomically(scene.model_path, gaussians, iteration)
+                except Exception as exc:
+                    print("[ITER {}] Checkpoint save failed: {}. Previous checkpoint is preserved.".format(iteration, exc))
+                    raise
                 # Disk cleanup: xóa tất cả checkpoint cũ hơn, chỉ giữ 1 checkpoint mới nhất
                 # Giúp tiết kiệm disk trong giới hạn 20GB của Kaggle
                 def _ckpt_iter(p):
@@ -328,6 +362,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             print("[ITER {}] Could not delete {}: {}".format(iteration, os.path.basename(old_ckpt), e))
 
 def prepare_output_and_logger(args):    
+    if args.use_wandb and not WANDB_FOUND:
+        sys.exit("WandB logging requested but package 'wandb' is not installed.")
+
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -350,6 +387,9 @@ def prepare_output_and_logger(args):
         
     if args.use_wandb:
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=os.path.basename(args.model_path), config=vars(args))
+        wandb.define_metric("train/*", step_metric="iteration")
+        wandb.define_metric("scene/*", step_metric="iteration")
+        wandb.log({"run/started": 1, "iteration": 0}, step=0)
         
     return tb_writer
 
@@ -401,6 +441,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
                 if WANDB_FOUND and wandb.run is not None:
                     wandb.log({
+                        "iteration": iteration,
                         f"{config['name']}/l1_loss": l1_test,
                         f"{config['name']}/psnr": psnr_test
                     }, step=iteration)
@@ -429,6 +470,9 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
     parser.add_argument("--wandb_project", type=str, default="bts-digital-twin")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (username or team)")
+    parser.add_argument("--wandb_log_interval", type=int, default=100, help="Log scalar metrics to wandb every N iterations")
+    parser.add_argument("--min_free_disk_gb", type=float, default=2.0, help="Stop training when free disk drops below this value")
+    parser.add_argument("--disk_check_interval", type=int, default=100, help="Check free disk every N iterations")
     args = parser.parse_args(sys.argv[1:])
     if args.iterations not in args.save_iterations:
         args.save_iterations.append(args.iterations)
@@ -443,6 +487,9 @@ if __name__ == "__main__":
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
+
+    if WANDB_FOUND and wandb.run is not None:
+        wandb.finish()
 
     # All done
     print("\nTraining complete.")

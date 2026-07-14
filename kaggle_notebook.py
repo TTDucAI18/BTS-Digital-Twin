@@ -45,9 +45,13 @@ DATA_ROOT_CANDIDATES = [
 ITERATIONS = int(os.environ.get("BTS_ITERATIONS", "30000"))
 TRAIN_RESOLUTION = int(os.environ.get("BTS_TRAIN_RESOLUTION", "2"))
 RENDER_RESOLUTION = int(os.environ.get("BTS_RENDER_RESOLUTION", "1"))
-MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "2500000"))
+MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "3000000"))
 MAX_WORKERS = int(os.environ.get("BTS_MAX_WORKERS", "2"))
 KAGGLE_TIME_LIMIT_H = float(os.environ.get("BTS_TIME_LIMIT_H", "11.0"))
+# Below this threshold, training exits cleanly and preserves the last verified checkpoint.
+MIN_FREE_DISK_GB = float(os.environ.get("BTS_MIN_FREE_DISK_GB", "2.0"))
+DISK_CHECK_INTERVAL = int(os.environ.get("BTS_DISK_CHECK_INTERVAL", "100"))
+WANDB_LOG_INTERVAL = int(os.environ.get("BTS_WANDB_LOG_INTERVAL", "100"))
 PRIVATE_SET1_SCENES = [
     "HCM0249",
     "HCM0254",
@@ -390,7 +394,28 @@ def is_valid_checkpoint(path):
         return False
     try:
         with zipfile.ZipFile(path, "r") as zf:
-            return zf.testzip() is None
+            if zf.testzip() is not None:
+                return False
+        import torch
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        return (
+            isinstance(payload, tuple)
+            and len(payload) == 2
+            and isinstance(payload[1], int)
+            and payload[1] == checkpoint_iter(path)
+        )
+    except Exception:
+        return False
+
+
+def is_valid_ply(path):
+    path = Path(path)
+    if not path.exists() or path.stat().st_size < 1024:
+        return False
+    try:
+        from plyfile import PlyData
+
+        return len(PlyData.read(path).elements) > 0
     except Exception:
         return False
 
@@ -406,13 +431,30 @@ def latest_checkpoint(out_dir, max_iter=None):
     return None
 
 
+def latest_input_checkpoint(scene_path, max_iter=None):
+    """Find the newest verified checkpoint shipped with the Kaggle dataset."""
+    scene_name = Path(scene_path).name
+    candidates = []
+    for root in (DATA_ROOT, DATA_ROOT / "private_set1", DATA_ROOT / "checkpoints", DATA_ROOT / "output"):
+        if root.exists():
+            candidates.extend(root.glob(f"**/{scene_name}/chkpnt*.pth"))
+    for ckpt in sorted(set(candidates), key=checkpoint_iter, reverse=True):
+        iteration = checkpoint_iter(ckpt)
+        if max_iter is not None and iteration > max_iter:
+            continue
+        if is_valid_checkpoint(ckpt):
+            print(f"[{scene_name}] verified input checkpoint: {ckpt} (iter {iteration})")
+            return ckpt
+    return None
+
+
 def final_iteration(out_dir):
     pc_dir = Path(out_dir) / "point_cloud"
     iters = []
     if pc_dir.exists():
         for p in pc_dir.glob("iteration_*"):
             try:
-                if (p / "point_cloud.ply").exists():
+                if is_valid_ply(p / "point_cloud.ply"):
                     iters.append(int(p.name.replace("iteration_", "")))
             except ValueError:
                 pass
@@ -425,7 +467,7 @@ def final_iteration(out_dir):
 def ensure_ply_from_checkpoint(out_dir, iteration):
     out_dir = Path(out_dir)
     ply = out_dir / "point_cloud" / f"iteration_{iteration}" / "point_cloud.ply"
-    if ply.exists():
+    if is_valid_ply(ply):
         return True
 
     ckpt = out_dir / f"chkpnt{iteration}.pth"
@@ -491,6 +533,8 @@ def build_train_cmd(scene_path, gpu_id):
     out_dir = scene_output(scene_path)
     cfg = scene_train_config(scene_path)
     resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1)
+    if resume is None:
+        resume = latest_input_checkpoint(scene_path, max_iter=ITERATIONS - 1)
 
     cmd = [
         sys.executable,
@@ -519,6 +563,10 @@ def build_train_cmd(scene_path, gpu_id):
         str(cfg["densify_until_iter"]),
         "--opacity_reset_interval",
         "3000",
+        "--min_free_disk_gb",
+        str(MIN_FREE_DISK_GB),
+        "--disk_check_interval",
+        str(DISK_CHECK_INTERVAL),
         "--depth_weight_init",
         "0.02",
         "--checkpoint_iterations",
@@ -540,6 +588,7 @@ def build_train_cmd(scene_path, gpu_id):
         cmd.extend(["--use_wandb", "--wandb_project", WANDB_PROJECT])
         if WANDB_ENTITY:
             cmd.extend(["--wandb_entity", WANDB_ENTITY])
+        cmd.extend(["--wandb_log_interval", str(WANDB_LOG_INTERVAL)])
 
     env = {
         "CUDA_VISIBLE_DEVICES": str(gpu_id),
@@ -586,6 +635,12 @@ def cleanup_intermediate(out_dir, keep_iter):
             ckpt.unlink(missing_ok=True)
 
 
+def cleanup_scene_output_after_submission(out_dir):
+    out_dir = Path(out_dir)
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
 def copy_renders_to_submission(scene_path, iteration):
     scene_name = Path(scene_path).name
     out_dir = scene_output(scene_path)
@@ -606,20 +661,40 @@ def copy_renders_to_submission(scene_path, iteration):
     return len(images)
 
 
+def submission_image_count(scene_name):
+    dest = SUBMISSION_DIR / scene_name
+    if not dest.exists():
+        return 0
+    total = 0
+    for ext in ["*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG"]:
+        total += len(list(dest.glob(ext)))
+    return total
+
+
 def train_and_render_scene(scene_path, gpu_id):
     scene_path = Path(scene_path)
     scene_name = scene_path.name
     out_dir = scene_output(scene_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    existing_submission_images = submission_image_count(scene_name)
+    if existing_submission_images > 0:
+        print(f"[{scene_name}] submission already has {existing_submission_images} images, skipping train/render.")
+        return scene_name, 0
+
     if hours_remaining() < 0.25:
         print(f"[{scene_name}] time budget exhausted, skipping.")
         return scene_name, 2
 
+    free_gb, total_gb = disk_free_gb()
+    if free_gb < MIN_FREE_DISK_GB:
+        print(f"[{scene_name}] disk free {free_gb:.1f}GB < {MIN_FREE_DISK_GB:.1f}GB, skipping new training to preserve verified checkpoints.")
+        return scene_name, 5
+
     final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
     final_ckpt = out_dir / f"chkpnt{ITERATIONS}.pth"
 
-    if final_ply.exists() or is_valid_checkpoint(final_ckpt):
+    if is_valid_ply(final_ply) or is_valid_checkpoint(final_ckpt):
         print(f"[{scene_name}] final model exists, skipping training.")
     else:
         cmd, env = build_train_cmd(scene_path, gpu_id)
@@ -632,6 +707,10 @@ def train_and_render_scene(scene_path, gpu_id):
             return scene_name, rc
 
     it = final_iteration(out_dir)
+    if it < ITERATIONS:
+        print(f"[{scene_name}] training stopped at iter {it}; expected {ITERATIONS}. Rendering is deferred until a verified final checkpoint/PLY exists.")
+        return scene_name, 6
+
     if not ensure_ply_from_checkpoint(out_dir, it):
         ply = out_dir / "point_cloud" / f"iteration_{it}" / "point_cloud.ply"
         print(f"[{scene_name}] no PLY found after training: {ply}")
@@ -649,6 +728,7 @@ def train_and_render_scene(scene_path, gpu_id):
     n = copy_renders_to_submission(scene_path, it)
     if n > 0:
         cleanup_intermediate(out_dir, it)
+        cleanup_scene_output_after_submission(out_dir)
         free_gb, total_gb = disk_free_gb()
         print(f"[{scene_name}] done. Disk: {free_gb:.1f}/{total_gb:.1f} GB free")
         return scene_name, 0
@@ -663,7 +743,7 @@ def train_and_render_scene(scene_path, gpu_id):
 def scene_priority(scene_path):
     out_dir = scene_output(scene_path)
     final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
-    if final_ply.exists() or is_valid_checkpoint(out_dir / f"chkpnt{ITERATIONS}.pth"):
+    if is_valid_ply(final_ply) or is_valid_checkpoint(out_dir / f"chkpnt{ITERATIONS}.pth"):
         return 0
     if latest_checkpoint(out_dir, max_iter=ITERATIONS - 1):
         return 2

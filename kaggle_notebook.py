@@ -43,9 +43,12 @@ DATA_ROOT_CANDIDATES = [
 ]
 
 ITERATIONS = int(os.environ.get("BTS_ITERATIONS", "30000"))
-TRAIN_RESOLUTION = int(os.environ.get("BTS_TRAIN_RESOLUTION", "2"))
+# Use full resolution for thin BTS and cable details; set it to 2 only for a constrained rerun.
+TRAIN_RESOLUTION = int(os.environ.get("BTS_TRAIN_RESOLUTION", "1"))
 RENDER_RESOLUTION = int(os.environ.get("BTS_RENDER_RESOLUTION", "1"))
-MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "3000000"))
+# Upper bound only, never a target.  Override it without editing the notebook.
+MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "5000000"))
+FOREGROUND_LOSS_WEIGHT = float(os.environ.get("BTS_FOREGROUND_LOSS_WEIGHT", "6.0"))
 MAX_WORKERS = int(os.environ.get("BTS_MAX_WORKERS", "2"))
 KAGGLE_TIME_LIMIT_H = float(os.environ.get("BTS_TIME_LIMIT_H", "11.0"))
 # Below this threshold, training exits cleanly and preserves the last verified checkpoint.
@@ -342,8 +345,10 @@ def optional_mask_args(scene_path):
         if (root / name).is_dir():
             args = ["--masks", name]
             if SUPPORTS_FOREGROUND_WEIGHT:
-                args.extend(["--foreground_loss_weight", "4.0"])
+                args.extend(["--foreground_loss_weight", str(FOREGROUND_LOSS_WEIGHT)])
+            print(f"[{Path(scene_path).name}] BTS masks: {root / name} (weight={FOREGROUND_LOSS_WEIGHT})")
             return args
+    print(f"[{Path(scene_path).name}] WARNING: no BTS foreground masks found; densification cannot preferentially focus on the BTS.")
     return []
 
 
@@ -474,7 +479,7 @@ def ensure_ply_from_checkpoint(out_dir, iteration):
     if not is_valid_checkpoint(ckpt):
         return False
 
-    helper = Path("/kaggle/working/extract_checkpoint_ply.py")
+    helper = OUTPUT_DIR / "extract_checkpoint_ply.py"
     helper.write_text(
         f"""
 import argparse
@@ -518,6 +523,7 @@ def scene_train_config(scene_path):
         "densify_until_iter": min(12000, ITERATIONS),
         "checkpoint_iterations": sorted({7500, 15000, 25000, ITERATIONS}),
         "max_gaussians": MAX_GAUSSIANS,
+        "position_lr_init": float(os.environ.get("BTS_POSITION_LR_INIT", "0.00016")),
     }
     if n <= 180:
         cfg["densify_grad_threshold"] = 0.00016
@@ -554,7 +560,7 @@ def build_train_cmd(scene_path, gpu_id):
         "--lambda_dssim",
         "0.2",
         "--position_lr_init",
-        "0.00016",
+        str(cfg["position_lr_init"]),
         "--densification_interval",
         "100",
         "--densify_grad_threshold",
@@ -569,6 +575,8 @@ def build_train_cmd(scene_path, gpu_id):
         str(DISK_CHECK_INTERVAL),
         "--depth_weight_init",
         "0.02",
+        "--test_iterations",
+        "-1",
         "--checkpoint_iterations",
         *[str(x) for x in cfg["checkpoint_iterations"]],
         "--save_iterations",
@@ -651,6 +659,10 @@ def copy_renders_to_submission(scene_path, iteration):
         return 0
 
     dest.mkdir(parents=True, exist_ok=True)
+    # A rerun must replace partial/stale renders rather than append to them.
+    for ext in ["*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG"]:
+        for old_image in dest.glob(ext):
+            old_image.unlink(missing_ok=True)
     images = []
     for ext in ["*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG"]:
         images.extend(sorted(render_dir.glob(ext)))
@@ -671,16 +683,42 @@ def submission_image_count(scene_name):
     return total
 
 
+def expected_submission_names(scene_path):
+    """Return exactly the valid image names requested by test_poses.csv."""
+    poses = Path(scene_path) / "test" / "test_poses.csv"
+    if not poses.exists():
+        return set()
+    names = set()
+    for line in poses.read_text(encoding="utf-8", errors="replace").splitlines()[1:]:
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) >= 14 and fields[0]:
+            names.add(fields[0])
+    return names
+
+
+def submission_names(scene_name):
+    dest = SUBMISSION_DIR / scene_name
+    if not dest.exists():
+        return set()
+    return {
+        p.name for p in dest.iterdir()
+        if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+    }
+
+
 def train_and_render_scene(scene_path, gpu_id):
     scene_path = Path(scene_path)
     scene_name = scene_path.name
     out_dir = scene_output(scene_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    existing_submission_images = submission_image_count(scene_name)
-    if existing_submission_images > 0:
-        print(f"[{scene_name}] submission already has {existing_submission_images} images, skipping train/render.")
+    expected_names = expected_submission_names(scene_path)
+    existing_names = submission_names(scene_name)
+    if expected_names and existing_names == expected_names:
+        print(f"[{scene_name}] submission already has all {len(existing_names)} expected images, skipping train/render.")
         return scene_name, 0
+    if existing_names:
+        print(f"[{scene_name}] incomplete/stale submission ({len(existing_names)}/{len(expected_names)}); rerendering.")
 
     if hours_remaining() < 0.25:
         print(f"[{scene_name}] time budget exhausted, skipping.")
@@ -827,14 +865,24 @@ def pack_as_jpeg(pairs, quality):
 
 pairs = collect_submission_images()
 missing = []
+invalid_submission = []
 for scene in ALL_SCENES:
     scene_dir = SUBMISSION_DIR / scene.name
-    if not scene_dir.exists() or not any(scene_dir.glob("*")):
+    expected_names = expected_submission_names(scene)
+    actual_names = submission_names(scene.name)
+    if not scene_dir.exists() or not actual_names:
         missing.append(scene.name)
+    elif expected_names and actual_names != expected_names:
+        invalid_submission.append(
+            f"{scene.name}: expected {len(expected_names)}, got {len(actual_names)} "
+            f"(missing={len(expected_names - actual_names)}, extra={len(actual_names - expected_names)})"
+        )
 
 print(f"Submission images: {len(pairs)}")
 if missing:
-    print(f"WARNING: missing rendered scenes: {missing}")
+    raise RuntimeError(f"Submission is incomplete; missing rendered scenes: {missing}")
+if invalid_submission:
+    raise RuntimeError("Submission file names/counts do not match test_poses.csv: " + "; ".join(invalid_submission))
 
 if pairs:
     # Competition submission limit: final submission.zip should stay <= 350MB.

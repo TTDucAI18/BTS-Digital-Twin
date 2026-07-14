@@ -97,6 +97,8 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.00015
         self.max_gaussians = 0
         self.foreground_loss_weight = 0.0
+        # Not checkpointed and cannot be inferred for unseen test cameras.
+        self.use_exposure_compensation = False
         # Hybrid Depth Scheduler (TASK 2): base weight for DA-v2 depth regularization.
         # Phase 1 (0-5k iters): full strength to anchor Gaussians on BTS tower.
         # Phase 2 (5k-25k iters): linear decay to 0, freeing 3DGS to recover cable geometry.

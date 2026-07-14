@@ -53,13 +53,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
                 ).squeeze(0)
             
             if accumulated_render is None:
-                accumulated_render = current_render.clone()
+                # Avoid an unnecessary second full-resolution image allocation.
+                accumulated_render = current_render
             else:
                 accumulated_render += current_render
                 
             # Giải phóng VRAM ngay lập tức để tránh tràn RAM GPU khi scale lớn
-            del current_render
-            torch.cuda.empty_cache()
+            if accumulated_render is not current_render:
+                del current_render
                 
         # Khôi phục view an toàn
         view.image_width = original_width
@@ -91,6 +92,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         
         gt_np = gt.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
         Image.fromarray(gt_np).save(gt_file_path, format="JPEG", quality=95)
+        del accumulated_render, final_rendering, gt
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, separate_sh: bool, ensemble_scales: list):
     with torch.no_grad():

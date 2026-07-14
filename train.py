@@ -152,6 +152,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     exposure_embedding = torch.nn.Embedding(num_cams, 3).cuda()
     exposure_embedding.weight.data.zero_() # Bắt đầu với bias = 0 (tương đương multiplier = 1.0)
     exposure_optimizer = torch.optim.Adam(exposure_embedding.parameters(), lr=0.01)
+    if not opt.use_exposure_compensation:
+        # Exposure is neither saved in a checkpoint nor defined for unseen test
+        # poses.  Do not let it inflate train-only quality by default.
+        exposure_optimizer = None
 
     viewpoint_stack = train_cameras.copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -309,7 +313,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     if opt.max_gaussians <= 0 or gaussians.get_xyz.shape[0] < opt.max_gaussians:
-                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                        gaussians.densify_and_prune(
+                            opt.densify_grad_threshold, 0.005, scene.cameras_extent,
+                            size_threshold, radii, max_points=opt.max_gaussians
+                        )
                     else:
                         print(f"\n[ITER {iteration}] WARNING: Max Gaussians reached ({gaussians.get_xyz.shape[0]}/{opt.max_gaussians}). Skipping densification to prevent OOM.")
                         # Still prune to remove transparent ones
@@ -328,8 +335,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                exposure_optimizer.step()
-                exposure_optimizer.zero_grad(set_to_none=True)
+                if exposure_optimizer is not None:
+                    exposure_optimizer.step()
+                    exposure_optimizer.zero_grad(set_to_none=True)
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])

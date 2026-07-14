@@ -5,7 +5,7 @@
 # The pipeline is tuned for Kaggle 2x T4, 16 GB VRAM per GPU:
 #   1. clone/update repo and submodules
 #   2. install CUDA extensions once
-#   3. discover scenes
+#   3. discover the 8 private_set1 scenes
 #   4. train one scene per GPU
 #   5. render test poses at full output resolution
 #   6. package submission.zip
@@ -39,6 +39,7 @@ DATA_ROOT_CANDIDATES = [
     Path("/kaggle/input/datasets/tdukaggle/ai-race-data/phase1"),
     Path("/kaggle/input/bts-digital-twin-phase1/phase1"),
     Path("/kaggle/input/ai-race-data/phase1"),
+    Path("D:/ai_race_2026/data/phase1"),
 ]
 
 ITERATIONS = int(os.environ.get("BTS_ITERATIONS", "30000"))
@@ -47,7 +48,17 @@ RENDER_RESOLUTION = int(os.environ.get("BTS_RENDER_RESOLUTION", "1"))
 MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "2500000"))
 MAX_WORKERS = int(os.environ.get("BTS_MAX_WORKERS", "2"))
 KAGGLE_TIME_LIMIT_H = float(os.environ.get("BTS_TIME_LIMIT_H", "11.0"))
-SCENE_FILTER = os.environ.get("BTS_SCENES", "").strip()
+PRIVATE_SET1_SCENES = [
+    "HCM0249",
+    "HCM0254",
+    "HCM0276",
+    "HCM1439",
+    "HNI0131",
+    "HNI0265",
+    "HNI0366",
+    "HNI0437",
+]
+SCENE_FILTER = os.environ.get("BTS_SCENES", ",".join(PRIVATE_SET1_SCENES)).strip()
 
 WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "").strip()
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "").strip()
@@ -142,6 +153,26 @@ else:
 os.chdir(REPO_DIR)
 run(["git", "log", "--oneline", "-3"], cwd=REPO_DIR, check=False)
 
+
+def patch_repo_for_kaggle():
+    """Apply tiny compatibility patches before train.py builds argparse."""
+    arguments_file = REPO_DIR / "arguments" / "__init__.py"
+    text = arguments_file.read_text(encoding="utf-8", errors="replace")
+    patched = text.replace("self._masks = \"\"", "self.masks = \"\"")
+    if patched != text:
+        arguments_file.write_text(patched, encoding="utf-8")
+        print("Patched arguments/__init__.py: masks no longer reserves shorthand -m.")
+
+    cameras_file = REPO_DIR / "scene" / "cameras.py"
+    text = cameras_file.read_text(encoding="utf-8", errors="replace")
+    patched = text.replace("                    self.depth_mask *= 0\n", "")
+    if patched != text:
+        cameras_file.write_text(patched, encoding="utf-8")
+        print("Patched scene/cameras.py: depth_mask is no longer touched before initialization.")
+
+
+patch_repo_for_kaggle()
+
 print("=" * 80)
 print("Installing Python deps and CUDA extensions")
 print("=" * 80)
@@ -182,7 +213,7 @@ else:
 
 ARGUMENTS_TEXT = (REPO_DIR / "arguments" / "__init__.py").read_text(encoding="utf-8", errors="replace")
 SUPPORTS_MAX_GAUSSIANS = "max_gaussians" in ARGUMENTS_TEXT
-SUPPORTS_MASKS = "_masks" in ARGUMENTS_TEXT or "self._masks" in ARGUMENTS_TEXT
+SUPPORTS_MASKS = "self.masks" in ARGUMENTS_TEXT or "_masks" in ARGUMENTS_TEXT or "self._masks" in ARGUMENTS_TEXT
 SUPPORTS_FOREGROUND_WEIGHT = "foreground_loss_weight" in ARGUMENTS_TEXT
 print(
     "Repo feature flags:",
@@ -201,10 +232,10 @@ print(
 def find_data_root():
     for candidate in DATA_ROOT_CANDIDATES:
         if candidate and candidate.exists():
-            if (candidate / "public_set").exists() or (candidate / "private_set1").exists():
+            if (candidate / "private_set1").exists():
                 return candidate
     raise FileNotFoundError(
-        "Could not find phase1 data root. Set BTS_DATA_DIR to the folder containing public_set/private_set1."
+        "Could not find phase1 data root. Set BTS_DATA_DIR to the folder containing private_set1."
     )
 
 
@@ -214,25 +245,36 @@ def is_scene_dir(path):
 
 
 def discover_scenes(data_root):
-    scenes = []
-    for split in ["public_set", "private_set1"]:
-        split_dir = data_root / split
-        if split_dir.exists():
-            scenes.extend([p for p in sorted(split_dir.iterdir()) if p.is_dir() and is_scene_dir(p)])
+    split_dir = data_root / "private_set1"
+    if not split_dir.exists():
+        raise FileNotFoundError(f"private_set1 not found under {data_root}")
 
     if SCENE_FILTER:
         wanted = {x.strip() for x in SCENE_FILTER.split(",") if x.strip()}
-        scenes = [p for p in scenes if p.name in wanted]
+    else:
+        wanted = set(PRIVATE_SET1_SCENES)
+
+    unknown = sorted(wanted - set(PRIVATE_SET1_SCENES))
+    if unknown:
+        raise ValueError(f"BTS_SCENES contains names outside private_set1 target list: {unknown}")
+
+    scenes = [split_dir / name for name in PRIVATE_SET1_SCENES if name in wanted]
+    missing_dirs = [p.name for p in scenes if not p.exists()]
+    invalid_dirs = [p.name for p in scenes if p.exists() and not is_scene_dir(p)]
+    if missing_dirs:
+        raise FileNotFoundError(f"Missing private_set1 scene dirs: {missing_dirs}")
+    if invalid_dirs:
+        raise RuntimeError(f"Invalid private_set1 scene dirs, missing train/sparse or sparse: {invalid_dirs}")
 
     if not scenes:
-        raise RuntimeError(f"No scenes found under {data_root}")
+        raise RuntimeError(f"No selected private_set1 scenes found under {split_dir}")
     return scenes
 
 
 DATA_ROOT = find_data_root()
 ALL_SCENES = discover_scenes(DATA_ROOT)
 print(f"DATA_ROOT: {DATA_ROOT}")
-print(f"Scenes ({len(ALL_SCENES)}): {[p.name for p in ALL_SCENES]}")
+print(f"Private set1 scenes ({len(ALL_SCENES)}): {[p.name for p in ALL_SCENES]}")
 
 
 def train_root(scene_path):
@@ -363,13 +405,13 @@ def ensure_ply_from_checkpoint(out_dir, iteration):
 
     helper = Path("/kaggle/working/extract_checkpoint_ply.py")
     helper.write_text(
-        """
+        f"""
 import argparse
 import os
 import sys
 import torch
 
-sys.path.insert(0, "/kaggle/working/BTS-Digital-Twin")
+sys.path.insert(0, {str(REPO_DIR)!r})
 from scene.gaussian_model import GaussianModel
 
 parser = argparse.ArgumentParser()
@@ -389,7 +431,7 @@ gaussians._rotation = model_params[5]
 gaussians._opacity = model_params[6]
 os.makedirs(os.path.dirname(args.out_ply), exist_ok=True)
 gaussians.save_ply(args.out_ply)
-print(f"Extracted {args.out_ply}")
+print(f"Extracted {{args.out_ply}}")
 """.lstrip(),
         encoding="utf-8",
     )

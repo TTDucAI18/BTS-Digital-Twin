@@ -60,10 +60,36 @@ PRIVATE_SET1_SCENES = [
 ]
 SCENE_FILTER = os.environ.get("BTS_SCENES", ",".join(PRIVATE_SET1_SCENES)).strip()
 
-WANDB_API_KEY = os.environ.get("WANDB_API_KEY", "").strip()
-WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "").strip()
+def get_secret(name):
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    try:
+        from kaggle_secrets import UserSecretsClient
+
+        return UserSecretsClient().get_secret(name).strip()
+    except Exception:
+        return ""
+
+
+def get_first_secret(names):
+    for name in names:
+        value = get_secret(name)
+        if value:
+            print(f"Loaded secret: {name}")
+            return value
+    return ""
+
+
+WANDB_API_KEY = get_first_secret(["WANDB_API_KEY", "wandb_api_key", "WANDB_KEY", "wandb_key"])
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "ai_race").strip()
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "bts-digital-twin")
+WANDB_REQUIRED = os.environ.get("BTS_REQUIRE_WANDB", "1").strip() != "0"
 USE_WANDB = bool(WANDB_API_KEY)
+if USE_WANDB:
+    os.environ["WANDB_API_KEY"] = WANDB_API_KEY
+    os.environ.setdefault("WANDB_MODE", "online")
+    os.environ.setdefault("WANDB__SERVICE_WAIT", "300")
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -209,7 +235,10 @@ if USE_WANDB:
             WANDB_ENTITY = ""
     print(f"WandB enabled: project={WANDB_PROJECT}, entity={WANDB_ENTITY or '<default>'}")
 else:
-    print("WandB disabled. Set WANDB_API_KEY in Kaggle Secrets to enable it.")
+    message = "WandB API key not found. Add Kaggle Secret named WANDB_API_KEY, then rerun from Cell 1/2."
+    if WANDB_REQUIRED:
+        raise RuntimeError(message)
+    print(f"WandB disabled. {message}")
 
 ARGUMENTS_TEXT = (REPO_DIR / "arguments" / "__init__.py").read_text(encoding="utf-8", errors="replace")
 SUPPORTS_MAX_GAUSSIANS = "max_gaussians" in ARGUMENTS_TEXT
@@ -458,6 +487,7 @@ def scene_train_config(scene_path):
 
 
 def build_train_cmd(scene_path, gpu_id):
+    scene_name = Path(scene_path).name
     out_dir = scene_output(scene_path)
     cfg = scene_train_config(scene_path)
     resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1)
@@ -511,7 +541,12 @@ def build_train_cmd(scene_path, gpu_id):
         if WANDB_ENTITY:
             cmd.extend(["--wandb_entity", WANDB_ENTITY])
 
-    env = {"CUDA_VISIBLE_DEVICES": str(gpu_id)}
+    env = {
+        "CUDA_VISIBLE_DEVICES": str(gpu_id),
+        "WANDB_API_KEY": WANDB_API_KEY,
+        "WANDB_MODE": "online",
+        "WANDB_NAME": f"{scene_name}-gpu{gpu_id}",
+    }
     return cmd, env
 
 
@@ -722,6 +757,8 @@ if missing:
     print(f"WARNING: missing rendered scenes: {missing}")
 
 if pairs:
+    # Competition submission limit: final submission.zip should stay <= 350MB.
+    # Kaggle runtime has a separate disk quota; it is not a per-file limit.
     target = 350 * 1024 * 1024
     size = pack_lossless(pairs)
     print(f"submission.zip lossless: {size / 1024 / 1024:.1f} MB")

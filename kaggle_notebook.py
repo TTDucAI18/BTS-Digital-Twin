@@ -640,6 +640,7 @@ def build_train_cmd(scene_path, gpu_id):
         "WANDB_API_KEY": WANDB_API_KEY,
         "WANDB_MODE": "online",
         "WANDB_NAME": f"{scene_name}-gpu{gpu_id}",
+        "WANDB_LOG_FILE": str(OUTPUT_DIR / f"{scene_name}_train.log"),
         # Stagger WandB service initialisation: GPU-0 inits first, GPU-1 waits
         # 15 s so the wandb-service daemon is already running when the second
         # process starts.  This prevents the silent "only one run appears" bug

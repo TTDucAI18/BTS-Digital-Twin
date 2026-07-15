@@ -463,6 +463,14 @@ def prepare_output_and_logger(args):
         wandb.define_metric("scene/*", step_metric="iteration")
         wandb.log({"run/started": 1, "iteration": 0}, step=0)
         
+        # Upload configuration file
+        wandb.save(os.path.join(args.model_path, "cfg_args"), base_path=args.model_path)
+        
+        # Upload the continuous train log file if provided by the environment
+        wandb_log_file = os.getenv("WANDB_LOG_FILE")
+        if wandb_log_file:
+            wandb.save(wandb_log_file, base_path=os.path.dirname(wandb_log_file), policy="live")
+        
     return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validation_iterations, scene : Scene, renderFunc, renderArgs, val_cameras):

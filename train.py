@@ -14,6 +14,7 @@ import glob as _glob
 import shutil
 import tempfile
 import zipfile
+import time
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -26,6 +27,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.training_utils import evenly_spaced_holdout_indices, foreground_edge_l1, foreground_weighted_l1, natural_image_key
 try:
     import wandb
     WANDB_FOUND = True
@@ -61,16 +63,25 @@ def checkpoint_is_complete(path):
         return False
 
 
-def save_checkpoint_atomically(model_path, gaussians, iteration):
+def save_checkpoint_atomically(model_path, gaussians, iteration, include_optimizer):
     """Write, CRC-validate, then atomically publish a checkpoint."""
     final_path = os.path.join(model_path, f"chkpnt{iteration}.pth")
     fd, temporary_path = tempfile.mkstemp(prefix=f".chkpnt{iteration}.", suffix=".tmp", dir=model_path)
     os.close(fd)
     try:
-        torch.save((gaussians.capture(), iteration), temporary_path)
+        started = time.monotonic()
+        torch.save((gaussians.capture(include_optimizer=include_optimizer), iteration), temporary_path)
+        saved_after = time.monotonic()
         if not checkpoint_is_complete(temporary_path):
             raise RuntimeError(f"Checkpoint validation failed: {temporary_path}")
+        validated_after = time.monotonic()
         os.replace(temporary_path, final_path)
+        size_gb = os.path.getsize(final_path) / (1024 ** 3)
+        print(
+            f"[ITER {iteration}] Checkpoint published: {size_gb:.2f} GB "
+            f"(save {saved_after - started:.1f}s, CRC {validated_after - saved_after:.1f}s, "
+            f"optimizer_state={include_optimizer})"
+        )
         return final_path
     finally:
         if os.path.exists(temporary_path):
@@ -89,7 +100,7 @@ def remove_superseded_checkpoints(model_path, keep_path):
         except OSError as exc:
             print("Could not delete {}: {}".format(os.path.basename(old_ckpt), exc))
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
+def training(dataset, opt, pipe, validation_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -136,16 +147,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             return base_weight * 0.05
 
-    # Extract validation set (chỉ để monitor — KHÔNG loại khỏi training)
-    import random
-    all_train_cams = scene.getTrainCameras()
-    val_size = min(10, max(1, len(all_train_cams) // 10))
-    # fixed seed for deterministic val set
-    random.seed(42)
-    val_indices = set(random.sample(range(len(all_train_cams)), val_size))
-    val_cameras = [c for i, c in enumerate(all_train_cams) if i in val_indices]
-    # Dùng 100% ảnh để train (không loại bỏ val set ra)
-    train_cameras = all_train_cams
+    # Hold out evenly spaced training views for novel-view validation.  Do not
+    # select from the shuffled Scene order: neighbouring capture indices often
+    # have nearly identical poses, so a uniform split by natural image index is
+    # more representative than a random contiguous cluster.
+    ordered_train_cams = sorted(scene.getTrainCameras(), key=lambda camera: natural_image_key(camera.image_name))
+    val_indices = evenly_spaced_holdout_indices(len(ordered_train_cams), args.validation_fraction)
+    val_cameras = [camera for i, camera in enumerate(ordered_train_cams) if i in val_indices]
+    train_cameras = [camera for i, camera in enumerate(ordered_train_cams) if i not in val_indices]
+    print(
+        f"Validation holdout: {len(val_cameras)}/{len(ordered_train_cams)} views "
+        f"({100 * len(val_cameras) / len(ordered_train_cams):.1f}%), evenly spaced by image index."
+    )
 
     # Phục hồi Exposure Compensation (giúp giảm mây mờ / floaters do chênh lệch độ sáng giữa các ảnh từ camera drone)
     num_cams = max([c.uid for c in train_cameras]) + 1
@@ -209,28 +222,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
 
-        # Áp dụng bù trừ phơi sáng cho từng ảnh
-        # Điều này giúp mô hình không phải tạo ra sương mù/floaters để bù sáng
-        cam_uid = torch.tensor([viewpoint_cam.uid], device="cuda", dtype=torch.long)
-        exp_modifier = torch.exp(exposure_embedding(cam_uid)).squeeze(0).unsqueeze(-1).unsqueeze(-1)
-        # Khóa lại ở [0, 1] trước khi tính loss
-        image_adj = torch.clamp(image * exp_modifier, 0.0, 1.0)
+        # With exposure compensation disabled, retain the rasterizer output
+        # directly.  Clamping it would zero gradients at saturated edges, where
+        # sharp BTS silhouettes and cables need the strongest correction.
+        if exposure_optimizer is None:
+            image_for_loss = image
+        else:
+            cam_uid = torch.tensor([viewpoint_cam.uid], device="cuda", dtype=torch.long)
+            exp_modifier = torch.exp(exposure_embedding(cam_uid)).squeeze(0).unsqueeze(-1).unsqueeze(-1)
+            image_for_loss = torch.clamp(image * exp_modifier, 0.0, 1.0)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        if opt.foreground_loss_weight > 0.0 and viewpoint_cam.foreground_mask is not None:
-            fg_mask = viewpoint_cam.foreground_mask.cuda()
-            pixel_l1 = torch.abs(image_adj - gt_image).mean(dim=0, keepdim=True)
-            pixel_weight = 1.0 + opt.foreground_loss_weight * fg_mask
-            Ll1 = (pixel_l1 * pixel_weight).sum() / (pixel_weight.sum() + 1e-6)
+        fg_mask = viewpoint_cam.foreground_mask.cuda() if viewpoint_cam.foreground_mask is not None else None
+        if opt.foreground_loss_weight > 0.0 and fg_mask is not None:
+            Ll1 = foreground_weighted_l1(image_for_loss, gt_image, fg_mask, opt.foreground_loss_weight)
         else:
-            Ll1 = l1_loss(image_adj, gt_image)
+            Ll1 = l1_loss(image_for_loss, gt_image)
         if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image_adj.unsqueeze(0), gt_image.unsqueeze(0))
+            ssim_value = fused_ssim(image_for_loss.unsqueeze(0), gt_image.unsqueeze(0))
         else:
-            ssim_value = ssim(image_adj, gt_image)
+            ssim_value = ssim(image_for_loss, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        foreground_edge_loss = 0.0
+        if opt.foreground_edge_loss_weight > 0.0 and fg_mask is not None:
+            foreground_edge_loss = foreground_edge_l1(image_for_loss, gt_image, fg_mask)
+            loss += opt.foreground_edge_loss_weight * foreground_edge_loss
 
         # ── KHẮC PHỤC LỖI TOÁN HỌC: Depth Regularization (Chống Exploding Gradients) ────
         Ll1depth_pure = 0.0
@@ -282,20 +300,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "train/depth_loss": Ll1depth,
                     "train/depth_loss_raw": Ll1depth_pure.item() if hasattr(Ll1depth_pure, "item") else float(Ll1depth_pure),
                     "train/depth_weight": current_depth_weight,
+                    "train/foreground_edge_loss": (
+                        foreground_edge_loss.item()
+                        if hasattr(foreground_edge_loss, "item") else float(foreground_edge_loss)
+                    ),
+                    "train/foreground_edge_weight": opt.foreground_edge_loss_weight,
                     "train/epoch": epoch,
                     "scene/total_points": gaussians.get_xyz.shape[0],
                 }, step=iteration)
 
+            stop_after_checkpoint = False
             if iteration % args.disk_check_interval == 0:
                 free_space_gb = shutil.disk_usage(scene.model_path).free / (1024**3)
                 if free_space_gb < args.min_free_disk_gb:
-                    print(f"\n[ITER {iteration}] Disk free {free_space_gb:.2f} GB < {args.min_free_disk_gb:.2f} GB. Stopping early; the last verified checkpoint is retained.")
-                    break
+                    print(f"\n[ITER {iteration}] Disk free {free_space_gb:.2f} GB < {args.min_free_disk_gb:.2f} GB. Saving a verified checkpoint before stopping.")
+                    stop_after_checkpoint = True
+                if args.stop_at_unix_time > 0 and time.time() >= args.stop_at_unix_time:
+                    print(f"\n[ITER {iteration}] Runtime deadline reached. Saving a verified checkpoint before stopping.")
+                    stop_after_checkpoint = True
             if iteration == opt.iterations:
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE), val_cameras)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), validation_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE), val_cameras)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 # FIX BUG 4: Free VRAM before writing large PLY to disk.
@@ -346,10 +373,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
+            if iteration in checkpoint_iterations or stop_after_checkpoint:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 try:
-                    new_ckpt_path = save_checkpoint_atomically(scene.model_path, gaussians, iteration)
+                    if args.checkpoint_stagger_seconds:
+                        print(
+                            f"[ITER {iteration}] Staggering checkpoint I/O for "
+                            f"{args.checkpoint_stagger_seconds}s."
+                        )
+                        time.sleep(args.checkpoint_stagger_seconds)
+                    new_ckpt_path = save_checkpoint_atomically(
+                        scene.model_path,
+                        gaussians,
+                        iteration,
+                        include_optimizer=args.checkpoint_optimizer_state,
+                    )
                 except Exception as exc:
                     print("[ITER {}] Checkpoint save failed: {}. Previous checkpoint is preserved.".format(iteration, exc))
                     raise
@@ -368,6 +406,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             print("[ITER {}] Deleted old checkpoint: {}".format(iteration, os.path.basename(old_ckpt)))
                         except Exception as e:
                             print("[ITER {}] Could not delete {}: {}".format(iteration, os.path.basename(old_ckpt), e))
+
+                if stop_after_checkpoint:
+                    print(f"[ITER {iteration}] Stopped cleanly after publishing checkpoint.")
+                    break
 
 def prepare_output_and_logger(args):    
     if args.use_wandb and not WANDB_FOUND:
@@ -401,22 +443,21 @@ def prepare_output_and_logger(args):
         
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, val_cameras):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validation_iterations, scene : Scene, renderFunc, renderArgs, val_cameras):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
-    # Report test and samples of training set
-    if iteration in testing_iterations:
+    # Kaggle test poses intentionally have no reference images.  Only the held
+    # out train views can produce meaningful image-space evaluation metrics.
+    if iteration in validation_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'validation', 'cameras' : val_cameras})
+        validation_configs = ({'name': 'validation', 'cameras': val_cameras},)
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
-                # Giới hạn số camera để tránh OOM khi Gaussian count cao
-                eval_cams = config['cameras'][:5]
+                eval_cams = config['cameras']
                 l1_test = 0.0
                 psnr_test = 0.0
                 with torch.no_grad():
@@ -470,11 +511,41 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[30_000])
+    parser.add_argument(
+        "--validation_iterations",
+        nargs="+",
+        type=int,
+        default=[],
+        help="Iterations for held-out training-view evaluation; hidden test poses are never evaluated.",
+    )
+    parser.add_argument(
+        "--validation_fraction",
+        type=float,
+        default=0.05,
+        help="Fraction of train images held out evenly by natural image index.",
+    )
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[25_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument(
+        "--checkpoint_optimizer_state",
+        action="store_true",
+        help="Include Adam state for an exact resume; substantially increases checkpoint I/O.",
+    )
+    parser.add_argument(
+        "--checkpoint_stagger_seconds",
+        type=float,
+        default=0.0,
+        help="Delay each checkpoint to avoid simultaneous multi-GPU disk I/O.",
+    )
+    parser.add_argument(
+        "--stop_at_unix_time",
+        type=float,
+        default=0.0,
+        help="Unix timestamp at which to checkpoint and stop cleanly (0 disables the deadline).",
+    )
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
     parser.add_argument("--wandb_project", type=str, default="bts-digital-twin")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (username or team)")
@@ -494,7 +565,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.validation_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
 
     if WANDB_FOUND and wandb.run is not None:
         wandb.finish()

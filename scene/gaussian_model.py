@@ -68,7 +68,14 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
-    def capture(self):
+    def capture(self, include_optimizer=True):
+        """Capture model state for a checkpoint.
+
+        Adam's moment tensors are substantially larger than the model itself for
+        dense Gaussian scenes.  They are optional because a resume can safely
+        recreate the optimizer; omitting them keeps constrained runtimes from
+        spending hours serializing GPU state while no training is occurring.
+        """
         return (
             self.active_sh_degree,
             self._xyz,
@@ -80,7 +87,7 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
-            self.optimizer.state_dict(),
+            self.optimizer.state_dict() if include_optimizer else None,
             self.spatial_lr_scale,
         )
     
@@ -100,7 +107,8 @@ class GaussianModel:
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        if opt_dict is not None:
+            self.optimizer.load_state_dict(opt_dict)
 
     @property
     def get_scaling(self):

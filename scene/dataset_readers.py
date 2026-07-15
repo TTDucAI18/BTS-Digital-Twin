@@ -218,7 +218,7 @@ def readKaggleTestCameras(test_poses_file):
             cam_infos.append(cam_info)
     return cam_infos
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, masks="", llffhold=8):
+def readColmapSceneInfo(path, images, depths, eval, train_test_exp, masks="", llffhold=8, load_test_poses=True):
     # Auto-detect BTS/Kaggle nested structure: scene_root/train/{images,sparse}
     # vs standard 3DGS structure: source_path/{images,sparse}
     if os.path.exists(os.path.join(path, "train", "sparse")):
@@ -288,11 +288,12 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, masks="", ll
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     test_cam_infos = [c for c in cam_infos if c.is_test]
     
-    test_poses_path = os.path.join(scene_root, "test", "test_poses.csv")
-    kaggle_test_cams = readKaggleTestCameras(test_poses_path)
-    if kaggle_test_cams:
-        print(f"[INFO] Loaded {len(kaggle_test_cams)} test poses from {test_poses_path}")
-    test_cam_infos.extend(kaggle_test_cams)
+    if load_test_poses:
+        test_poses_path = os.path.join(scene_root, "test", "test_poses.csv")
+        kaggle_test_cams = readKaggleTestCameras(test_poses_path)
+        if kaggle_test_cams:
+            print(f"[INFO] Loaded {len(kaggle_test_cams)} test poses from {test_poses_path}")
+        test_cam_infos.extend(kaggle_test_cams)
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 

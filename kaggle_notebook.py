@@ -46,15 +46,32 @@ ITERATIONS = int(os.environ.get("BTS_ITERATIONS", "30000"))
 # Use full resolution for thin BTS and cable details; set it to 2 only for a constrained rerun.
 TRAIN_RESOLUTION = int(os.environ.get("BTS_TRAIN_RESOLUTION", "1"))
 RENDER_RESOLUTION = int(os.environ.get("BTS_RENDER_RESOLUTION", "1"))
+USE_ANTIALIASING = os.environ.get("BTS_ANTIALIASING", "1").strip() != "0"
+RENDER_ENSEMBLE_SCALES = [
+    float(scale.strip())
+    for scale in os.environ.get("BTS_RENDER_ENSEMBLE_SCALES", "1.5").split(",")
+    if scale.strip()
+]
+if not RENDER_ENSEMBLE_SCALES or any(scale < 1.0 for scale in RENDER_ENSEMBLE_SCALES):
+    raise ValueError("BTS_RENDER_ENSEMBLE_SCALES must contain one or more scales >= 1.0.")
 # Upper bound only, never a target.  Override it without editing the notebook.
 MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "5000000"))
 FOREGROUND_LOSS_WEIGHT = float(os.environ.get("BTS_FOREGROUND_LOSS_WEIGHT", "6.0"))
+FOREGROUND_EDGE_LOSS_WEIGHT = float(os.environ.get("BTS_FOREGROUND_EDGE_LOSS_WEIGHT", "0.05"))
 MAX_WORKERS = int(os.environ.get("BTS_MAX_WORKERS", "2"))
 KAGGLE_TIME_LIMIT_H = float(os.environ.get("BTS_TIME_LIMIT_H", "11.0"))
+# Reserve time for the final compact checkpoint, render, and packaging.
+KAGGLE_STOP_BUFFER_MIN = float(os.environ.get("BTS_STOP_BUFFER_MIN", "30"))
 # Below this threshold, training exits cleanly and preserves the last verified checkpoint.
 MIN_FREE_DISK_GB = float(os.environ.get("BTS_MIN_FREE_DISK_GB", "2.0"))
 DISK_CHECK_INTERVAL = int(os.environ.get("BTS_DISK_CHECK_INTERVAL", "100"))
 WANDB_LOG_INTERVAL = int(os.environ.get("BTS_WANDB_LOG_INTERVAL", "100"))
+# Hold out uniformly distributed capture views for model selection.  These are
+# train images only; Kaggle test poses have no ground-truth images.
+VALIDATION_FRACTION = float(os.environ.get("BTS_VALIDATION_FRACTION", "0.05"))
+# Offset checkpoint writes per GPU so two large archives do not saturate the
+# small Kaggle working disk at the same iteration.
+CHECKPOINT_STAGGER_SECONDS = float(os.environ.get("BTS_CHECKPOINT_STAGGER_SECONDS", "90"))
 PRIVATE_SET1_SCENES = [
     "HCM0249",
     "HCM0254",
@@ -105,6 +122,9 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSION_START = time.time()
+TRAIN_STOP_AT_UNIX_TIME = SESSION_START + max(
+    0.0, KAGGLE_TIME_LIMIT_H * 3600 - KAGGLE_STOP_BUFFER_MIN * 60,
+)
 
 
 def run(cmd, cwd=None, log_file=None, check=False, env=None):
@@ -346,6 +366,7 @@ def optional_mask_args(scene_path):
             args = ["--masks", name]
             if SUPPORTS_FOREGROUND_WEIGHT:
                 args.extend(["--foreground_loss_weight", str(FOREGROUND_LOSS_WEIGHT)])
+                args.extend(["--foreground_edge_loss_weight", str(FOREGROUND_EDGE_LOSS_WEIGHT)])
             print(f"[{Path(scene_path).name}] BTS masks: {root / name} (weight={FOREGROUND_LOSS_WEIGHT})")
             return args
     print(f"[{Path(scene_path).name}] WARNING: no BTS foreground masks found; densification cannot preferentially focus on the BTS.")
@@ -577,18 +598,29 @@ def build_train_cmd(scene_path, gpu_id):
         "0.02",
         "--test_iterations",
         "-1",
+        "--validation_iterations",
+        *[str(x) for x in cfg["checkpoint_iterations"]],
+        "--validation_fraction",
+        str(VALIDATION_FRACTION),
         "--checkpoint_iterations",
         *[str(x) for x in cfg["checkpoint_iterations"]],
         "--save_iterations",
         str(ITERATIONS),
         "--disable_viewer",
         "--quiet",
+        "--skip_test_poses",
         *optional_depth_args(scene_path),
         *optional_mask_args(scene_path),
     ]
 
     if SUPPORTS_MAX_GAUSSIANS:
         cmd.extend(["--max_gaussians", str(cfg["max_gaussians"])])
+    if USE_ANTIALIASING:
+        cmd.append("--antialiasing")
+
+    cmd.extend(["--stop_at_unix_time", str(TRAIN_STOP_AT_UNIX_TIME)])
+    if gpu_id:
+        cmd.extend(["--checkpoint_stagger_seconds", str(gpu_id * CHECKPOINT_STAGGER_SECONDS)])
 
     if resume:
         cmd.extend(["--start_checkpoint", resume])
@@ -609,7 +641,7 @@ def build_train_cmd(scene_path, gpu_id):
 
 def build_render_cmd(scene_path, gpu_id, iteration):
     out_dir = scene_output(scene_path)
-    return [
+    cmd = [
         sys.executable,
         REPO_DIR / "render.py",
         "-s",
@@ -624,7 +656,12 @@ def build_render_cmd(scene_path, gpu_id, iteration):
         "--sh_degree",
         "3",
         "--quiet",
-    ], {"CUDA_VISIBLE_DEVICES": str(gpu_id)}
+        "--ensemble_scales",
+        *[str(scale) for scale in RENDER_ENSEMBLE_SCALES],
+    ]
+    if USE_ANTIALIASING:
+        cmd.append("--antialiasing")
+    return cmd, {"CUDA_VISIBLE_DEVICES": str(gpu_id)}
 
 
 def cleanup_intermediate(out_dir, keep_iter):
@@ -720,7 +757,7 @@ def train_and_render_scene(scene_path, gpu_id):
     if existing_names:
         print(f"[{scene_name}] incomplete/stale submission ({len(existing_names)}/{len(expected_names)}); rerendering.")
 
-    if hours_remaining() < 0.25:
+    if hours_remaining() < KAGGLE_STOP_BUFFER_MIN / 60:
         print(f"[{scene_name}] time budget exhausted, skipping.")
         return scene_name, 2
 

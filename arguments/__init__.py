@@ -61,6 +61,8 @@ class ModelParams(ParamGroup):
         # exposure compensation causes color shift and PSNR degradation on test poses.
         self.data_device = "cuda"
         self.eval = False
+        # Hidden competition poses have no images and are needed only by render.py.
+        self.skip_test_poses = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -97,6 +99,7 @@ class OptimizationParams(ParamGroup):
         self.densify_grad_threshold = 0.00015
         self.max_gaussians = 0
         self.foreground_loss_weight = 0.0
+        self.foreground_edge_loss_weight = 0.05
         # Not checkpointed and cannot be inferred for unseen test cameras.
         self.use_exposure_compensation = False
         # Hybrid Depth Scheduler (TASK 2): base weight for DA-v2 depth regularization.

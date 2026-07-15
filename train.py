@@ -436,7 +436,29 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
         
     if args.use_wandb:
-        wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=os.path.basename(args.model_path), config=vars(args))
+        # Use explicit wandb_name if provided (e.g. from kaggle_notebook.py),
+        # otherwise fall back to the model directory basename.
+        run_name = getattr(args, "wandb_name", None) or os.path.basename(args.model_path)
+        # Retry loop: two parallel subprocesses racing to init the wandb-service
+        # can cause the first one to fail silently.  Retry up to 3 times with a
+        # brief back-off to survive transient socket / service-start conflicts.
+        for _wandb_attempt in range(3):
+            try:
+                wandb.init(
+                    project=args.wandb_project,
+                    entity=args.wandb_entity,
+                    name=run_name,
+                    config=vars(args),
+                    settings=wandb.Settings(start_method="thread"),
+                )
+                break
+            except Exception as _wandb_exc:
+                if _wandb_attempt == 2:
+                    print(f"[WandB] Init failed after 3 attempts: {_wandb_exc}. Continuing without WandB.")
+                    break
+                _delay = 5 * (2 ** _wandb_attempt)
+                print(f"[WandB] Init attempt {_wandb_attempt + 1} failed ({_wandb_exc}); retrying in {_delay}s...")
+                time.sleep(_delay)
         wandb.define_metric("train/*", step_metric="iteration")
         wandb.define_metric("scene/*", step_metric="iteration")
         wandb.log({"run/started": 1, "iteration": 0}, step=0)
@@ -549,6 +571,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
     parser.add_argument("--wandb_project", type=str, default="bts-digital-twin")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (username or team)")
+    parser.add_argument("--wandb_name", type=str, default=None, help="Explicit WandB run name; overrides the model_path basename.")
     parser.add_argument("--wandb_log_interval", type=int, default=100, help="Log scalar metrics to wandb every N iterations")
     parser.add_argument("--min_free_disk_gb", type=float, default=2.0, help="Stop training when free disk drops below this value")
     parser.add_argument("--disk_check_interval", type=int, default=100, help="Check free disk every N iterations")

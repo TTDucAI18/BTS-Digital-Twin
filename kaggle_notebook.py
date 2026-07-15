@@ -104,8 +104,8 @@ def get_first_secret(names):
             return value
     return ""
 
-
-WANDB_API_KEY = get_first_secret(["WANDB_API_KEY", "wandb_api_key", "WANDB_KEY", "wandb_key"])
+#public wandb key. DO NOT CHANGE IT.
+WANDB_API_KEY = "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"
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "ai_race").strip()
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "bts-digital-twin")
 WANDB_REQUIRED = os.environ.get("BTS_REQUIRE_WANDB", "1").strip() != "0"
@@ -628,6 +628,11 @@ def build_train_cmd(scene_path, gpu_id):
         cmd.extend(["--use_wandb", "--wandb_project", WANDB_PROJECT])
         if WANDB_ENTITY:
             cmd.extend(["--wandb_entity", WANDB_ENTITY])
+        # Pass the run name explicitly so train.py uses it directly in wandb.init().
+        # Relying on the WANDB_NAME env-var alone is unreliable: the SDK prioritises
+        # the name= keyword argument inside wandb.init(), so without this flag the
+        # env-var is silently ignored.
+        cmd.extend(["--wandb_name", f"{scene_name}-gpu{gpu_id}"])
         cmd.extend(["--wandb_log_interval", str(WANDB_LOG_INTERVAL)])
 
     env = {
@@ -635,6 +640,12 @@ def build_train_cmd(scene_path, gpu_id):
         "WANDB_API_KEY": WANDB_API_KEY,
         "WANDB_MODE": "online",
         "WANDB_NAME": f"{scene_name}-gpu{gpu_id}",
+        # Stagger WandB service initialisation: GPU-0 inits first, GPU-1 waits
+        # 15 s so the wandb-service daemon is already running when the second
+        # process starts.  This prevents the silent "only one run appears" bug
+        # caused by two processes racing to spawn the shared wandb-service.
+        "WANDB_INIT_TIMEOUT": "120",
+        "WANDB__SERVICE_WAIT": str(max(300, int(gpu_id * 15 + 300))),
     }
     return cmd, env
 
@@ -775,7 +786,18 @@ def train_and_render_scene(scene_path, gpu_id):
         cmd, env = build_train_cmd(scene_path, gpu_id)
         log = OUTPUT_DIR / f"{scene_name}_train.log"
         print(f"[{scene_name}] train on GPU {gpu_id} | images={count_images(scene_path)} | log={log}")
+        # Stagger the WandB-service startup: GPU-0 initialises it first, and
+        # subsequent workers wait long enough for the daemon to be ready before
+        # they call wandb.init().  Without this delay the two processes race to
+        # spawn the shared wandb-service socket and the loser fails silently,
+        # which is why only one scene appeared in the WandB dashboard.
+        if gpu_id and USE_WANDB:
+            import time as _time
+            _wandb_stagger = 15 * gpu_id
+            print(f"[{scene_name}] Waiting {_wandb_stagger}s for WandB service to start on GPU 0...")
+            _time.sleep(_wandb_stagger)
         rc = run(cmd, cwd=REPO_DIR, env=env, log_file=log, check=False)
+
         if rc != 0:
             print(f"[{scene_name}] training failed rc={rc}")
             print(tail(log, 80))

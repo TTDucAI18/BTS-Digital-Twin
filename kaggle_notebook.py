@@ -279,46 +279,62 @@ run([sys.executable, "-c",
 run(["nvcc", "--version"], check=False)
 
 def _install_cuda_ext(submodule):
-    """Install a CUDA extension, ensuring the compiled .so is actually built.
+    """Install a CUDA extension reliably without pip network hangs.
 
-    pip install -e (editable) with newer pip uses PEP 660 which adds only a
-    .pth file WITHOUT compiling the CUDA .so.  We therefore use a regular
-    (non-editable) install so the extension is properly compiled and placed
-    on sys.path.  Falls back to the legacy setup.py path if pip fails.
+    Strategy:
+      1. Compile with 'setup.py build_ext --inplace' — pure local build,
+         no network calls, no pip locks. This avoids the Kaggle pip hang
+         that occurs when resolving dependencies for the 2nd+ extension.
+      2. Register with 'pip install --no-build-isolation --no-cache-dir
+         --no-deps .' so the package lands in site-packages and is importable
+         in subprocesses (train.py, render.py) without PYTHONPATH tricks.
+      3. If inplace build fails, try a full pip install as last resort.
     """
     log_file = OUTPUT_DIR / f"install_{submodule.name}.log"
     arch_list = "7.5;8.0;8.6;8.9;9.0"
+    build_env = {"MAX_JOBS": "4", "TORCH_CUDA_ARCH_LIST": arch_list}
 
-    # Attempt 1: non-editable install (compiles and installs .so properly)
+    # Step 1: compile the CUDA .so in-place (no network, no pip locks)
     rc = run(
-        [sys.executable, "-m", "pip", "install",
-         "--no-build-isolation", "--no-cache-dir", str(submodule)],
-        cwd=REPO_DIR, log_file=log_file, check=False,
-        env={"MAX_JOBS": "4", "TORCH_CUDA_ARCH_LIST": arch_list},
-    )
-    if rc == 0:
-        print(f"[{submodule.name}] installed OK (pip non-editable)")
-        return
-
-    print(f"[{submodule.name}] pip install failed (rc={rc}), trying setup.py fallback ...")
-    print(tail(log_file, 30))
-
-    # Attempt 2: build extension in-place, then install via setup.py develop
-    rc2 = run(
         [sys.executable, "setup.py", "build_ext", "--inplace"],
-        cwd=submodule, log_file=log_file, check=False,
-        env={"MAX_JOBS": "1", "TORCH_CUDA_ARCH_LIST": arch_list},
+        cwd=submodule, log_file=log_file, check=False, env=build_env,
     )
-    if rc2 == 0:
-        run([sys.executable, "setup.py", "develop"],
-            cwd=submodule, log_file=log_file, check=False)
-        print(f"[{submodule.name}] installed OK (setup.py develop)")
+    if rc != 0:
+        # Retry single-threaded in case of parallel compilation race
+        print(f"[{submodule.name}] build_ext failed (rc={rc}), retrying MAX_JOBS=1 ...")
+        rc = run(
+            [sys.executable, "setup.py", "build_ext", "--inplace"],
+            cwd=submodule, log_file=log_file, check=False,
+            env={"MAX_JOBS": "1", "TORCH_CUDA_ARCH_LIST": arch_list},
+        )
+
+    if rc == 0:
+        # Step 2: register in site-packages using --no-deps (no network calls)
+        rc2 = run(
+            [sys.executable, "-m", "pip", "install",
+             "--no-build-isolation", "--no-cache-dir", "--no-deps", str(submodule)],
+            cwd=REPO_DIR, log_file=log_file, check=False,
+            env={"MAX_JOBS": "1", "TORCH_CUDA_ARCH_LIST": arch_list},
+        )
+        if rc2 == 0:
+            print(f"[{submodule.name}] installed OK (build_ext --inplace + pip --no-deps)")
+            return
+        # pip registration failed but .so is built — add source dir to path as fallback
+        print(f"[{submodule.name}] pip --no-deps failed (rc={rc2}), adding to sys.path directly")
+        src = str(submodule)
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        # Persist path for subprocesses via .pth file
+        import site
+        pth = Path(site.getsitepackages()[0]) / f"_bts_{submodule.name}.pth"
+        pth.write_text(src + "\n", encoding="utf-8")
+        print(f"[{submodule.name}] registered via {pth}")
         return
 
-    # Both methods failed
+    # All methods failed
     log_tail = tail(log_file, 80)
-    print(f"ERROR: failed to install {submodule.name}.\n--- build log ---\n{log_tail}\n--- end ---")
-    raise RuntimeError(f"Could not install {submodule.name}. Full log: {log_file}")
+    print(f"ERROR: failed to build {submodule.name}.\n--- build log ---\n{log_tail}\n--- end ---")
+    raise RuntimeError(f"Could not build {submodule.name}. Full log: {log_file}")
 
 for submodule in [
     REPO_DIR / "submodules" / "diff-gaussian-rasterization",

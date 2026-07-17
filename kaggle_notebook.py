@@ -23,6 +23,18 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:  # tqdm installed later; fall back to identity wrapper
+    def _tqdm(it, **kw):  # type: ignore
+        return it
+
+
+def _tqdm_bar(iterable, desc, total=None, unit="it"):
+    """Wrap any iterable with a tqdm bar; safe before tqdm is installed."""
+    return _tqdm(iterable, desc=desc, total=total or len(list(iterable)) if hasattr(iterable, '__len__') else None,
+                 unit=unit, dynamic_ncols=True, leave=True)
+
 
 # =============================================================================
 # CELL 1 - Configuration
@@ -336,11 +348,12 @@ def _install_cuda_ext(submodule):
     print(f"ERROR: failed to build {submodule.name}.\n--- build log ---\n{log_tail}\n--- end ---")
     raise RuntimeError(f"Could not build {submodule.name}. Full log: {log_file}")
 
-for submodule in [
+_submodules = [
     REPO_DIR / "submodules" / "diff-gaussian-rasterization",
     REPO_DIR / "submodules" / "simple-knn",
     REPO_DIR / "submodules" / "fused-ssim",
-]:
+]
+for submodule in _tqdm(_submodules, desc="CUDA extensions", unit="ext"):
     if submodule.exists():
         _install_cuda_ext(submodule)
     else:
@@ -839,7 +852,7 @@ def copy_renders_to_submission(scene_path, iteration):
     for ext in ["*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG"]:
         images.extend(sorted(render_dir.glob(ext)))
 
-    for img in images:
+    for img in _tqdm(images, desc=f"[{scene_name}] copying renders", unit="img", leave=False):
         shutil.copy2(img, dest / img.name)
     print(f"[{scene_name}] copied {len(images)} renders to {dest}")
     return len(images)
@@ -992,20 +1005,61 @@ print(
 )
 print("=" * 80)
 
+_scene_start_times: dict = {}
+
 results = []
+_pipeline_bar = _tqdm(total=len(ALL_SCENES), desc="Scenes", unit="scene", dynamic_ncols=True)
 with ThreadPoolExecutor(max_workers=len(GPU_IDS)) as executor:
     futures = {executor.submit(worker, scene): scene for scene in ALL_SCENES}
     for future in as_completed(futures):
         scene = futures[future]
+        scene_name = Path(scene).name
+        t_done = time.time()
         try:
             result = future.result()
         except Exception as exc:
-            result = (Path(scene).name, 99)
-            print(f"[{Path(scene).name}] unhandled error: {exc}")
+            result = (scene_name, 99)
+            print(f"[{scene_name}] unhandled error: {exc}")
         results.append(result)
-        print(f"Completed: {result}")
+        rc = result[1]
+        rc_label = {0: "OK", 2: "timeout", 3: "no-PLY", 4: "no-renders",
+                    5: "low-disk", 6: "partial", 99: "exception"}.get(rc, f"rc={rc}")
+        free_gb, _ = disk_free_gb()
+        n_imgs = submission_image_count(scene_name)
+        _pipeline_bar.set_postfix(scene=scene_name, status=rc_label, imgs=n_imgs,
+                                  disk_free=f"{free_gb:.1f}GB")
+        _pipeline_bar.update(1)
+        print(f"Completed: {result} | imgs={n_imgs} | disk_free={free_gb:.1f}GB")
+        # WandB: log per-scene pipeline summary
+        if USE_WANDB:
+            try:
+                import wandb as _wandb
+                _wandb.log({
+                    f"pipeline/{scene_name}/status": rc,
+                    f"pipeline/{scene_name}/rendered_images": n_imgs,
+                    f"pipeline/{scene_name}/disk_free_gb": free_gb,
+                    f"pipeline/{scene_name}/hours_remaining": hours_remaining(),
+                })
+            except Exception:
+                pass
+_pipeline_bar.close()
 
 print("Pipeline results:", results)
+
+# WandB: log final pipeline summary table
+if USE_WANDB:
+    try:
+        import wandb as _wandb
+        _rows = [[name, rc, {0:"OK",2:"timeout",3:"no-PLY",4:"no-renders",
+                              5:"low-disk",6:"partial",99:"exception"}.get(rc, str(rc)),
+                  submission_image_count(name)]
+                 for name, rc in results]
+        _wandb.log({"pipeline/summary": _wandb.Table(
+            columns=["scene", "rc", "status", "rendered_images"],
+            data=_rows,
+        )})
+    except Exception as _e:
+        print(f"WandB summary log failed: {_e}")
 
 
 # =============================================================================
@@ -1027,7 +1081,7 @@ def pack_lossless(pairs):
     if SUBMISSION_ZIP.exists():
         SUBMISSION_ZIP.unlink()
     with zipfile.ZipFile(SUBMISSION_ZIP, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        for full, arcname in pairs:
+        for full, arcname in _tqdm(pairs, desc="Packing (lossless)", unit="img"):
             zf.write(full, arcname)
     return SUBMISSION_ZIP.stat().st_size
 
@@ -1038,7 +1092,7 @@ def pack_as_jpeg(pairs, quality):
     if SUBMISSION_ZIP.exists():
         SUBMISSION_ZIP.unlink()
     with zipfile.ZipFile(SUBMISSION_ZIP, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-        for full, arcname in pairs:
+        for full, arcname in _tqdm(pairs, desc=f"Packing JPEG q={quality}", unit="img"):
             try:
                 img = Image.open(full).convert("RGB")
                 buf = io.BytesIO()

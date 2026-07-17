@@ -37,7 +37,7 @@ SUBMISSION_ZIP = Path(os.environ.get("BTS_SUBMISSION_ZIP", "/kaggle/working/subm
 DATA_ROOT_CANDIDATES = [
     Path(os.environ["BTS_DATA_DIR"]) if os.environ.get("BTS_DATA_DIR") else None,
     # Current local layout: D:/ai_race_2026/data/<scene>/{train,test}.
-    Path("D:/ai_race_2026/data"),
+    Path("/kaggle/input/datasets/tdukaggle/ai-race-data"),
     Path("/kaggle/input/datasets/tdukaggle/ai-race-data/phase1"),
     Path("/kaggle/input/bts-digital-twin-phase1/phase1"),
     Path("/kaggle/input/ai-race-data/phase1"),
@@ -262,9 +262,42 @@ print("=" * 80)
 print("Installing Python deps and CUDA extensions")
 print("=" * 80)
 
-run([sys.executable, "-m", "pip", "install", "-q", "plyfile", "tqdm", "opencv-python-headless", "ninja", "Pillow", "matplotlib", "setuptools<70.0.0"], check=True)
+run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip"], check=True)
+# setuptools<70 must be pinned BEFORE CUDA extensions are built to avoid
+# distutils removal breakage (setuptools>=70 drops distutils shim).
+# wheel and packaging are required build-time deps for --no-build-isolation.
+run([sys.executable, "-m", "pip", "install", "-q", "--upgrade",
+     "setuptools<70.0.0", "wheel", "packaging", "ninja",
+     "plyfile", "tqdm", "opencv-python-headless", "Pillow", "matplotlib"], check=True)
 if USE_WANDB:
     run([sys.executable, "-m", "pip", "install", "-q", "wandb"], check=True)
+
+# Print build environment info for diagnostics
+run([sys.executable, "-c",
+     "import torch; print('torch', torch.__version__, '| cuda', torch.version.cuda); "
+     "import setuptools; print('setuptools', setuptools.__version__)"], check=False)
+run(["nvcc", "--version"], check=False)
+
+def _install_cuda_ext(submodule):
+    """Install a CUDA extension with full log capture and a MAX_JOBS=1 fallback."""
+    log_file = OUTPUT_DIR / f"install_{submodule.name}.log"
+    base_cmd = [sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", submodule]
+    # First attempt: allow parallel compilation (faster)
+    rc = run(base_cmd, cwd=REPO_DIR, log_file=log_file, check=False,
+             env={"MAX_JOBS": "4"})
+    if rc == 0:
+        return
+    print(f"[{submodule.name}] parallel build failed (rc={rc}), retrying with MAX_JOBS=1 ...")
+    # Second attempt: single-threaded, more verbose — avoids OOM / race conditions
+    rc = run(base_cmd + ["--verbose"], cwd=REPO_DIR, log_file=log_file, check=False,
+             env={"MAX_JOBS": "1", "TORCH_CUDA_ARCH_LIST": "7.5;8.0;8.6;8.9;9.0"})
+    if rc != 0:
+        log_tail = tail(log_file, 80)
+        print(f"ERROR: failed to install {submodule.name}.\n--- build log (last 80 lines) ---\n{log_tail}\n--- end ---")
+        raise RuntimeError(
+            f"pip install failed for {submodule.name} (rc={rc}). "
+            f"Full log: {log_file}"
+        )
 
 for submodule in [
     REPO_DIR / "submodules" / "diff-gaussian-rasterization",
@@ -272,7 +305,9 @@ for submodule in [
     REPO_DIR / "submodules" / "fused-ssim",
 ]:
     if submodule.exists():
-        run([sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", submodule], cwd=REPO_DIR, check=True)
+        _install_cuda_ext(submodule)
+    else:
+        print(f"WARNING: missing submodule {submodule}")
     else:
         print(f"WARNING: missing submodule {submodule}")
 

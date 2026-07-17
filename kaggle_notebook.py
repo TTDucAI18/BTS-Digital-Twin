@@ -279,25 +279,46 @@ run([sys.executable, "-c",
 run(["nvcc", "--version"], check=False)
 
 def _install_cuda_ext(submodule):
-    """Install a CUDA extension with full log capture and a MAX_JOBS=1 fallback."""
+    """Install a CUDA extension, ensuring the compiled .so is actually built.
+
+    pip install -e (editable) with newer pip uses PEP 660 which adds only a
+    .pth file WITHOUT compiling the CUDA .so.  We therefore use a regular
+    (non-editable) install so the extension is properly compiled and placed
+    on sys.path.  Falls back to the legacy setup.py path if pip fails.
+    """
     log_file = OUTPUT_DIR / f"install_{submodule.name}.log"
-    base_cmd = [sys.executable, "-m", "pip", "install", "--no-build-isolation", "-e", submodule]
-    # First attempt: allow parallel compilation (faster)
-    rc = run(base_cmd, cwd=REPO_DIR, log_file=log_file, check=False,
-             env={"MAX_JOBS": "4"})
+    arch_list = "7.5;8.0;8.6;8.9;9.0"
+
+    # Attempt 1: non-editable install (compiles and installs .so properly)
+    rc = run(
+        [sys.executable, "-m", "pip", "install",
+         "--no-build-isolation", "--no-cache-dir", str(submodule)],
+        cwd=REPO_DIR, log_file=log_file, check=False,
+        env={"MAX_JOBS": "4", "TORCH_CUDA_ARCH_LIST": arch_list},
+    )
     if rc == 0:
+        print(f"[{submodule.name}] installed OK (pip non-editable)")
         return
-    print(f"[{submodule.name}] parallel build failed (rc={rc}), retrying with MAX_JOBS=1 ...")
-    # Second attempt: single-threaded, more verbose — avoids OOM / race conditions
-    rc = run(base_cmd + ["--verbose"], cwd=REPO_DIR, log_file=log_file, check=False,
-             env={"MAX_JOBS": "1", "TORCH_CUDA_ARCH_LIST": "7.5;8.0;8.6;8.9;9.0"})
-    if rc != 0:
-        log_tail = tail(log_file, 80)
-        print(f"ERROR: failed to install {submodule.name}.\n--- build log (last 80 lines) ---\n{log_tail}\n--- end ---")
-        raise RuntimeError(
-            f"pip install failed for {submodule.name} (rc={rc}). "
-            f"Full log: {log_file}"
-        )
+
+    print(f"[{submodule.name}] pip install failed (rc={rc}), trying setup.py fallback ...")
+    print(tail(log_file, 30))
+
+    # Attempt 2: build extension in-place, then install via setup.py develop
+    rc2 = run(
+        [sys.executable, "setup.py", "build_ext", "--inplace"],
+        cwd=submodule, log_file=log_file, check=False,
+        env={"MAX_JOBS": "1", "TORCH_CUDA_ARCH_LIST": arch_list},
+    )
+    if rc2 == 0:
+        run([sys.executable, "setup.py", "develop"],
+            cwd=submodule, log_file=log_file, check=False)
+        print(f"[{submodule.name}] installed OK (setup.py develop)")
+        return
+
+    # Both methods failed
+    log_tail = tail(log_file, 80)
+    print(f"ERROR: failed to install {submodule.name}.\n--- build log ---\n{log_tail}\n--- end ---")
+    raise RuntimeError(f"Could not install {submodule.name}. Full log: {log_file}")
 
 for submodule in [
     REPO_DIR / "submodules" / "diff-gaussian-rasterization",

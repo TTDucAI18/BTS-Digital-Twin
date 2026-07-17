@@ -308,8 +308,6 @@ for submodule in [
         _install_cuda_ext(submodule)
     else:
         print(f"WARNING: missing submodule {submodule}")
-    else:
-        print(f"WARNING: missing submodule {submodule}")
 
 verify_code = (
     "from diff_gaussian_rasterization import GaussianRasterizer; "

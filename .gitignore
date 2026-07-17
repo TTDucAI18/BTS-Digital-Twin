@@ -107,6 +107,9 @@ submissions/
 !dummy_chkpnt.pth
 
 # Kaggle/local notebook artifacts
+# The Kaggle orchestration notebook is maintained locally and must not be
+# included in repository updates from this checkout.
+kaggle_notebook.py
 kaggle/working/
 working/
 *.csv

@@ -186,7 +186,7 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
     epoch_samples = 0
     completed_epochs = 0
 
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress", file=sys.stdout)
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc=args.progress_name, file=sys.stdout, dynamic_ncols=True)
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn is None:
@@ -502,6 +502,7 @@ def prepare_output_and_logger(args):
         # Retry loop: two parallel subprocesses racing to init the wandb-service
         # can cause the first one to fail silently.  Retry up to 3 times with a
         # brief back-off to survive transient socket / service-start conflicts.
+        wandb_initialized = False
         for _wandb_attempt in range(3):
             try:
                 wandb.init(
@@ -511,7 +512,10 @@ def prepare_output_and_logger(args):
                     config=vars(args),
                     settings=wandb.Settings(start_method="thread"),
                 )
-                break
+                wandb_initialized = wandb.run is not None
+                if wandb_initialized:
+                    break
+                raise RuntimeError("wandb.init returned without an active run")
             except Exception as _wandb_exc:
                 if _wandb_attempt == 2:
                     print(f"[WandB] Init failed after 3 attempts: {_wandb_exc}. Continuing without WandB.")
@@ -519,18 +523,19 @@ def prepare_output_and_logger(args):
                 _delay = 5 * (2 ** _wandb_attempt)
                 print(f"[WandB] Init attempt {_wandb_attempt + 1} failed ({_wandb_exc}); retrying in {_delay}s...")
                 time.sleep(_delay)
-        wandb.define_metric("train/*", step_metric="iteration")
-        wandb.define_metric("train_epoch/*", step_metric="iteration")
-        wandb.define_metric("scene/*", step_metric="iteration")
-        wandb.log({"run/started": 1, "iteration": 0}, step=0)
-        
-        # Upload configuration file
-        wandb.save(os.path.join(args.model_path, "cfg_args"), base_path=args.model_path)
-        
-        # Upload the continuous train log file if provided by the environment
-        wandb_log_file = os.getenv("WANDB_LOG_FILE")
-        if wandb_log_file:
-            wandb.save(wandb_log_file, base_path=os.path.dirname(wandb_log_file), policy="live")
+        if wandb_initialized:
+            wandb.define_metric("train/*", step_metric="iteration")
+            wandb.define_metric("train_epoch/*", step_metric="iteration")
+            wandb.define_metric("scene/*", step_metric="iteration")
+            wandb.log({"run/started": 1, "iteration": 0}, step=0)
+
+            # Upload configuration file
+            wandb.save(os.path.join(args.model_path, "cfg_args"), base_path=args.model_path)
+
+            # Upload the continuous train log file if provided by the environment
+            wandb_log_file = os.getenv("WANDB_LOG_FILE")
+            if wandb_log_file:
+                wandb.save(wandb_log_file, base_path=os.path.dirname(wandb_log_file), policy="live")
         
     return tb_writer
 
@@ -623,6 +628,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
+    parser.add_argument(
+        "--progress_name",
+        type=str,
+        default="Training progress",
+        help="Scene/GPU label displayed by tqdm when subprocess output is streamed.",
+    )
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[25_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument(

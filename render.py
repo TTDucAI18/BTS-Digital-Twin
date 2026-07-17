@@ -64,6 +64,16 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     if save_gt:
         makedirs(gts_path, exist_ok=True)
 
+    # Reruns must not inherit files from an older test-poses list.  The
+    # notebook validates exact names, so a stale render here would otherwise
+    # make a repaired scene fail submission validation forever.
+    for directory in (render_path, gts_path if save_gt else None):
+        if directory is None:
+            continue
+        for entry in os.scandir(directory):
+            if entry.is_file() and entry.name.lower().endswith((".png", ".jpg", ".jpeg")):
+                os.unlink(entry.path)
+
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         final_rendering = render_view(view, gaussians, pipeline, background, separate_sh, ensemble_scales)
         out_name = getattr(view, "image_name", None) or f"{idx:05d}.jpg"

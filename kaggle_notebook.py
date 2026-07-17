@@ -5,7 +5,7 @@
 # The pipeline is tuned for Kaggle 2x T4, 16 GB VRAM per GPU:
 #   1. clone/update repo and submodules
 #   2. install CUDA extensions once
-#   3. discover the 8 private_set1 scenes
+#   3. discover the seven competition scenes
 #   4. train one scene per GPU
 #   5. render test poses at full output resolution
 #   6. package submission.zip
@@ -36,26 +36,58 @@ SUBMISSION_ZIP = Path(os.environ.get("BTS_SUBMISSION_ZIP", "/kaggle/working/subm
 
 DATA_ROOT_CANDIDATES = [
     Path(os.environ["BTS_DATA_DIR"]) if os.environ.get("BTS_DATA_DIR") else None,
+    # Current local layout: D:/ai_race_2026/data/<scene>/{train,test}.
+    Path("D:/ai_race_2026/data"),
     Path("/kaggle/input/datasets/tdukaggle/ai-race-data/phase1"),
     Path("/kaggle/input/bts-digital-twin-phase1/phase1"),
     Path("/kaggle/input/ai-race-data/phase1"),
+    Path("/kaggle/input/ai-race-data"),
     Path("D:/ai_race_2026/data/phase1"),
 ]
 
-ITERATIONS = int(os.environ.get("BTS_ITERATIONS", "30000"))
+ITERATIONS = int(os.environ.get("BTS_ITERATIONS", "40000"))
+POSITION_LR_MAX_STEPS = int(os.environ.get("BTS_POSITION_LR_MAX_STEPS", str(ITERATIONS)))
+if ITERATIONS <= 0 or POSITION_LR_MAX_STEPS <= 0:
+    raise ValueError("BTS_ITERATIONS and BTS_POSITION_LR_MAX_STEPS must be positive.")
+# These fixed held-out views are logged to WandB at every selected iteration,
+# so 30k/35k/40k can be compared without retaining several multi-GB PLYs.
+_requested_comparison_iterations = {
+    int(value.strip())
+    for value in os.environ.get("BTS_COMPARISON_ITERATIONS", "30000,35000,40000").split(",")
+    if value.strip()
+}
+COMPARISON_ITERATIONS = sorted(
+    iteration for iteration in _requested_comparison_iterations if 0 < iteration <= ITERATIONS
+)
+if ITERATIONS not in COMPARISON_ITERATIONS:
+    COMPARISON_ITERATIONS.append(ITERATIONS)
 # Use full resolution for thin BTS and cable details; set it to 2 only for a constrained rerun.
 TRAIN_RESOLUTION = int(os.environ.get("BTS_TRAIN_RESOLUTION", "1"))
 RENDER_RESOLUTION = int(os.environ.get("BTS_RENDER_RESOLUTION", "1"))
 USE_ANTIALIASING = os.environ.get("BTS_ANTIALIASING", "1").strip() != "0"
 RENDER_ENSEMBLE_SCALES = [
     float(scale.strip())
-    for scale in os.environ.get("BTS_RENDER_ENSEMBLE_SCALES", "1.5").split(",")
+    for scale in os.environ.get("BTS_RENDER_ENSEMBLE_SCALES", "1.0").split(",")
     if scale.strip()
 ]
 if not RENDER_ENSEMBLE_SCALES or any(scale < 1.0 for scale in RENDER_ENSEMBLE_SCALES):
     raise ValueError("BTS_RENDER_ENSEMBLE_SCALES must contain one or more scales >= 1.0.")
+# Close-range objects need native-resolution detail rather than the BTS
+# multi-scale smoothing pass.  This remains overrideable for ablations.
+CLOSEUP_RENDER_ENSEMBLE_SCALES = [
+    float(scale.strip())
+    for scale in os.environ.get("BTS_CLOSEUP_RENDER_ENSEMBLE_SCALES", "1.0").split(",")
+    if scale.strip()
+]
+if not CLOSEUP_RENDER_ENSEMBLE_SCALES or any(scale < 1.0 for scale in CLOSEUP_RENDER_ENSEMBLE_SCALES):
+    raise ValueError("BTS_CLOSEUP_RENDER_ENSEMBLE_SCALES must contain one or more scales >= 1.0.")
 # Upper bound only, never a target.  Override it without editing the notebook.
 MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "5000000"))
+DENSIFY_GRAD_THRESHOLD = float(os.environ.get("BTS_DENSIFY_GRAD_THRESHOLD", "0.00012"))
+DENSIFY_UNTIL_ITER = int(os.environ.get("BTS_DENSIFY_UNTIL_ITER", "15000"))
+PERCENT_DENSE = float(os.environ.get("BTS_PERCENT_DENSE", "0.005"))
+if DENSIFY_GRAD_THRESHOLD <= 0 or DENSIFY_UNTIL_ITER <= 0 or not 0 < PERCENT_DENSE <= 1:
+    raise ValueError("BTS densification settings must be positive, and BTS_PERCENT_DENSE must be in (0, 1].")
 FOREGROUND_LOSS_WEIGHT = float(os.environ.get("BTS_FOREGROUND_LOSS_WEIGHT", "6.0"))
 FOREGROUND_EDGE_LOSS_WEIGHT = float(os.environ.get("BTS_FOREGROUND_EDGE_LOSS_WEIGHT", "0.05"))
 MAX_WORKERS = int(os.environ.get("BTS_MAX_WORKERS", "2"))
@@ -72,17 +104,17 @@ VALIDATION_FRACTION = float(os.environ.get("BTS_VALIDATION_FRACTION", "0.05"))
 # Offset checkpoint writes per GPU so two large archives do not saturate the
 # small Kaggle working disk at the same iteration.
 CHECKPOINT_STAGGER_SECONDS = float(os.environ.get("BTS_CHECKPOINT_STAGGER_SECONDS", "90"))
-PRIVATE_SET1_SCENES = [
-    "HCM0249",
-    "HCM0254",
-    "HCM0276",
-    "HCM1439",
-    "HNI0131",
-    "HNI0265",
-    "HNI0366",
-    "HNI0437",
+TARGET_SCENES = [
+    "bonsai",
+    "chair",
+    "HCM0421",
+    "HCM0539",
+    "HCM0540",
+    "HCM0644",
+    "HCM0674",
 ]
-SCENE_FILTER = os.environ.get("BTS_SCENES", ",".join(PRIVATE_SET1_SCENES)).strip()
+CLOSEUP_SCENES = frozenset({"bonsai", "chair"})
+SCENE_FILTER = os.environ.get("BTS_SCENES", ",".join(TARGET_SCENES)).strip()
 
 def get_secret(name):
     value = os.environ.get(name, "").strip()
@@ -288,10 +320,14 @@ print(
 def find_data_root():
     for candidate in DATA_ROOT_CANDIDATES:
         if candidate and candidate.exists():
-            if (candidate / "private_set1").exists():
+            # Support both the legacy phase1/private_set1 mount and the new
+            # flat dataset mount.  Validate target names here so a generic
+            # Kaggle input directory is never selected by accident.
+            scene_base = candidate / "private_set1" if (candidate / "private_set1").exists() else candidate
+            if any((scene_base / name).is_dir() for name in TARGET_SCENES):
                 return candidate
     raise FileNotFoundError(
-        "Could not find phase1 data root. Set BTS_DATA_DIR to the folder containing private_set1."
+        "Could not find the dataset root. Set BTS_DATA_DIR to the folder containing the seven scene directories."
     )
 
 
@@ -301,36 +337,34 @@ def is_scene_dir(path):
 
 
 def discover_scenes(data_root):
-    split_dir = data_root / "private_set1"
-    if not split_dir.exists():
-        raise FileNotFoundError(f"private_set1 not found under {data_root}")
+    split_dir = data_root / "private_set1" if (data_root / "private_set1").exists() else data_root
 
     if SCENE_FILTER:
         wanted = {x.strip() for x in SCENE_FILTER.split(",") if x.strip()}
     else:
-        wanted = set(PRIVATE_SET1_SCENES)
+        wanted = set(TARGET_SCENES)
 
-    unknown = sorted(wanted - set(PRIVATE_SET1_SCENES))
+    unknown = sorted(wanted - set(TARGET_SCENES))
     if unknown:
-        raise ValueError(f"BTS_SCENES contains names outside private_set1 target list: {unknown}")
+        raise ValueError(f"BTS_SCENES contains names outside the target scene list: {unknown}")
 
-    scenes = [split_dir / name for name in PRIVATE_SET1_SCENES if name in wanted]
+    scenes = [split_dir / name for name in TARGET_SCENES if name in wanted]
     missing_dirs = [p.name for p in scenes if not p.exists()]
     invalid_dirs = [p.name for p in scenes if p.exists() and not is_scene_dir(p)]
     if missing_dirs:
-        raise FileNotFoundError(f"Missing private_set1 scene dirs: {missing_dirs}")
+        raise FileNotFoundError(f"Missing target scene dirs: {missing_dirs}")
     if invalid_dirs:
         raise RuntimeError(f"Invalid private_set1 scene dirs, missing train/sparse or sparse: {invalid_dirs}")
 
     if not scenes:
-        raise RuntimeError(f"No selected private_set1 scenes found under {split_dir}")
+        raise RuntimeError(f"No selected target scenes found under {split_dir}")
     return scenes
 
 
 DATA_ROOT = find_data_root()
 ALL_SCENES = discover_scenes(DATA_ROOT)
 print(f"DATA_ROOT: {DATA_ROOT}")
-print(f"Private set1 scenes ({len(ALL_SCENES)}): {[p.name for p in ALL_SCENES]}")
+print(f"Target scenes ({len(ALL_SCENES)}): {[p.name for p in ALL_SCENES]}")
 
 
 def train_root(scene_path):
@@ -350,10 +384,12 @@ def optional_depth_args(scene_path):
     root = train_root(scene_path)
     depth_params = root / "sparse" / "0" / "depth_params.json"
     if not depth_params.exists():
+        print(f"[{Path(scene_path).name}] no Depth Anything metadata; depth regularization is disabled.")
         return []
     for name in ["depths_any", "depth_anything", "depths", "depth"]:
         if (root / name).is_dir():
             return ["--depths", name]
+    print(f"[{Path(scene_path).name}] Depth Anything metadata exists but no depth map directory was found; depth regularization is disabled.")
     return []
 
 
@@ -367,9 +403,9 @@ def optional_mask_args(scene_path):
             if SUPPORTS_FOREGROUND_WEIGHT:
                 args.extend(["--foreground_loss_weight", str(FOREGROUND_LOSS_WEIGHT)])
                 args.extend(["--foreground_edge_loss_weight", str(FOREGROUND_EDGE_LOSS_WEIGHT)])
-            print(f"[{Path(scene_path).name}] BTS masks: {root / name} (weight={FOREGROUND_LOSS_WEIGHT})")
+            print(f"[{Path(scene_path).name}] foreground masks: {root / name} (weight={FOREGROUND_LOSS_WEIGHT})")
             return args
-    print(f"[{Path(scene_path).name}] WARNING: no BTS foreground masks found; densification cannot preferentially focus on the BTS.")
+    print(f"[{Path(scene_path).name}] no foreground masks found; using image/depth losses only.")
     return []
 
 
@@ -537,21 +573,28 @@ print(f"Extracted {{args.out_ply}}")
 
 
 def scene_train_config(scene_path):
-    n = count_images(scene_path)
+    scene_name = Path(scene_path).name
     cfg = {
         "resolution": TRAIN_RESOLUTION,
-        "densify_grad_threshold": 0.00020,
-        "densify_until_iter": min(12000, ITERATIONS),
-        "checkpoint_iterations": sorted({7500, 15000, 25000, ITERATIONS}),
+        "densify_grad_threshold": DENSIFY_GRAD_THRESHOLD,
+        "densify_until_iter": min(DENSIFY_UNTIL_ITER, ITERATIONS),
+        "percent_dense": PERCENT_DENSE,
+        "depth_weight_init": float(os.environ.get("BTS_DEPTH_WEIGHT_INIT", "0.02")),
+        "checkpoint_iterations": COMPARISON_ITERATIONS,
         "max_gaussians": MAX_GAUSSIANS,
         "position_lr_init": float(os.environ.get("BTS_POSITION_LR_INIT", "0.00016")),
+        "position_lr_max_steps": POSITION_LR_MAX_STEPS,
     }
-    if n <= 180:
-        cfg["densify_grad_threshold"] = 0.00016
-        cfg["densify_until_iter"] = min(15000, ITERATIONS)
-    elif n >= 280:
-        cfg["densify_grad_threshold"] = 0.00024
-        cfg["densify_until_iter"] = min(10000, ITERATIONS)
+    if scene_name in CLOSEUP_SCENES:
+        # bonsai/chair are compact, close-range 360-degree captures.  Smaller
+        # split/clone scale and a lower gradient gate create tighter Gaussians;
+        # Depth Anything remains a weak anchor instead of flattening fine shape.
+        cfg.update({
+            "densify_grad_threshold": float(os.environ.get("BTS_CLOSEUP_DENSIFY_GRAD_THRESHOLD", "0.00012")),
+            "densify_until_iter": min(int(os.environ.get("BTS_CLOSEUP_DENSIFY_UNTIL_ITER", "15000")), ITERATIONS),
+            "percent_dense": float(os.environ.get("BTS_CLOSEUP_PERCENT_DENSE", "0.005")),
+            "depth_weight_init": float(os.environ.get("BTS_CLOSEUP_DEPTH_WEIGHT_INIT", "0.01")),
+        })
     return cfg
 
 
@@ -559,6 +602,11 @@ def build_train_cmd(scene_path, gpu_id):
     scene_name = Path(scene_path).name
     out_dir = scene_output(scene_path)
     cfg = scene_train_config(scene_path)
+    print(
+        f"[{scene_name}] profile={'closeup' if scene_name in CLOSEUP_SCENES else 'bts'} "
+        f"| dense={cfg['percent_dense']} | grad={cfg['densify_grad_threshold']} "
+        f"| depth_weight={cfg['depth_weight_init']} | compare={cfg['checkpoint_iterations']}"
+    )
     resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1)
     if resume is None:
         resume = latest_input_checkpoint(scene_path, max_iter=ITERATIONS - 1)
@@ -582,12 +630,16 @@ def build_train_cmd(scene_path, gpu_id):
         "0.2",
         "--position_lr_init",
         str(cfg["position_lr_init"]),
+        "--position_lr_max_steps",
+        str(cfg["position_lr_max_steps"]),
         "--densification_interval",
         "100",
         "--densify_grad_threshold",
         str(cfg["densify_grad_threshold"]),
         "--densify_until_iter",
         str(cfg["densify_until_iter"]),
+        "--percent_dense",
+        str(cfg["percent_dense"]),
         "--opacity_reset_interval",
         "3000",
         "--min_free_disk_gb",
@@ -595,7 +647,7 @@ def build_train_cmd(scene_path, gpu_id):
         "--disk_check_interval",
         str(DISK_CHECK_INTERVAL),
         "--depth_weight_init",
-        "0.02",
+        str(cfg["depth_weight_init"]),
         "--test_iterations",
         "-1",
         "--validation_iterations",
@@ -653,6 +705,7 @@ def build_train_cmd(scene_path, gpu_id):
 
 def build_render_cmd(scene_path, gpu_id, iteration):
     out_dir = scene_output(scene_path)
+    ensemble_scales = CLOSEUP_RENDER_ENSEMBLE_SCALES if Path(scene_path).name in CLOSEUP_SCENES else RENDER_ENSEMBLE_SCALES
     cmd = [
         sys.executable,
         REPO_DIR / "render.py",
@@ -669,7 +722,7 @@ def build_render_cmd(scene_path, gpu_id, iteration):
         "3",
         "--quiet",
         "--ensemble_scales",
-        *[str(scale) for scale in RENDER_ENSEMBLE_SCALES],
+        *[str(scale) for scale in ensemble_scales],
     ]
     if USE_ANTIALIASING:
         cmd.append("--antialiasing")
@@ -863,7 +916,10 @@ def worker(scene):
 
 
 print("=" * 80)
-print(f"Starting pipeline: {len(ALL_SCENES)} scenes, GPUs={GPU_IDS}, iterations={ITERATIONS}")
+print(
+    f"Starting pipeline: {len(ALL_SCENES)} scenes, GPUs={GPU_IDS}, iterations={ITERATIONS}, "
+    f"comparison/validation={COMPARISON_ITERATIONS}"
+)
 print("=" * 80)
 
 results = []

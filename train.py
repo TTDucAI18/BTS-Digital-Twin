@@ -27,7 +27,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.training_utils import evenly_spaced_holdout_indices, foreground_edge_l1, foreground_weighted_l1, natural_image_key
+from utils.training_utils import evenly_spaced_holdout_indices, foreground_edge_l1, foreground_weighted_l1, image_edge_l1, natural_image_key
 try:
     import wandb
     WANDB_FOUND = True
@@ -147,17 +147,23 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
         else:
             return base_weight * 0.05
 
-    # Hold out evenly spaced training views for novel-view validation.  Do not
-    # select from the shuffled Scene order: neighbouring capture indices often
-    # have nearly identical poses, so a uniform split by natural image index is
-    # more representative than a random contiguous cluster.
+    # Keep a deterministic set of capture views for visual monitoring.  The
+    # competition rewards reconstruction quality, not a held-out score, so by
+    # default every available training image still contributes gradients.
     ordered_train_cams = sorted(scene.getTrainCameras(), key=lambda camera: natural_image_key(camera.image_name))
     val_indices = evenly_spaced_holdout_indices(len(ordered_train_cams), args.validation_fraction)
     val_cameras = [camera for i, camera in enumerate(ordered_train_cams) if i in val_indices]
-    train_cameras = [camera for i, camera in enumerate(ordered_train_cams) if i not in val_indices]
+    if args.validation_holdout:
+        train_cameras = [camera for i, camera in enumerate(ordered_train_cams) if i not in val_indices]
+        validation_name = "validation"
+        train_mode = "holdout"
+    else:
+        train_cameras = ordered_train_cams
+        validation_name = "fixed_train_monitor"
+        train_mode = "full-data"
     print(
-        f"Validation holdout: {len(val_cameras)}/{len(ordered_train_cams)} views "
-        f"({100 * len(val_cameras) / len(ordered_train_cams):.1f}%), evenly spaced by image index."
+        f"Fixed monitor: {len(val_cameras)}/{len(ordered_train_cams)} views "
+        f"({100 * len(val_cameras) / len(ordered_train_cams):.1f}%), mode={train_mode}."
     )
 
     # Phục hồi Exposure Compensation (giúp giảm mây mờ / floaters do chênh lệch độ sáng giữa các ảnh từ camera drone)
@@ -174,6 +180,11 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    epoch_loss_sum = 0.0
+    epoch_l1_sum = 0.0
+    epoch_ssim_sum = 0.0
+    epoch_samples = 0
+    completed_epochs = 0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress", file=sys.stdout)
     first_iter += 1
@@ -250,6 +261,11 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
             foreground_edge_loss = foreground_edge_l1(image_for_loss, gt_image, fg_mask)
             loss += opt.foreground_edge_loss_weight * foreground_edge_loss
 
+        image_edge_loss = 0.0
+        if opt.image_edge_loss_weight > 0.0:
+            image_edge_loss = image_edge_l1(image_for_loss, gt_image)
+            loss += opt.image_edge_loss_weight * image_edge_loss
+
         # ── KHẮC PHỤC LỖI TOÁN HỌC: Depth Regularization (Chống Exploding Gradients) ────
         Ll1depth_pure = 0.0
         current_depth_weight = get_depth_weight(iteration, base_weight=opt.depth_weight_init)
@@ -282,6 +298,10 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
         iter_end.record()
 
         with torch.no_grad():
+            epoch_loss_sum += loss.item()
+            epoch_l1_sum += Ll1.item()
+            epoch_ssim_sum += ssim_value.item()
+            epoch_samples += 1
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
@@ -294,6 +314,12 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
             if WANDB_FOUND and wandb.run is not None and iteration % args.wandb_log_interval == 0:
                 wandb.log({
                     "iteration": iteration,
+                    # These are deliberately named as single-view values.
+                    # They vary with the sampled camera and are not a
+                    # convergence criterion on their own.
+                    "train/view_loss": loss.item(),
+                    "train/view_l1_loss": Ll1.item(),
+                    "train/view_ssim": ssim_value.item(),
                     "train/loss": loss.item(),
                     "train/l1_loss": Ll1.item(),
                     "train/ssim": ssim_value.item(),
@@ -305,9 +331,31 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                         if hasattr(foreground_edge_loss, "item") else float(foreground_edge_loss)
                     ),
                     "train/foreground_edge_weight": opt.foreground_edge_loss_weight,
+                    "train/image_edge_loss": (
+                        image_edge_loss.item()
+                        if hasattr(image_edge_loss, "item") else float(image_edge_loss)
+                    ),
+                    "train/image_edge_weight": opt.image_edge_loss_weight,
                     "train/epoch": epoch,
                     "scene/total_points": gaussians.get_xyz.shape[0],
                 }, step=iteration)
+
+            # A camera stack is consumed without replacement.  Log its mean
+            # once per full pass so WandB exposes a stable convergence signal.
+            if not viewpoint_stack and epoch_samples:
+                completed_epochs += 1
+                if WANDB_FOUND and wandb.run is not None:
+                    wandb.log({
+                        "iteration": iteration,
+                        "train_epoch/loss": epoch_loss_sum / epoch_samples,
+                        "train_epoch/l1_loss": epoch_l1_sum / epoch_samples,
+                        "train_epoch/ssim": epoch_ssim_sum / epoch_samples,
+                        "train_epoch/index": completed_epochs,
+                    }, step=iteration)
+                epoch_loss_sum = 0.0
+                epoch_l1_sum = 0.0
+                epoch_ssim_sum = 0.0
+                epoch_samples = 0
 
             stop_after_checkpoint = False
             if iteration % args.disk_check_interval == 0:
@@ -322,7 +370,7 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), validation_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE), val_cameras)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), validation_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE), val_cameras, validation_name)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 # FIX BUG 4: Free VRAM before writing large PLY to disk.
@@ -338,7 +386,11 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    size_threshold = (
+                        opt.max_screen_size
+                        if iteration > opt.opacity_reset_interval and opt.max_screen_size > 0
+                        else None
+                    )
                     if opt.max_gaussians <= 0 or gaussians.get_xyz.shape[0] < opt.max_gaussians:
                         gaussians.densify_and_prune(
                             opt.densify_grad_threshold, 0.005, scene.cameras_extent,
@@ -357,7 +409,15 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                         gaussians.tmp_radii = None
                         torch.cuda.empty_cache()
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                reset_is_due = (
+                    opt.opacity_reset_interval > 0
+                    and iteration % opt.opacity_reset_interval == 0
+                )
+                reset_is_allowed = (
+                    opt.opacity_reset_until_iter <= 0
+                    or iteration <= opt.opacity_reset_until_iter
+                )
+                if (reset_is_due and reset_is_allowed) or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
             # Optimizer step
@@ -460,6 +520,7 @@ def prepare_output_and_logger(args):
                 print(f"[WandB] Init attempt {_wandb_attempt + 1} failed ({_wandb_exc}); retrying in {_delay}s...")
                 time.sleep(_delay)
         wandb.define_metric("train/*", step_metric="iteration")
+        wandb.define_metric("train_epoch/*", step_metric="iteration")
         wandb.define_metric("scene/*", step_metric="iteration")
         wandb.log({"run/started": 1, "iteration": 0}, step=0)
         
@@ -473,7 +534,7 @@ def prepare_output_and_logger(args):
         
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validation_iterations, scene : Scene, renderFunc, renderArgs, val_cameras):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validation_iterations, scene : Scene, renderFunc, renderArgs, val_cameras, validation_name):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -483,7 +544,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validatio
     # out train views can produce meaningful image-space evaluation metrics.
     if iteration in validation_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'validation', 'cameras': val_cameras},)
+        validation_configs = ({'name': validation_name, 'cameras': val_cameras},)
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -496,7 +557,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validatio
                         gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                         if tb_writer and (idx < 5):
                             tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                            if iteration == testing_iterations[0]:
+                            if validation_iterations and iteration == validation_iterations[0]:
                                 tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                         if WANDB_FOUND and wandb.run is not None and (idx < 5):
                             has_gt = (hasattr(viewpoint, 'original_image') 
@@ -552,7 +613,12 @@ if __name__ == "__main__":
         "--validation_fraction",
         type=float,
         default=0.05,
-        help="Fraction of train images held out evenly by natural image index.",
+        help="Fraction of train images selected evenly as a fixed monitor set.",
+    )
+    parser.add_argument(
+        "--validation_holdout",
+        action="store_true",
+        help="Exclude fixed validation views from training. Disabled by default to maximise reconstruction coverage.",
     )
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")

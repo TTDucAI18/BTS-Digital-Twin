@@ -51,3 +51,29 @@ def foreground_edge_l1(rendered, target, foreground_mask):
     numerator = (error_x * mask_x).sum() + (error_y * mask_y).sum()
     denominator = mask_x.sum() + mask_y.sum() + 1e-6
     return numerator / denominator
+
+
+def image_edge_l1(rendered, target, edge_strength=4.0):
+    """Match image gradients, with extra weight on high-contrast target edges.
+
+    Unlike a semantic foreground mask this remains usable when a scene has no
+    masks.  It gives chair perforations, thin legs, and object silhouettes more
+    gradient signal while keeping a modest weight on broad background changes.
+    """
+    render_x = rendered[:, :, 1:] - rendered[:, :, :-1]
+    render_y = rendered[:, 1:, :] - rendered[:, :-1, :]
+    target_x = target[:, :, 1:] - target[:, :, :-1]
+    target_y = target[:, 1:, :] - target[:, :-1, :]
+
+    error_x = torch.abs(render_x - target_x).mean(dim=0, keepdim=True)
+    error_y = torch.abs(render_y - target_y).mean(dim=0, keepdim=True)
+    target_edge_x = torch.abs(target_x).mean(dim=0, keepdim=True)
+    target_edge_y = torch.abs(target_y).mean(dim=0, keepdim=True)
+
+    # Per-image normalization makes the weighting stable across bright and dark
+    # frames; the clamp prevents a handful of window highlights dominating.
+    scale_x = target_edge_x.mean().clamp_min(1e-6)
+    scale_y = target_edge_y.mean().clamp_min(1e-6)
+    weight_x = 1.0 + edge_strength * (target_edge_x / scale_x).clamp(max=5.0)
+    weight_y = 1.0 + edge_strength * (target_edge_y / scale_y).clamp(max=5.0)
+    return ((error_x * weight_x).sum() + (error_y * weight_y).sum()) / (weight_x.sum() + weight_y.sum() + 1e-6)

@@ -94,12 +94,20 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
+        # 0 keeps the legacy behaviour of resetting throughout densification.
+        # Scene profiles can stop resets early so mature distant backgrounds do
+        # not keep getting erased while foreground detail is still splitting.
+        self.opacity_reset_until_iter = 0
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.00015
+        # Gaussians larger than this screen-space radius are pruned after the
+        # first opacity reset.  Set to 0 to disable that specific pruning rule.
+        self.max_screen_size = 20
         self.max_gaussians = 0
         self.foreground_loss_weight = 0.0
         self.foreground_edge_loss_weight = 0.05
+        self.image_edge_loss_weight = 0.0
         # Not checkpointed and cannot be inferred for unseen test cameras.
         self.use_exposure_compensation = False
         # Hybrid Depth Scheduler (TASK 2): base weight for DA-v2 depth regularization.

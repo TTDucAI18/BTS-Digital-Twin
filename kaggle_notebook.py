@@ -110,12 +110,40 @@ KAGGLE_STOP_BUFFER_MIN = float(os.environ.get("BTS_STOP_BUFFER_MIN", "30"))
 MIN_FREE_DISK_GB = float(os.environ.get("BTS_MIN_FREE_DISK_GB", "2.0"))
 DISK_CHECK_INTERVAL = int(os.environ.get("BTS_DISK_CHECK_INTERVAL", "100"))
 WANDB_LOG_INTERVAL = int(os.environ.get("BTS_WANDB_LOG_INTERVAL", "100"))
-# Hold out uniformly distributed capture views for model selection.  These are
-# train images only; Kaggle test poses have no ground-truth images.
+# Fixed train-view monitor used for model selection.  Test poses have no ground
+# truth, so this is the only image-space signal available during a Kaggle run.
+# By default the monitor views remain in training: novel-view coverage matters
+# more than a strict holdout for the final competition reconstruction.
 VALIDATION_FRACTION = float(os.environ.get("BTS_VALIDATION_FRACTION", "0.05"))
+VALIDATION_HOLDOUT = os.environ.get("BTS_VALIDATION_HOLDOUT", "0").strip() == "1"
+# Resume an interrupted run from its own output by default.  Input checkpoints
+# can be from a different data/preprocessing/configuration generation, so they
+# are deliberately opt-in for quality-sensitive reruns.
+RESUME_LOCAL = os.environ.get("BTS_RESUME_LOCAL", "1").strip() != "0"
+RESUME_INPUT = os.environ.get("BTS_RESUME_INPUT", "0").strip() == "1"
 # Offset checkpoint writes per GPU so two large archives do not saturate the
 # small Kaggle working disk at the same iteration.
 CHECKPOINT_STAGGER_SECONDS = float(os.environ.get("BTS_CHECKPOINT_STAGGER_SECONDS", "90"))
+if (
+    TRAIN_RESOLUTION <= 0
+    or RENDER_RESOLUTION <= 0
+    or MAX_GAUSSIANS < 0
+    or FOREGROUND_LOSS_WEIGHT < 0
+    or FOREGROUND_EDGE_LOSS_WEIGHT < 0
+    or MAX_WORKERS <= 0
+    or KAGGLE_TIME_LIMIT_H <= 0
+    or KAGGLE_STOP_BUFFER_MIN < 0
+    or MIN_FREE_DISK_GB < 0
+    or DISK_CHECK_INTERVAL <= 0
+    or WANDB_LOG_INTERVAL <= 0
+    or not 0.0 < VALIDATION_FRACTION < 1.0
+    or CHECKPOINT_STAGGER_SECONDS < 0
+):
+    raise ValueError(
+        "Invalid BTS configuration: resolutions/workers/intervals must be positive; "
+        "weights, disk threshold, and checkpoint stagger must be non-negative; "
+        "BTS_VALIDATION_FRACTION must be in (0, 1)."
+    )
 TARGET_SCENES = [
     "bonsai",
     "chair",
@@ -606,7 +634,7 @@ def final_iteration(out_dir):
     ckpt = latest_checkpoint(out_dir)
     if ckpt:
         iters.append(checkpoint_iter(ckpt))
-    return max(iters) if iters else ITERATIONS
+    return max(iters) if iters else 0
 
 
 def ensure_ply_from_checkpoint(out_dir, iteration):
@@ -652,7 +680,7 @@ print(f"Extracted {{args.out_ply}}")
         encoding="utf-8",
     )
     rc = run([sys.executable, helper, "--checkpoint", ckpt, "--out_ply", ply], cwd=REPO_DIR, check=False)
-    return rc == 0 and ply.exists()
+    return rc == 0 and is_valid_ply(ply)
 
 
 def scene_train_config(scene_path):
@@ -665,6 +693,9 @@ def scene_train_config(scene_path):
         "depth_weight_init": float(os.environ.get("BTS_DEPTH_WEIGHT_INIT", "0.02")),
         "checkpoint_iterations": COMPARISON_ITERATIONS,
         "max_gaussians": MAX_GAUSSIANS,
+        "max_screen_size": int(os.environ.get("BTS_MAX_SCREEN_SIZE", "20")),
+        "opacity_reset_until_iter": int(os.environ.get("BTS_OPACITY_RESET_UNTIL_ITER", "0")),
+        "image_edge_loss_weight": float(os.environ.get("BTS_IMAGE_EDGE_LOSS_WEIGHT", "0.0")),
         "position_lr_init": float(os.environ.get("BTS_POSITION_LR_INIT", "0.00016")),
         "position_lr_max_steps": POSITION_LR_MAX_STEPS,
     }
@@ -674,10 +705,33 @@ def scene_train_config(scene_path):
         # Depth Anything remains a weak anchor instead of flattening fine shape.
         cfg.update({
             "densify_grad_threshold": float(os.environ.get("BTS_CLOSEUP_DENSIFY_GRAD_THRESHOLD", "0.00012")),
-            "densify_until_iter": min(int(os.environ.get("BTS_CLOSEUP_DENSIFY_UNTIL_ITER", "15000")), ITERATIONS),
+            # Glass, foliage, and narrow furniture edges in the close-up scenes
+            # need geometry creation beyond the generic 15k cutoff.  This is
+            # still bounded and can be lowered via the environment on a T4.
+            "densify_until_iter": min(int(os.environ.get("BTS_CLOSEUP_DENSIFY_UNTIL_ITER", "20000")), ITERATIONS),
             "percent_dense": float(os.environ.get("BTS_CLOSEUP_PERCENT_DENSE", "0.005")),
             "depth_weight_init": float(os.environ.get("BTS_CLOSEUP_DEPTH_WEIGHT_INIT", "0.01")),
+            # Keep large, distant window/background splats long enough to
+            # converge, while a weak image-edge loss protects chair holes and
+            # other high-contrast close-range structure without needing masks.
+            "max_screen_size": int(os.environ.get("BTS_CLOSEUP_MAX_SCREEN_SIZE", "64")),
+            "opacity_reset_until_iter": int(os.environ.get("BTS_CLOSEUP_OPACITY_RESET_UNTIL_ITER", "12000")),
+            "image_edge_loss_weight": float(os.environ.get("BTS_CLOSEUP_IMAGE_EDGE_LOSS_WEIGHT", "0.03")),
         })
+    invalid = (
+        cfg["densify_grad_threshold"] <= 0
+        or cfg["densify_until_iter"] <= 0
+        or not 0 < cfg["percent_dense"] <= 1
+        or cfg["depth_weight_init"] < 0
+        or cfg["max_gaussians"] < 0
+        or cfg["max_screen_size"] < 0
+        or cfg["opacity_reset_until_iter"] < 0
+        or cfg["image_edge_loss_weight"] < 0
+        or cfg["position_lr_init"] <= 0
+        or cfg["position_lr_max_steps"] <= 0
+    )
+    if invalid:
+        raise ValueError(f"[{scene_name}] invalid scene training configuration: {cfg}")
     return cfg
 
 
@@ -688,11 +742,16 @@ def build_train_cmd(scene_path, gpu_id):
     print(
         f"[{scene_name}] profile={'closeup' if scene_name in CLOSEUP_SCENES else 'bts'} "
         f"| dense={cfg['percent_dense']} | grad={cfg['densify_grad_threshold']} "
-        f"| depth_weight={cfg['depth_weight_init']} | compare={cfg['checkpoint_iterations']}"
+        f"| depth_weight={cfg['depth_weight_init']} | screen_prune={cfg['max_screen_size']} "
+        f"| edge_loss={cfg['image_edge_loss_weight']} | compare={cfg['checkpoint_iterations']}"
     )
-    resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1)
-    if resume is None:
+    resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1) if RESUME_LOCAL else None
+    if resume is not None:
+        print(f"[{scene_name}] resuming verified local checkpoint: {resume}")
+    elif RESUME_INPUT:
         resume = latest_input_checkpoint(scene_path, max_iter=ITERATIONS - 1)
+    else:
+        print(f"[{scene_name}] input-checkpoint resume disabled; starting clean if no local checkpoint exists.")
 
     cmd = [
         sys.executable,
@@ -725,6 +784,12 @@ def build_train_cmd(scene_path, gpu_id):
         str(cfg["percent_dense"]),
         "--opacity_reset_interval",
         "3000",
+        "--opacity_reset_until_iter",
+        str(cfg["opacity_reset_until_iter"]),
+        "--max_screen_size",
+        str(cfg["max_screen_size"]),
+        "--image_edge_loss_weight",
+        str(cfg["image_edge_loss_weight"]),
         "--min_free_disk_gb",
         str(MIN_FREE_DISK_GB),
         "--disk_check_interval",
@@ -747,6 +812,8 @@ def build_train_cmd(scene_path, gpu_id):
         *optional_depth_args(scene_path),
         *optional_mask_args(scene_path),
     ]
+    if VALIDATION_HOLDOUT:
+        cmd.append("--validation_holdout")
 
     if SUPPORTS_MAX_GAUSSIANS:
         cmd.extend(["--max_gaussians", str(cfg["max_gaussians"])])
@@ -960,14 +1027,26 @@ def train_and_render_scene(scene_path, gpu_id):
         return scene_name, rc
 
     n = copy_renders_to_submission(scene_path, it)
-    if n > 0:
-        cleanup_intermediate(out_dir, it)
-        cleanup_scene_output_after_submission(out_dir)
-        free_gb, total_gb = disk_free_gb()
-        print(f"[{scene_name}] done. Disk: {free_gb:.1f}/{total_gb:.1f} GB free")
-        return scene_name, 0
+    if n <= 0:
+        return scene_name, 4
 
-    return scene_name, 4
+    actual_names = submission_names(scene_name)
+    if expected_names and actual_names != expected_names:
+        print(
+            f"[{scene_name}] render set is incomplete; preserving model for retry "
+            f"(expected={len(expected_names)}, got={len(actual_names)}, "
+            f"missing={len(expected_names - actual_names)}, "
+            f"extra={len(actual_names - expected_names)})."
+        )
+        return scene_name, 7
+
+    # Only reclaim the large model artifacts after the copied render set has
+    # passed the same exact-name contract that Cell 6 enforces at packaging.
+    cleanup_intermediate(out_dir, it)
+    cleanup_scene_output_after_submission(out_dir)
+    free_gb, total_gb = disk_free_gb()
+    print(f"[{scene_name}] done. Disk: {free_gb:.1f}/{total_gb:.1f} GB free")
+    return scene_name, 0
 
 
 # =============================================================================
@@ -979,7 +1058,7 @@ def scene_priority(scene_path):
     final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
     if is_valid_ply(final_ply) or is_valid_checkpoint(out_dir / f"chkpnt{ITERATIONS}.pth"):
         return 0
-    if latest_checkpoint(out_dir, max_iter=ITERATIONS - 1):
+    if RESUME_LOCAL and latest_checkpoint(out_dir, max_iter=ITERATIONS - 1):
         return 2
     return 1
 
@@ -1023,7 +1102,7 @@ with ThreadPoolExecutor(max_workers=len(GPU_IDS)) as executor:
         results.append(result)
         rc = result[1]
         rc_label = {0: "OK", 2: "timeout", 3: "no-PLY", 4: "no-renders",
-                    5: "low-disk", 6: "partial", 99: "exception"}.get(rc, f"rc={rc}")
+                    5: "low-disk", 6: "partial", 7: "invalid-render-set", 99: "exception"}.get(rc, f"rc={rc}")
         free_gb, _ = disk_free_gb()
         n_imgs = submission_image_count(scene_name)
         _pipeline_bar.set_postfix(scene=scene_name, status=rc_label, imgs=n_imgs,
@@ -1051,7 +1130,7 @@ if USE_WANDB:
     try:
         import wandb as _wandb
         _rows = [[name, rc, {0:"OK",2:"timeout",3:"no-PLY",4:"no-renders",
-                              5:"low-disk",6:"partial",99:"exception"}.get(rc, str(rc)),
+                              5:"low-disk",6:"partial",7:"invalid-render-set",99:"exception"}.get(rc, str(rc)),
                   submission_image_count(name)]
                  for name, rc in results]
         _wandb.log({"pipeline/summary": _wandb.Table(

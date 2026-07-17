@@ -6,6 +6,7 @@ from utils.training_utils import (
     evenly_spaced_holdout_indices,
     foreground_edge_l1,
     foreground_weighted_l1,
+    image_edge_l1,
     natural_image_key,
 )
 
@@ -32,6 +33,10 @@ class TrainingUtilsTests(unittest.TestCase):
         target = torch.tensor([[[0.0, 1.0, 1.0]], [[0.0, 1.0, 1.0]], [[0.0, 1.0, 1.0]]])
         mask = torch.tensor([[[0.0, 1.0, 1.0]]])
         self.assertAlmostEqual(foreground_edge_l1(rendered, target, mask).item(), 0.5, places=6)
+
+    def test_image_edge_l1_is_zero_for_matching_images(self):
+        image = torch.tensor([[[0.0, 1.0, 0.0]], [[0.0, 1.0, 0.0]], [[0.0, 1.0, 0.0]]])
+        self.assertAlmostEqual(image_edge_l1(image, image).item(), 0.0, places=6)
 
 
 if __name__ == "__main__":

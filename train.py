@@ -459,8 +459,14 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                     except:
                         return 0
                 all_ckpts = sorted(_glob.glob(os.path.join(scene.model_path, "chkpnt*.pth")), key=_ckpt_iter)
+                # Keep explicit milestone checkpoints (30k/35k/40k in the
+                # notebook) for recovery/model selection.  A checkpoint
+                # created by a disk/deadline stop remains protected through
+                # ``new_ckpt_path`` even when it is not a scheduled milestone.
+                protected_checkpoint_iterations = set(checkpoint_iterations)
                 for old_ckpt in all_ckpts:
-                    if old_ckpt != new_ckpt_path:
+                    old_iteration = _ckpt_iter(old_ckpt)
+                    if old_ckpt != new_ckpt_path and old_iteration not in protected_checkpoint_iterations:
                         try:
                             os.remove(old_ckpt)
                             print("[ITER {}] Deleted old checkpoint: {}".format(iteration, os.path.basename(old_ckpt)))

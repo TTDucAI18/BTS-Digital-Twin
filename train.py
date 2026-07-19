@@ -251,8 +251,14 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
             image_for_loss = torch.clamp(image * exp_modifier, 0.0, 1.0)
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
+        # Camera images are parked as FP16 and masks as uint8 when
+        # --data_device cpu is selected.  Convert only the sampled view on
+        # GPU, preserving the original FP32 loss numerics without retaining
+        # every full-resolution image/mask in host RAM.
+        gt_image = viewpoint_cam.original_image.cuda().float()
         fg_mask = viewpoint_cam.foreground_mask.cuda() if viewpoint_cam.foreground_mask is not None else None
+        if fg_mask is not None and fg_mask.dtype != torch.float32:
+            fg_mask = fg_mask.float().div_(255.0)
         if opt.foreground_loss_weight > 0.0 and fg_mask is not None:
             Ll1 = foreground_weighted_l1(image_for_loss, gt_image, fg_mask, opt.foreground_loss_weight)
         else:
@@ -572,7 +578,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validatio
                 with torch.no_grad():
                     for idx, viewpoint in enumerate(eval_cams):
                         image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                        gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                        gt_image = torch.clamp(viewpoint.original_image.to("cuda").float(), 0.0, 1.0)
                         if tb_writer and (idx < 5):
                             tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                             if validation_iterations and iteration == validation_iterations[0]:

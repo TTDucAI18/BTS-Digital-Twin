@@ -45,10 +45,11 @@ class Camera(nn.Module):
         self.alpha_mask = None
         if resized_image_rgb.shape[0] == 4:
             self.alpha_mask = resized_image_rgb[3:4, ...].to(self.data_device)
-        else: 
-            self.alpha_mask = torch.ones_like(resized_image_rgb[0:1, ...].to(self.data_device))
+        # RGB images have no alpha channel.  Keeping an all-ones tensor for
+        # every camera wastes ~1.2 GiB per 240-image HCM scene on CPU.
 
-        self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
+        image_dtype = torch.float16 if self.data_device.type == "cpu" else torch.float32
+        self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device, dtype=image_dtype)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
         self.foreground_mask = None
@@ -56,10 +57,15 @@ class Camera(nn.Module):
             foreground_mask = cv2.resize(foreground_mask, resolution, interpolation=cv2.INTER_NEAREST)
             if foreground_mask.ndim != 2:
                 foreground_mask = foreground_mask[..., 0]
-            foreground_mask = foreground_mask.astype(np.float32)
-            if foreground_mask.max() > 1.0:
-                foreground_mask /= 255.0
-            foreground_mask = np.clip(foreground_mask, 0.0, 1.0)
+            foreground_mask = np.clip(foreground_mask, 0.0, 255.0)
+            if self.data_device.type == "cpu":
+                # A binary mask needs one byte/pixel while parked in RAM. It
+                # is normalized only for the sampled camera on GPU.
+                foreground_mask = ((foreground_mask > 0).astype(np.uint8) * 255)
+            else:
+                foreground_mask = foreground_mask.astype(np.float32)
+                if foreground_mask.max() > 1.0:
+                    foreground_mask /= 255.0
             self.foreground_mask = torch.from_numpy(foreground_mask[None]).to(self.data_device)
 
         self.invdepthmap = None

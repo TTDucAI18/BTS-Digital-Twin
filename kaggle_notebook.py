@@ -18,6 +18,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -45,6 +46,14 @@ REPO_URL = os.environ.get("BTS_REPO_URL", "https://github.com/TTDucAI18/BTS-Digi
 REPO_REF = os.environ.get("BTS_REPO_REF", "main").strip()
 REPO_DIR = Path(os.environ.get("BTS_REPO_DIR", "/kaggle/working/BTS-Digital-Twin"))
 OUTPUT_DIR = Path(os.environ.get("BTS_OUTPUT_DIR", "/kaggle/working/output"))
+# This directory is deliberately outside each scene's model directory.  A
+# completed checkpoint survives cleanup of model artifacts and is easy to add
+# to a Kaggle output dataset after an interrupted session.
+CHECKPOINT_DIR = Path(os.environ.get("BTS_CHECKPOINT_DIR", "/kaggle/working/checkpoints"))
+# Optional read-only Kaggle Input containing extracted checkpoint folders.  It
+# is intentionally separate from CHECKPOINT_DIR: /kaggle/input is read-only,
+# while new 40k checkpoints must be published under /kaggle/working.
+CHECKPOINT_INPUT_DIR = Path(os.environ.get("BTS_CHECKPOINT_INPUT_DIR", str(CHECKPOINT_DIR)))
 SUBMISSION_DIR = Path(os.environ.get("BTS_SUBMISSION_DIR", "/kaggle/working/submission"))
 SUBMISSION_ZIP = Path(os.environ.get("BTS_SUBMISSION_ZIP", "/kaggle/working/submission.zip"))
 
@@ -157,6 +166,9 @@ KEEP_MODEL_ARTIFACTS = os.environ.get("BTS_KEEP_MODEL_ARTIFACTS", "0").strip() =
 # Offset checkpoint writes per GPU so two large archives do not saturate the
 # small Kaggle working disk at the same iteration.
 CHECKPOINT_STAGGER_SECONDS = float(os.environ.get("BTS_CHECKPOINT_STAGGER_SECONDS", "90"))
+# Retaining every 5M-Gaussian checkpoint can fill Kaggle's working disk.  Keep
+# the two newest verified backups per scene (for example 35000 and 40000).
+CHECKPOINT_BACKUP_KEEP = int(os.environ.get("BTS_CHECKPOINT_BACKUP_KEEP", "2"))
 if (
     TRAIN_RESOLUTION <= 0
     or RENDER_RESOLUTION <= 0
@@ -172,6 +184,7 @@ if (
     or SUBPROCESS_HEARTBEAT_SECONDS <= 0
     or not 0.0 < VALIDATION_FRACTION < 1.0
     or CHECKPOINT_STAGGER_SECONDS < 0
+    or CHECKPOINT_BACKUP_KEEP <= 0
 ):
     raise ValueError(
         "Invalid BTS configuration: resolutions/workers/intervals must be positive; "
@@ -226,6 +239,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSION_START = time.time()
@@ -710,9 +724,17 @@ def scene_output(scene_path):
 
 
 def checkpoint_iter(path):
+    """Read the iteration from local or archived checkpoint names.
+
+    Accepted names include ``chkpnt35000.pth`` and the durable archive form
+    ``chkpnt35000_hcm0421.pth``.
+    """
     try:
-        return int(Path(path).name.replace("chkpnt", "").replace(".pth", ""))
-    except ValueError:
+        stem = Path(path).stem
+        if not stem.startswith("chkpnt"):
+            return -1
+        return int(stem[len("chkpnt"):].split("_", 1)[0])
+    except (TypeError, ValueError):
         return -1
 
 
@@ -725,7 +747,10 @@ def is_valid_checkpoint(path):
             if zf.testzip() is not None:
                 return False
         import torch
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        # CRC is checked above.  ``meta`` validates the pickle structure and
+        # iteration without materialising multi-GB Gaussian tensors in CPU
+        # RAM while two scenes are being resumed concurrently.
+        payload = torch.load(path, map_location="meta", weights_only=False)
         return (
             isinstance(payload, tuple)
             and len(payload) == 2
@@ -734,6 +759,99 @@ def is_valid_checkpoint(path):
         )
     except Exception:
         return False
+
+
+def checkpoint_backup_path(scene_name, iteration):
+    """Return the canonical extracted-checkpoint directory name."""
+    safe_scene = "".join(
+        char.lower() if char.isalnum() or char in {"-", "_"} else "_"
+        for char in str(scene_name)
+    )
+    return CHECKPOINT_DIR / f"chkpnt{iteration}_{safe_scene}"
+
+
+def is_valid_checkpoint_archive(path):
+    """Cheap structural validation for an extracted PyTorch checkpoint."""
+    path = Path(path)
+    if not path.is_dir():
+        return False
+    # torch.save writes a zip root such as .chkpnt35000.<random>/data.pkl.
+    return any(
+        child.is_file() and child.name == "data.pkl" and (child.parent / "data").is_dir()
+        for child in path.rglob("data.pkl")
+    )
+
+
+def pack_checkpoint_archive(archive_dir, destination):
+    """Recreate a torch-compatible .pth zip from an extracted archive folder."""
+    archive_dir, destination = Path(archive_dir), Path(destination)
+    if not is_valid_checkpoint_archive(archive_dir):
+        return False
+    try:
+        with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_STORED) as zf:
+            for entry in archive_dir.rglob("*"):
+                if entry.is_file():
+                    zf.write(entry, entry.relative_to(archive_dir).as_posix())
+        return is_valid_checkpoint(destination)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        return False
+
+
+def archive_checkpoint(scene_name, source):
+    """Extract a verified .pth into a durable per-scene archive directory."""
+    source = Path(source)
+    iteration = checkpoint_iter(source)
+    if iteration <= 0 or not is_valid_checkpoint(source):
+        print(f"[{scene_name}] refusing to archive invalid checkpoint: {source}")
+        return None
+
+    destination = checkpoint_backup_path(scene_name, iteration)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=CHECKPOINT_DIR))
+    try:
+        with zipfile.ZipFile(source, "r") as zf:
+            if zf.testzip() is not None:
+                raise RuntimeError("source checkpoint CRC validation failed")
+            zf.extractall(temporary)
+        if not is_valid_checkpoint_archive(temporary):
+            raise RuntimeError("extracted checkpoint has no data.pkl/data payload")
+        if destination.exists():
+            shutil.rmtree(destination)
+        os.replace(temporary, destination)
+    except Exception as exc:
+        shutil.rmtree(temporary, ignore_errors=True)
+        print(f"[{scene_name}] checkpoint archive failed: {exc}")
+        return None
+
+    scene_suffix = f"_{destination.name.split('_', 1)[1]}"
+    backups = sorted(
+        (path for path in CHECKPOINT_DIR.glob(f"chkpnt*{scene_suffix}") if path.is_dir()),
+        key=checkpoint_iter,
+        reverse=True,
+    )
+    for stale in backups[CHECKPOINT_BACKUP_KEEP:]:
+        shutil.rmtree(stale, ignore_errors=True)
+    print(f"[{scene_name}] verified checkpoint backup: {destination}")
+    return destination
+
+
+def restore_archived_checkpoint(scene_name, out_dir, source):
+    """Atomically hydrate an archived checkpoint into train.py's model path."""
+    source = Path(source)
+    destination = Path(out_dir) / f"chkpnt{checkpoint_iter(source)}.pth"
+    if is_valid_checkpoint(destination):
+        return destination
+    temporary = destination.with_suffix(destination.suffix + ".restore.tmp")
+    try:
+        if not pack_checkpoint_archive(source, temporary):
+            raise RuntimeError("repacked checkpoint failed CRC/torch.load validation")
+        os.replace(temporary, destination)
+        print(f"[{scene_name}] restored verified checkpoint: {source} -> {destination}")
+        return destination
+    except Exception as exc:
+        temporary.unlink(missing_ok=True)
+        print(f"[{scene_name}] checkpoint restore failed: {exc}")
+        return None
 
 
 def is_valid_ply(path):
@@ -756,6 +874,32 @@ def latest_checkpoint(out_dir, max_iter=None):
             continue
         if is_valid_checkpoint(ckpt):
             return ckpt
+    return None
+
+
+def latest_archived_checkpoint(scene_path, max_iter=None):
+    """Find the most advanced valid per-scene archive, never another scene's."""
+    scene_name = Path(scene_path).name
+    # Use the same canonical suffix used by checkpoint_backup_path().
+    suffix = checkpoint_backup_path(scene_name, 0).name.replace("chkpnt0", "")
+    roots = tuple(dict.fromkeys((CHECKPOINT_DIR, CHECKPOINT_INPUT_DIR)))
+    candidates = sorted(
+        (
+            path
+            for root in roots if root.is_dir()
+            for path in root.glob(f"chkpnt*{suffix}")
+            if path.is_dir()
+        ),
+        key=checkpoint_iter,
+        reverse=True,
+    )
+    for checkpoint in candidates:
+        iteration = checkpoint_iter(checkpoint)
+        if max_iter is not None and iteration > max_iter:
+            continue
+        if is_valid_checkpoint_archive(checkpoint):
+            print(f"[{scene_name}] verified archived checkpoint: {checkpoint} (iter {iteration})")
+            return checkpoint
     return None
 
 
@@ -907,9 +1051,17 @@ def build_train_cmd(scene_path, gpu_id):
         f"| edge_loss={cfg['image_edge_loss_weight']} | checkpoints={cfg['checkpoint_iterations']} "
         f"| validate/render={cfg['validation_iterations']}"
     )
-    resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1) if (RESUME_LOCAL and not FRESH_RUN) else None
+    resume = None
+    if RESUME_LOCAL and not FRESH_RUN:
+        # A SIGKILL may leave the scene output partially cleaned or corrupted.
+        # Choose the newest valid copy across the live model directory and the
+        # independently verified archive.
+        local_resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1)
+        archived_resume = latest_archived_checkpoint(scene_path, max_iter=ITERATIONS - 1)
+        candidates = [path for path in (local_resume, archived_resume) if path is not None]
+        resume = max(candidates, key=checkpoint_iter) if candidates else None
     if resume is not None:
-        print(f"[{scene_name}] resuming verified local checkpoint: {resume}")
+        print(f"[{scene_name}] resuming newest verified checkpoint: {resume}")
     elif RESUME_INPUT:
         resume = latest_input_checkpoint(scene_path, max_iter=ITERATIONS - 1)
     else:
@@ -1144,6 +1296,14 @@ def train_and_render_scene(scene_path, gpu_id):
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[{scene_name}] BTS_FRESH_RUN=1: cleared prior model and renders.")
 
+    if RESUME_LOCAL and not FRESH_RUN:
+        # Hydrate a backup before the final-artifact check as well: an archived
+        # 40k checkpoint can be rendered immediately without retraining.
+        archived = latest_archived_checkpoint(scene_path)
+        local = latest_checkpoint(out_dir)
+        if archived is not None and (local is None or checkpoint_iter(archived) > checkpoint_iter(local)):
+            restore_archived_checkpoint(scene_name, out_dir, archived)
+
     expected_names = expected_submission_names(scene_path)
     existing_names = submission_names(scene_name)
     if expected_names and existing_names == expected_names:
@@ -1166,6 +1326,8 @@ def train_and_render_scene(scene_path, gpu_id):
 
     print(f"[{scene_name}] checking final model artifacts.", flush=True)
     if is_valid_ply(final_ply) or is_valid_checkpoint(final_ckpt):
+        if is_valid_checkpoint(final_ckpt):
+            archive_checkpoint(scene_name, final_ckpt)
         print(f"[{scene_name}] final model exists, skipping training.")
     else:
         print(f"[{scene_name}] preparing train.py command.", flush=True)
@@ -1183,6 +1345,13 @@ def train_and_render_scene(scene_path, gpu_id):
             print(f"[{scene_name}] Waiting {_wandb_stagger}s for WandB service to start on GPU 0...")
             _time.sleep(_wandb_stagger)
         rc = run(cmd, cwd=REPO_DIR, env=env, log_file=log, check=False, stream=True)
+
+        # train.py publishes checkpoints atomically.  Synchronise the newest
+        # one even when it exited with -9, so the next Kaggle run resumes the
+        # last completed step rather than silently starting from zero.
+        newest = latest_checkpoint(out_dir)
+        if newest is not None:
+            archive_checkpoint(scene_name, newest)
 
         if rc != 0:
             print(f"[{scene_name}] training failed rc={rc}")
@@ -1251,7 +1420,16 @@ def scene_priority(scene_path):
     final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
     if is_valid_ply(final_ply) or is_valid_checkpoint(out_dir / f"chkpnt{ITERATIONS}.pth"):
         return (3, 0)
-    partial = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1) if RESUME_LOCAL else None
+    partial = None
+    if RESUME_LOCAL:
+        candidates = [
+            checkpoint for checkpoint in (
+                latest_checkpoint(out_dir, max_iter=ITERATIONS - 1),
+                latest_archived_checkpoint(scene_path, max_iter=ITERATIONS - 1),
+            )
+            if checkpoint is not None
+        ]
+        partial = max(candidates, key=checkpoint_iter) if candidates else None
     if partial:
         # Finish the most advanced resumable models first.
         return (2, checkpoint_iter(partial))

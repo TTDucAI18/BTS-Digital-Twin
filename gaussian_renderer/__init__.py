@@ -111,12 +111,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
         
-    # Exposure application removed (TASK 1): use_trained_exp block deleted.
-    # Rendered image retains physically accurate colors from SH coefficients.
+    # Do not clamp here.  During training a clamp gives zero gradient wherever
+    # a splat overshoots 0/1, precisely at high-contrast antenna, cable and
+    # object-silhouette boundaries.  Callers that display or save an image
+    # clamp explicitly after optimisation; see train.py and render.py.
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    rendered_image = rendered_image.clamp(0, 1)
     out = {
         "render": rendered_image,
         "viewspace_points": screenspace_points,

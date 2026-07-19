@@ -453,7 +453,10 @@ class GaussianModel:
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_points=0):
         grads = self.xyz_gradient_accum / self.denom
-        grads[grads.isnan()] = 0.0
+        # A single invalid projected point must never win the top-k budget and
+        # create a burst of displaced children around a tower tip.  NaN/Inf
+        # have no meaningful geometric direction, so exclude them.
+        grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
 
         self.tmp_radii = radii
         self.densify_and_clone(grads, max_grad, extent, max_points=max_points)

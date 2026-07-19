@@ -18,6 +18,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,6 +42,7 @@ def _tqdm_bar(iterable, desc, total=None, unit="it"):
 # =============================================================================
 
 REPO_URL = os.environ.get("BTS_REPO_URL", "https://github.com/TTDucAI18/BTS-Digital-Twin.git")
+REPO_REF = os.environ.get("BTS_REPO_REF", "main").strip()
 REPO_DIR = Path(os.environ.get("BTS_REPO_DIR", "/kaggle/working/BTS-Digital-Twin"))
 OUTPUT_DIR = Path(os.environ.get("BTS_OUTPUT_DIR", "/kaggle/working/output"))
 SUBMISSION_DIR = Path(os.environ.get("BTS_SUBMISSION_DIR", "/kaggle/working/submission"))
@@ -54,6 +56,7 @@ DATA_ROOT_CANDIDATES = [
     Path("/kaggle/input/bts-digital-twin-phase1/phase1"),
     Path("/kaggle/input/ai-race-data/phase1"),
     Path("/kaggle/input/ai-race-data"),
+    Path("D:/ai_race_2026/data"),
     Path("D:/ai_race_2026/data/phase1"),
 ]
 
@@ -61,18 +64,34 @@ ITERATIONS = int(os.environ.get("BTS_ITERATIONS", "40000"))
 POSITION_LR_MAX_STEPS = int(os.environ.get("BTS_POSITION_LR_MAX_STEPS", str(ITERATIONS)))
 if ITERATIONS <= 0 or POSITION_LR_MAX_STEPS <= 0:
     raise ValueError("BTS_ITERATIONS and BTS_POSITION_LR_MAX_STEPS must be positive.")
-# These fixed held-out views are logged to WandB at every selected iteration,
-# so 30k/35k/40k can be compared without retaining several multi-GB PLYs.
-_requested_comparison_iterations = {
+# Keep recovery/model-selection checkpoints at these milestones.  Checkpoint
+# I/O is much cheaper than rendering a set of held-out cameras, and the latter
+# is unnecessary once 40k has been selected as the submission schedule.
+_requested_checkpoint_iterations = {
     int(value.strip())
-    for value in os.environ.get("BTS_COMPARISON_ITERATIONS", "30000,35000,40000").split(",")
+    # With a 5M safety ceiling, a CUDA OOM is a hard crash rather than a clean
+    # deadline stop.  Checkpoint at 10k/20k as well, while train.py retains
+    # only the latest verified archive so this does not accumulate disk usage.
+    for value in os.environ.get("BTS_CHECKPOINT_ITERATIONS", "10000,20000,30000,35000,40000").split(",")
     if value.strip()
 }
-COMPARISON_ITERATIONS = sorted(
-    iteration for iteration in _requested_comparison_iterations if 0 < iteration <= ITERATIONS
+CHECKPOINT_ITERATIONS = sorted(
+    iteration for iteration in _requested_checkpoint_iterations if 0 < iteration <= ITERATIONS
 )
-if ITERATIONS not in COMPARISON_ITERATIONS:
-    COMPARISON_ITERATIONS.append(ITERATIONS)
+if ITERATIONS not in CHECKPOINT_ITERATIONS:
+    CHECKPOINT_ITERATIONS.append(ITERATIONS)
+# Do not render validation views at 30k/35k.  Keep the final fixed-view WandB
+# diagnostic at 40k; override only when deliberately running an ablation.
+_requested_validation_iterations = {
+    int(value.strip())
+    for value in os.environ.get("BTS_VALIDATION_ITERATIONS", str(ITERATIONS)).split(",")
+    if value.strip()
+}
+VALIDATION_ITERATIONS = sorted(
+    iteration for iteration in _requested_validation_iterations if 0 < iteration <= ITERATIONS
+)
+if ITERATIONS not in VALIDATION_ITERATIONS:
+    VALIDATION_ITERATIONS.append(ITERATIONS)
 # Use full resolution for thin BTS and cable details; set it to 2 only for a constrained rerun.
 TRAIN_RESOLUTION = int(os.environ.get("BTS_TRAIN_RESOLUTION", "1"))
 RENDER_RESOLUTION = int(os.environ.get("BTS_RENDER_RESOLUTION", "1"))
@@ -93,10 +112,15 @@ CLOSEUP_RENDER_ENSEMBLE_SCALES = [
 ]
 if not CLOSEUP_RENDER_ENSEMBLE_SCALES or any(scale < 1.0 for scale in CLOSEUP_RENDER_ENSEMBLE_SCALES):
     raise ValueError("BTS_CLOSEUP_RENDER_ENSEMBLE_SCALES must contain one or more scales >= 1.0.")
-# Upper bound only, never a target.  Override it without editing the notebook.
+# Upper bound only, never a target.  Five million is deliberately restored for
+# high-detail BTS reruns; it can require more VRAM/disk and should be paired
+# with the atomic checkpoint path below.
 MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "5000000"))
-DENSIFY_GRAD_THRESHOLD = float(os.environ.get("BTS_DENSIFY_GRAD_THRESHOLD", "0.00012"))
-DENSIFY_UNTIL_ITER = int(os.environ.get("BTS_DENSIFY_UNTIL_ITER", "15000"))
+# Thin tower lattice and cables retain high image-space gradients late in
+# training.  Stopping at 15k freezes their allocation while the 15k--40k
+# phase merely optimises oversized splats, producing the observed smearing.
+DENSIFY_GRAD_THRESHOLD = float(os.environ.get("BTS_DENSIFY_GRAD_THRESHOLD", "0.00010"))
+DENSIFY_UNTIL_ITER = int(os.environ.get("BTS_DENSIFY_UNTIL_ITER", "30000"))
 PERCENT_DENSE = float(os.environ.get("BTS_PERCENT_DENSE", "0.005"))
 if DENSIFY_GRAD_THRESHOLD <= 0 or DENSIFY_UNTIL_ITER <= 0 or not 0 < PERCENT_DENSE <= 1:
     raise ValueError("BTS densification settings must be positive, and BTS_PERCENT_DENSE must be in (0, 1].")
@@ -110,6 +134,7 @@ KAGGLE_STOP_BUFFER_MIN = float(os.environ.get("BTS_STOP_BUFFER_MIN", "30"))
 MIN_FREE_DISK_GB = float(os.environ.get("BTS_MIN_FREE_DISK_GB", "2.0"))
 DISK_CHECK_INTERVAL = int(os.environ.get("BTS_DISK_CHECK_INTERVAL", "100"))
 WANDB_LOG_INTERVAL = int(os.environ.get("BTS_WANDB_LOG_INTERVAL", "100"))
+SUBPROCESS_HEARTBEAT_SECONDS = float(os.environ.get("BTS_SUBPROCESS_HEARTBEAT_SECONDS", "30"))
 # Fixed train-view monitor used for model selection.  Test poses have no ground
 # truth, so this is the only image-space signal available during a Kaggle run.
 # By default the monitor views remain in training: novel-view coverage matters
@@ -121,6 +146,14 @@ VALIDATION_HOLDOUT = os.environ.get("BTS_VALIDATION_HOLDOUT", "0").strip() == "1
 # are deliberately opt-in for quality-sensitive reruns.
 RESUME_LOCAL = os.environ.get("BTS_RESUME_LOCAL", "1").strip() != "0"
 RESUME_INPUT = os.environ.get("BTS_RESUME_INPUT", "0").strip() == "1"
+# An explicit fresh run clears only the selected scene output/submission
+# directories immediately before that scene starts.  It is opt-in because it
+# intentionally discards resumable checkpoints from a prior experiment.
+FRESH_RUN = os.environ.get("BTS_FRESH_RUN", "0").strip() == "1"
+# Successful scenes normally release their model after their exact render set
+# was copied, saving Kaggle disk.  Enable this for a rerun when final PLY and
+# checkpoint artifacts must remain available for inspection or later renders.
+KEEP_MODEL_ARTIFACTS = os.environ.get("BTS_KEEP_MODEL_ARTIFACTS", "0").strip() == "1"
 # Offset checkpoint writes per GPU so two large archives do not saturate the
 # small Kaggle working disk at the same iteration.
 CHECKPOINT_STAGGER_SECONDS = float(os.environ.get("BTS_CHECKPOINT_STAGGER_SECONDS", "90"))
@@ -136,12 +169,14 @@ if (
     or MIN_FREE_DISK_GB < 0
     or DISK_CHECK_INTERVAL <= 0
     or WANDB_LOG_INTERVAL <= 0
+    or SUBPROCESS_HEARTBEAT_SECONDS <= 0
     or not 0.0 < VALIDATION_FRACTION < 1.0
     or CHECKPOINT_STAGGER_SECONDS < 0
 ):
     raise ValueError(
         "Invalid BTS configuration: resolutions/workers/intervals must be positive; "
         "weights, disk threshold, and checkpoint stagger must be non-negative; "
+        "heartbeat interval must be positive; "
         "BTS_VALIDATION_FRACTION must be in (0, 1)."
     )
 TARGET_SCENES = [
@@ -198,27 +233,112 @@ TRAIN_STOP_AT_UNIX_TIME = SESSION_START + max(
     0.0, KAGGLE_TIME_LIMIT_H * 3600 - KAGGLE_STOP_BUFFER_MIN * 60,
 )
 
+# The main notebook thread may receive KeyboardInterrupt while workers are
+# blocking in a child train.py process.  Keep those PIDs so the interrupt path
+# can stop them before ThreadPoolExecutor waits for its worker threads.
+_ACTIVE_PROCESSES = set()
+_ACTIVE_PROCESSES_LOCK = threading.Lock()
 
-def run(cmd, cwd=None, log_file=None, check=False, env=None):
-    """Run a command and stream or capture output."""
+
+def stop_active_processes():
+    """Terminate active train/render children so an interrupted cell can exit."""
+    with _ACTIVE_PROCESSES_LOCK:
+        processes = list(_ACTIVE_PROCESSES)
+    for process in processes:
+        if process.poll() is None:
+            print(f"Stopping subprocess pid={process.pid} after notebook interrupt.")
+            process.terminate()
+    for process in processes:
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            print(f"Killing unresponsive subprocess pid={process.pid}.")
+            process.kill()
+
+
+def run(cmd, cwd=None, log_file=None, check=False, env=None, stream=False):
+    """Run a command, optionally teeing a persisted log into the notebook."""
     cwd = str(cwd) if cwd is not None else None
     printable = " ".join(str(x) for x in cmd)
     print(f"\n$ {printable}")
     merged_env = os.environ.copy()
+    merged_env.setdefault("PYTHONUNBUFFERED", "1")
     if env:
         merged_env.update(env)
 
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         with open(log_file, "w", encoding="utf-8", errors="replace") as f:
-            result = subprocess.run(
-                [str(x) for x in cmd],
-                cwd=cwd,
-                env=merged_env,
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+            if stream:
+                process = subprocess.Popen(
+                    [str(x) for x in cmd],
+                    cwd=cwd,
+                    env=merged_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=0,
+                )
+                assert process.stdout is not None
+                with _ACTIVE_PROCESSES_LOCK:
+                    _ACTIVE_PROCESSES.add(process)
+
+                # A blocking os.read() gave the notebook no indication of a
+                # child stuck before its first print, and made Interrupt leave
+                # the executor waiting for its worker.  Drain stdout in a
+                # reader thread so the worker can emit a useful heartbeat.
+                output_queue = queue.Queue()
+
+                def drain_stdout():
+                    try:
+                        while True:
+                            chunk = process.stdout.read(4096)
+                            if not chunk:
+                                break
+                            output_queue.put(chunk)
+                    finally:
+                        output_queue.put(None)
+
+                reader = threading.Thread(target=drain_stdout, name=f"stream-{process.pid}", daemon=True)
+                reader.start()
+                started = time.monotonic()
+                try:
+                    while True:
+                        try:
+                            chunk = output_queue.get(timeout=SUBPROCESS_HEARTBEAT_SECONDS)
+                        except queue.Empty:
+                            if process.poll() is None:
+                                elapsed = time.monotonic() - started
+                                print(
+                                    f"[pid={process.pid}] still running for {elapsed / 60:.1f} min; "
+                                    f"waiting for subprocess output. Log: {log_file}",
+                                    flush=True,
+                                )
+                            continue
+                        if chunk is None:
+                            break
+                        output = chunk.decode("utf-8", errors="replace")
+                        f.write(output)
+                        f.flush()
+                        print(output, end="", flush=True)
+                    result = process.wait()
+                except BaseException:
+                    if process.poll() is None:
+                        process.terminate()
+                    raise
+                finally:
+                    with _ACTIVE_PROCESSES_LOCK:
+                        _ACTIVE_PROCESSES.discard(process)
+                    process.stdout.close()
+                    reader.join(timeout=1)
+            else:
+                result = subprocess.run(
+                    [str(x) for x in cmd],
+                    cwd=cwd,
+                    env=merged_env,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                ).returncode
     else:
         result = subprocess.run(
             [str(x) for x in cmd],
@@ -232,9 +352,10 @@ def run(cmd, cwd=None, log_file=None, check=False, env=None):
         if result.stderr:
             print(result.stderr)
 
-    if check and result.returncode != 0:
-        raise RuntimeError(f"Command failed with rc={result.returncode}: {printable}")
-    return result.returncode
+    returncode = result if log_file else result.returncode
+    if check and returncode != 0:
+        raise RuntimeError(f"Command failed with rc={returncode}: {printable}")
+    return returncode
 
 
 def tail(path, n=80):
@@ -269,14 +390,38 @@ print(f"Disk: {free_gb:.1f} GB free / {total_gb:.1f} GB total")
 # CELL 2 - Repo and dependencies
 # =============================================================================
 
+REPO_SYNC_REQUIRED = os.environ.get("BTS_REQUIRE_REPO_SYNC", "0").strip() == "1"
+
 if REPO_DIR.exists():
-    run(["git", "-C", REPO_DIR, "pull", "--ff-only"], check=False)
-    run(["git", "-C", REPO_DIR, "submodule", "update", "--init", "--recursive"], check=True)
+    # Never continue with a stale checkout: it can silently omit new training
+    # flags even though this notebook file itself has been updated.  A prior
+    # notebook run can leave harmless compatibility edits in this checkout,
+    # however; a failed fast-forward must not prevent the training queue from
+    # starting.  Set BTS_REQUIRE_REPO_SYNC=1 when using an exact revision is
+    # more important than using the available checkout.
+    sync_rc = run(["git", "-C", REPO_DIR, "fetch", "origin", REPO_REF], check=False)
+    if sync_rc == 0:
+        sync_rc = run(["git", "-C", REPO_DIR, "merge", "--ff-only", f"origin/{REPO_REF}"], check=False)
+    if sync_rc != 0:
+        message = (
+            f"Repository sync failed (rc={sync_rc}); continuing with existing checkout "
+            f"at {REPO_DIR}. Set BTS_REQUIRE_REPO_SYNC=1 to fail instead."
+        )
+        if REPO_SYNC_REQUIRED:
+            raise RuntimeError(message)
+        print(f"WARNING: {message}")
+    submodule_rc = run(["git", "-C", REPO_DIR, "submodule", "update", "--init", "--recursive"], check=False)
+    if submodule_rc != 0:
+        message = f"Submodule update failed (rc={submodule_rc})."
+        if REPO_SYNC_REQUIRED:
+            raise RuntimeError(message)
+        print(f"WARNING: {message} Continuing with the existing submodules.")
 else:
-    run(["git", "clone", "--recurse-submodules", REPO_URL, REPO_DIR], check=True)
+    run(["git", "clone", "--branch", REPO_REF, "--recurse-submodules", REPO_URL, REPO_DIR], check=True)
 
 os.chdir(REPO_DIR)
 run(["git", "log", "--oneline", "-3"], cwd=REPO_DIR, check=False)
+run(["git", "rev-parse", "HEAD"], cwd=REPO_DIR, check=True)
 
 
 def patch_repo_for_kaggle():
@@ -390,22 +535,30 @@ for submodule in _tqdm(_submodules, desc="CUDA extensions", unit="ext"):
 verify_code = (
     "from diff_gaussian_rasterization import GaussianRasterizer; "
     "from simple_knn._C import distCUDA2; "
-    "print('CUDA extensions OK')"
+    "from fused_ssim import fused_ssim; "
+    "print('CUDA extensions OK: rasterizer, simple-knn, fused-ssim')"
 )
 run([sys.executable, "-c", verify_code], cwd=REPO_DIR, check=True)
 
 if USE_WANDB:
-    import wandb
+    try:
+        import wandb
 
-    wandb.login(key=WANDB_API_KEY)
-    if not WANDB_ENTITY:
-        try:
-            WANDB_ENTITY = wandb.Api().viewer.username
-        except Exception:
-            WANDB_ENTITY = ""
-    print(f"WandB enabled: project={WANDB_PROJECT}, entity={WANDB_ENTITY or '<default>'}")
+        wandb.login(key=WANDB_API_KEY)
+        if not WANDB_ENTITY:
+            try:
+                WANDB_ENTITY = wandb.Api().viewer.username
+            except Exception:
+                WANDB_ENTITY = ""
+        print(f"WandB enabled: project={WANDB_PROJECT}, entity={WANDB_ENTITY or '<default>'}")
+    except Exception as exc:
+        message = f"WandB login failed: {exc}"
+        USE_WANDB = False
+        if WANDB_REQUIRED:
+            raise RuntimeError(message) from exc
+        print(f"WARNING: {message}. Continuing with WandB disabled.")
 else:
-    message = "WandB API key not found. Add Kaggle Secret named WANDB_API_KEY, then rerun from Cell 1/2."
+    message = "WandB API key not found. Add Kaggle Secret named WANDB_API_KEY to enable logging."
     if WANDB_REQUIRED:
         raise RuntimeError(message)
     print(f"WandB disabled. {message}")
@@ -508,7 +661,9 @@ def optional_mask_args(scene_path):
     if not SUPPORTS_MASKS:
         return []
     root = train_root(scene_path)
-    for name in ["masks", "mask", "foreground_masks", "foreground"]:
+    # Prefer the generated object masks over a generic legacy ``masks``
+    # directory when both are present in a Kaggle dataset mount.
+    for name in ["foreground_masks", "masks", "mask", "foreground"]:
         if (root / name).is_dir():
             args = ["--masks", name]
             if SUPPORTS_FOREGROUND_WEIGHT:
@@ -691,11 +846,16 @@ def scene_train_config(scene_path):
         "densify_until_iter": min(DENSIFY_UNTIL_ITER, ITERATIONS),
         "percent_dense": PERCENT_DENSE,
         "depth_weight_init": float(os.environ.get("BTS_DEPTH_WEIGHT_INIT", "0.02")),
-        "checkpoint_iterations": COMPARISON_ITERATIONS,
+        "checkpoint_iterations": CHECKPOINT_ITERATIONS,
+        "validation_iterations": VALIDATION_ITERATIONS,
         "max_gaussians": MAX_GAUSSIANS,
         "max_screen_size": int(os.environ.get("BTS_MAX_SCREEN_SIZE", "20")),
-        "opacity_reset_until_iter": int(os.environ.get("BTS_OPACITY_RESET_UNTIL_ITER", "0")),
-        "image_edge_loss_weight": float(os.environ.get("BTS_IMAGE_EDGE_LOSS_WEIGHT", "0.0")),
+        # Do not erase mature thin splats during the extended densification
+        # phase.  New high-gradient structure can still split until 30k.
+        "opacity_reset_until_iter": int(os.environ.get("BTS_OPACITY_RESET_UNTIL_ITER", "15000")),
+        # With no tower masks in the supplied scenes, this is the only loss
+        # that explicitly increases gradients on cable/lattice edges.
+        "image_edge_loss_weight": float(os.environ.get("BTS_IMAGE_EDGE_LOSS_WEIGHT", "0.02")),
         "position_lr_init": float(os.environ.get("BTS_POSITION_LR_INIT", "0.00016")),
         "position_lr_max_steps": POSITION_LR_MAX_STEPS,
     }
@@ -705,10 +865,11 @@ def scene_train_config(scene_path):
         # Depth Anything remains a weak anchor instead of flattening fine shape.
         cfg.update({
             "densify_grad_threshold": float(os.environ.get("BTS_CLOSEUP_DENSIFY_GRAD_THRESHOLD", "0.00012")),
-            # Glass, foliage, and narrow furniture edges in the close-up scenes
-            # need geometry creation beyond the generic 15k cutoff.  This is
-            # still bounded and can be lowered via the environment on a T4.
-            "densify_until_iter": min(int(os.environ.get("BTS_CLOSEUP_DENSIFY_UNTIL_ITER", "20000")), ITERATIONS),
+            # Do not freeze close-up geometry at 20k: this was the source of
+            # the chair/bonsai point-count plateau and blurred close-up edges.
+            # The final 10k remains a fixed-geometry convergence phase.
+            "densify_until_iter": min(int(os.environ.get("BTS_CLOSEUP_DENSIFY_UNTIL_ITER", "30000")), ITERATIONS),
+            "max_gaussians": int(os.environ.get("BTS_CLOSEUP_MAX_GAUSSIANS", "5000000")),
             "percent_dense": float(os.environ.get("BTS_CLOSEUP_PERCENT_DENSE", "0.005")),
             "depth_weight_init": float(os.environ.get("BTS_CLOSEUP_DEPTH_WEIGHT_INIT", "0.01")),
             # Keep large, distant window/background splats long enough to
@@ -743,9 +904,10 @@ def build_train_cmd(scene_path, gpu_id):
         f"[{scene_name}] profile={'closeup' if scene_name in CLOSEUP_SCENES else 'bts'} "
         f"| dense={cfg['percent_dense']} | grad={cfg['densify_grad_threshold']} "
         f"| depth_weight={cfg['depth_weight_init']} | screen_prune={cfg['max_screen_size']} "
-        f"| edge_loss={cfg['image_edge_loss_weight']} | compare={cfg['checkpoint_iterations']}"
+        f"| edge_loss={cfg['image_edge_loss_weight']} | checkpoints={cfg['checkpoint_iterations']} "
+        f"| validate/render={cfg['validation_iterations']}"
     )
-    resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1) if RESUME_LOCAL else None
+    resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1) if (RESUME_LOCAL and not FRESH_RUN) else None
     if resume is not None:
         print(f"[{scene_name}] resuming verified local checkpoint: {resume}")
     elif RESUME_INPUT:
@@ -799,7 +961,7 @@ def build_train_cmd(scene_path, gpu_id):
         "--test_iterations",
         "-1",
         "--validation_iterations",
-        *[str(x) for x in cfg["checkpoint_iterations"]],
+        *[str(x) for x in cfg["validation_iterations"]],
         "--validation_fraction",
         str(VALIDATION_FRACTION),
         "--checkpoint_iterations",
@@ -807,7 +969,12 @@ def build_train_cmd(scene_path, gpu_id):
         "--save_iterations",
         str(ITERATIONS),
         "--disable_viewer",
-        "--quiet",
+        # Do not pass --quiet here. train.py sends it to safe_state(), whose
+        # stdout wrapper drops every print and tqdm update. With subprocess
+        # output streamed this otherwise makes healthy GPU workers look hung
+        # while the notebook waits in as_completed().
+        "--progress_name",
+        f"{scene_name}-gpu{gpu_id}",
         "--skip_test_poses",
         *optional_depth_args(scene_path),
         *optional_mask_args(scene_path),
@@ -963,6 +1130,19 @@ def train_and_render_scene(scene_path, gpu_id):
     scene_name = scene_path.name
     out_dir = scene_output(scene_path)
     out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[{scene_name}] worker started on GPU {gpu_id}; running preflight.", flush=True)
+
+    if FRESH_RUN:
+        # This is intentionally scoped to exactly one selected scene.  It runs
+        # before checkpoint discovery so --start_checkpoint can never revive a
+        # model from the previous experiment.
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        scene_submission = SUBMISSION_DIR / scene_name
+        if scene_submission.exists():
+            shutil.rmtree(scene_submission)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[{scene_name}] BTS_FRESH_RUN=1: cleared prior model and renders.")
 
     expected_names = expected_submission_names(scene_path)
     existing_names = submission_names(scene_name)
@@ -984,9 +1164,11 @@ def train_and_render_scene(scene_path, gpu_id):
     final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
     final_ckpt = out_dir / f"chkpnt{ITERATIONS}.pth"
 
+    print(f"[{scene_name}] checking final model artifacts.", flush=True)
     if is_valid_ply(final_ply) or is_valid_checkpoint(final_ckpt):
         print(f"[{scene_name}] final model exists, skipping training.")
     else:
+        print(f"[{scene_name}] preparing train.py command.", flush=True)
         cmd, env = build_train_cmd(scene_path, gpu_id)
         log = OUTPUT_DIR / f"{scene_name}_train.log"
         print(f"[{scene_name}] train on GPU {gpu_id} | images={count_images(scene_path)} | log={log}")
@@ -1000,16 +1182,23 @@ def train_and_render_scene(scene_path, gpu_id):
             _wandb_stagger = 15 * gpu_id
             print(f"[{scene_name}] Waiting {_wandb_stagger}s for WandB service to start on GPU 0...")
             _time.sleep(_wandb_stagger)
-        rc = run(cmd, cwd=REPO_DIR, env=env, log_file=log, check=False)
+        rc = run(cmd, cwd=REPO_DIR, env=env, log_file=log, check=False, stream=True)
 
         if rc != 0:
             print(f"[{scene_name}] training failed rc={rc}")
             print(tail(log, 80))
             return scene_name, rc
 
-    it = final_iteration(out_dir)
-    if it < ITERATIONS:
-        print(f"[{scene_name}] training stopped at iter {it}; expected {ITERATIONS}. Rendering is deferred until a verified final checkpoint/PLY exists.")
+    # Render the requested schedule point exactly.  A prior experiment can
+    # leave a later valid checkpoint in this output directory; choosing the
+    # numerically latest artifact would silently submit that other experiment.
+    it = ITERATIONS
+    if not (is_valid_ply(final_ply) or is_valid_checkpoint(final_ckpt)):
+        completed_iter = final_iteration(out_dir)
+        print(
+            f"[{scene_name}] training stopped at iter {completed_iter}; expected {ITERATIONS}. "
+            "Rendering is deferred until a verified final checkpoint/PLY exists."
+        )
         return scene_name, 6
 
     if not ensure_ply_from_checkpoint(out_dir, it):
@@ -1020,7 +1209,7 @@ def train_and_render_scene(scene_path, gpu_id):
     cmd, env = build_render_cmd(scene_path, gpu_id, it)
     log = OUTPUT_DIR / f"{scene_name}_render.log"
     print(f"[{scene_name}] render iteration {it} on GPU {gpu_id} | log={log}")
-    rc = run(cmd, cwd=REPO_DIR, env=env, log_file=log, check=False)
+    rc = run(cmd, cwd=REPO_DIR, env=env, log_file=log, check=False, stream=True)
     if rc != 0:
         print(f"[{scene_name}] render failed rc={rc}")
         print(tail(log, 80))
@@ -1042,8 +1231,12 @@ def train_and_render_scene(scene_path, gpu_id):
 
     # Only reclaim the large model artifacts after the copied render set has
     # passed the same exact-name contract that Cell 6 enforces at packaging.
-    cleanup_intermediate(out_dir, it)
-    cleanup_scene_output_after_submission(out_dir)
+    if KEEP_MODEL_ARTIFACTS:
+        cleanup_intermediate(out_dir, it)
+        print(f"[{scene_name}] retaining final model artifacts (BTS_KEEP_MODEL_ARTIFACTS=1).")
+    else:
+        cleanup_intermediate(out_dir, it)
+        cleanup_scene_output_after_submission(out_dir)
     free_gb, total_gb = disk_free_gb()
     print(f"[{scene_name}] done. Disk: {free_gb:.1f}/{total_gb:.1f} GB free")
     return scene_name, 0
@@ -1057,10 +1250,14 @@ def scene_priority(scene_path):
     out_dir = scene_output(scene_path)
     final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
     if is_valid_ply(final_ply) or is_valid_checkpoint(out_dir / f"chkpnt{ITERATIONS}.pth"):
-        return 0
-    if RESUME_LOCAL and latest_checkpoint(out_dir, max_iter=ITERATIONS - 1):
-        return 2
-    return 1
+        return (3, 0)
+    partial = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1) if RESUME_LOCAL else None
+    if partial:
+        # Finish the most advanced resumable models first.
+        return (2, checkpoint_iter(partial))
+    # BTS is the submission priority.  Starting bonsai/chair on both GPUs
+    # previously pushed all five tower scenes into the global deadline.
+    return (1 if Path(scene_path).name not in CLOSEUP_SCENES else 0, 0)
 
 
 ALL_SCENES = sorted(ALL_SCENES, key=scene_priority, reverse=True)
@@ -1072,6 +1269,7 @@ for gpu in GPU_IDS:
 def worker(scene):
     gpu = gpu_queue.get()
     try:
+        print(f"[{Path(scene).name}] acquired GPU {gpu} from queue.", flush=True)
         return train_and_render_scene(scene, gpu)
     finally:
         gpu_queue.put(gpu)
@@ -1080,7 +1278,7 @@ def worker(scene):
 print("=" * 80)
 print(
     f"Starting pipeline: {len(ALL_SCENES)} scenes, GPUs={GPU_IDS}, iterations={ITERATIONS}, "
-    f"comparison/validation={COMPARISON_ITERATIONS}"
+    f"checkpoints={CHECKPOINT_ITERATIONS}, validation/render={VALIDATION_ITERATIONS}"
 )
 print("=" * 80)
 
@@ -1088,7 +1286,9 @@ _scene_start_times: dict = {}
 
 results = []
 _pipeline_bar = _tqdm(total=len(ALL_SCENES), desc="Scenes", unit="scene", dynamic_ncols=True)
-with ThreadPoolExecutor(max_workers=len(GPU_IDS)) as executor:
+executor = ThreadPoolExecutor(max_workers=len(GPU_IDS))
+futures = {}
+try:
     futures = {executor.submit(worker, scene): scene for scene in ALL_SCENES}
     for future in as_completed(futures):
         scene = futures[future]
@@ -1109,19 +1309,29 @@ with ThreadPoolExecutor(max_workers=len(GPU_IDS)) as executor:
                                   disk_free=f"{free_gb:.1f}GB")
         _pipeline_bar.update(1)
         print(f"Completed: {result} | imgs={n_imgs} | disk_free={free_gb:.1f}GB")
-        # WandB: log per-scene pipeline summary
-        if USE_WANDB:
-            try:
-                import wandb as _wandb
-                _wandb.log({
-                    f"pipeline/{scene_name}/status": rc,
-                    f"pipeline/{scene_name}/rendered_images": n_imgs,
-                    f"pipeline/{scene_name}/disk_free_gb": free_gb,
-                    f"pipeline/{scene_name}/hours_remaining": hours_remaining(),
-                })
-            except Exception:
-                pass
-_pipeline_bar.close()
+        # WandB belongs to child training processes.  The notebook parent has
+        # no wandb.init(), so do not emit a false error after pipeline exit.
+except KeyboardInterrupt:
+    # Do not let ThreadPoolExecutor.__exit__ wait indefinitely for subprocesses
+    # after an interrupted Kaggle cell.  Stop active children first, then join
+    # the short-lived reader/worker threads.
+    print("KeyboardInterrupt: stopping active train/render subprocesses...")
+    for future in futures:
+        future.cancel()
+    stop_active_processes()
+    # A worker can be blocked in a slow checkpoint/PLY validation before it
+    # has spawned a child process.  Do not make the notebook wait for that
+    # thread after the user has explicitly interrupted the cell.
+    executor.shutdown(wait=False, cancel_futures=True)
+    raise
+except BaseException:
+    stop_active_processes()
+    executor.shutdown(wait=False, cancel_futures=True)
+    raise
+else:
+    executor.shutdown(wait=True)
+finally:
+    _pipeline_bar.close()
 
 print("Pipeline results:", results)
 

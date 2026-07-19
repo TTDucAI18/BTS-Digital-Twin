@@ -105,6 +105,13 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
+    print(
+        "CUDA training path: "
+        f"fused_ssim={'enabled' if FUSED_SSIM_AVAILABLE else 'python-fallback'}, "
+        f"sparse_adam={'enabled' if (opt.optimizer_type == 'sparse_adam' and SPARSE_ADAM_AVAILABLE) else 'disabled'}, "
+        f"antialiasing={'enabled' if pipe.antialiasing else 'disabled'}."
+    )
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(args)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -459,14 +466,14 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                     except:
                         return 0
                 all_ckpts = sorted(_glob.glob(os.path.join(scene.model_path, "chkpnt*.pth")), key=_ckpt_iter)
-                # Keep explicit milestone checkpoints (30k/35k/40k in the
-                # notebook) for recovery/model selection.  A checkpoint
-                # created by a disk/deadline stop remains protected through
-                # ``new_ckpt_path`` even when it is not a scheduled milestone.
-                protected_checkpoint_iterations = set(checkpoint_iterations)
                 for old_ckpt in all_ckpts:
                     old_iteration = _ckpt_iter(old_ckpt)
-                    if old_ckpt != new_ckpt_path and old_iteration not in protected_checkpoint_iterations:
+                    # Atomically publish first, then retain only the newest
+                    # valid archive.  At 5M Gaussians multiple milestones can
+                    # exhaust the shared Kaggle disk and trigger an avoidable
+                    # early stop; a single latest checkpoint is sufficient
+                    # for resume and is already CRC-validated above.
+                    if old_ckpt != new_ckpt_path:
                         try:
                             os.remove(old_ckpt)
                             print("[ITER {}] Deleted old checkpoint: {}".format(iteration, os.path.basename(old_ckpt)))

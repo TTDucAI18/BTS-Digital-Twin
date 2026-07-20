@@ -105,6 +105,11 @@ class OptimizationParams(ParamGroup):
         # first opacity reset.  Set to 0 to disable that specific pruning rule.
         self.max_screen_size = 20
         self.max_gaussians = 0
+        # Optional staged point budget, e.g. "12000:1500000,24000:4000000".
+        # The first cap applies through its iteration; max_gaussians applies
+        # afterwards.  This prevents a low gradient threshold from consuming
+        # the entire point budget in the first few thousand iterations.
+        self.densify_cap_schedule = ""
         self.foreground_loss_weight = 0.0
         self.foreground_edge_loss_weight = 0.05
         self.image_edge_loss_weight = 0.0

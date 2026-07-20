@@ -100,6 +100,42 @@ def remove_superseded_checkpoints(model_path, keep_path):
         except OSError as exc:
             print("Could not delete {}: {}".format(os.path.basename(old_ckpt), exc))
 
+
+def parse_densify_cap_schedule(raw_schedule, final_cap):
+    """Parse ``end_iteration:max_points`` stages for densification.
+
+    A blank schedule preserves the legacy single-cap behaviour.  Stages must
+    be strictly increasing so a typo cannot silently unlock a larger budget
+    early in training.
+    """
+    if not raw_schedule or not raw_schedule.strip():
+        return ()
+    stages = []
+    previous_iteration = 0
+    for item in raw_schedule.split(","):
+        try:
+            end_iteration_text, cap_text = item.strip().split(":", 1)
+            end_iteration, cap = int(end_iteration_text), int(cap_text)
+        except ValueError as exc:
+            raise ValueError(
+                "--densify_cap_schedule must be comma-separated "
+                "END_ITER:MAX_GAUSSIANS entries"
+            ) from exc
+        if end_iteration <= previous_iteration or cap <= 0:
+            raise ValueError("--densify_cap_schedule stages must have increasing positive iterations and positive caps")
+        if final_cap > 0 and cap > final_cap:
+            raise ValueError("--densify_cap_schedule cap cannot exceed --max_gaussians")
+        stages.append((end_iteration, cap))
+        previous_iteration = end_iteration
+    return tuple(stages)
+
+
+def densify_point_cap(iteration, stages, final_cap):
+    for end_iteration, cap in stages:
+        if iteration <= end_iteration:
+            return cap
+    return final_cap
+
 def training(dataset, opt, pipe, validation_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -111,6 +147,9 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
         f"sparse_adam={'enabled' if (opt.optimizer_type == 'sparse_adam' and SPARSE_ADAM_AVAILABLE) else 'disabled'}, "
         f"antialiasing={'enabled' if pipe.antialiasing else 'disabled'}."
     )
+    densify_cap_stages = parse_densify_cap_schedule(opt.densify_cap_schedule, opt.max_gaussians)
+    if densify_cap_stages:
+        print(f"Densification point-budget schedule: {densify_cap_stages}; final={opt.max_gaussians}")
 
     first_iter = 0
     tb_writer = prepare_output_and_logger(args)
@@ -172,6 +211,17 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
         f"Fixed monitor: {len(val_cameras)}/{len(ordered_train_cams)} views "
         f"({100 * len(val_cameras) / len(ordered_train_cams):.1f}%), mode={train_mode}."
     )
+    if opt.foreground_loss_weight > 0.0 or opt.foreground_edge_loss_weight > 0.0:
+        missing_masks = [camera.image_name for camera in train_cameras if camera.foreground_mask is None]
+        if missing_masks:
+            raise RuntimeError(
+                "Foreground optimisation was requested but masks are missing for "
+                f"{len(missing_masks)}/{len(train_cameras)} train views; first={missing_masks[0]}"
+            )
+        print(
+            f"Foreground optimisation enabled for all {len(train_cameras)} train views: "
+            f"L1 weight={opt.foreground_loss_weight}, edge weight={opt.foreground_edge_loss_weight}."
+        )
 
     # Phục hồi Exposure Compensation (giúp giảm mây mờ / floaters do chênh lệch độ sáng giữa các ảnh từ camera drone)
     num_cams = max([c.uid for c in train_cameras]) + 1
@@ -259,6 +309,7 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
         fg_mask = viewpoint_cam.foreground_mask.cuda() if viewpoint_cam.foreground_mask is not None else None
         if fg_mask is not None and fg_mask.dtype != torch.float32:
             fg_mask = fg_mask.float().div_(255.0)
+        foreground_fraction = fg_mask.mean() if fg_mask is not None else None
         if opt.foreground_loss_weight > 0.0 and fg_mask is not None:
             Ll1 = foreground_weighted_l1(image_for_loss, gt_image, fg_mask, opt.foreground_loss_weight)
         else:
@@ -344,6 +395,9 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                         if hasattr(foreground_edge_loss, "item") else float(foreground_edge_loss)
                     ),
                     "train/foreground_edge_weight": opt.foreground_edge_loss_weight,
+                    "train/foreground_fraction": (
+                        foreground_fraction.item() if foreground_fraction is not None else 0.0
+                    ),
                     "train/image_edge_loss": (
                         image_edge_loss.item()
                         if hasattr(image_edge_loss, "item") else float(image_edge_loss)
@@ -404,13 +458,14 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                         if iteration > opt.opacity_reset_interval and opt.max_screen_size > 0
                         else None
                     )
-                    if opt.max_gaussians <= 0 or gaussians.get_xyz.shape[0] < opt.max_gaussians:
+                    current_cap = densify_point_cap(iteration, densify_cap_stages, opt.max_gaussians)
+                    if current_cap <= 0 or gaussians.get_xyz.shape[0] < current_cap:
                         gaussians.densify_and_prune(
                             opt.densify_grad_threshold, 0.005, scene.cameras_extent,
-                            size_threshold, radii, max_points=opt.max_gaussians
+                            size_threshold, radii, max_points=current_cap
                         )
                     else:
-                        print(f"\n[ITER {iteration}] WARNING: Max Gaussians reached ({gaussians.get_xyz.shape[0]}/{opt.max_gaussians}). Skipping densification to prevent OOM.")
+                        print(f"\n[ITER {iteration}] Point budget reached ({gaussians.get_xyz.shape[0]}/{current_cap}). Skipping densification.")
                         # Still prune to remove transparent ones
                         prune_mask = (gaussians.get_opacity < 0.005).squeeze()
                         if size_threshold:

@@ -121,22 +121,21 @@ CLOSEUP_RENDER_ENSEMBLE_SCALES = [
 ]
 if not CLOSEUP_RENDER_ENSEMBLE_SCALES or any(scale < 1.0 for scale in CLOSEUP_RENDER_ENSEMBLE_SCALES):
     raise ValueError("BTS_CLOSEUP_RENDER_ENSEMBLE_SCALES must contain one or more scales >= 1.0.")
-# Upper bound only, never a target.  Five million is deliberately restored for
-# high-detail BTS reruns; it can require more VRAM/disk and should be paired
-# with the atomic checkpoint path below.
-MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "5000000"))
+# Upper bound only, never a target.  The staged budget below makes a 10M
+# ceiling safe for high-detail BTS reruns instead of spending it immediately.
+MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "10000000"))
 # Thin tower lattice and cables retain high image-space gradients late in
 # training.  Stopping at 15k freezes their allocation while the 15k--40k
 # phase merely optimises oversized splats, producing the observed smearing.
-DENSIFY_GRAD_THRESHOLD = float(os.environ.get("BTS_DENSIFY_GRAD_THRESHOLD", "0.00010"))
+DENSIFY_GRAD_THRESHOLD = float(os.environ.get("BTS_DENSIFY_GRAD_THRESHOLD", "0.00015"))
 DENSIFY_UNTIL_ITER = int(os.environ.get("BTS_DENSIFY_UNTIL_ITER", "30000"))
 PERCENT_DENSE = float(os.environ.get("BTS_PERCENT_DENSE", "0.005"))
 if DENSIFY_GRAD_THRESHOLD <= 0 or DENSIFY_UNTIL_ITER <= 0 or not 0 < PERCENT_DENSE <= 1:
     raise ValueError("BTS densification settings must be positive, and BTS_PERCENT_DENSE must be in (0, 1].")
-FOREGROUND_LOSS_WEIGHT = float(os.environ.get("BTS_FOREGROUND_LOSS_WEIGHT", "6.0"))
+FOREGROUND_LOSS_WEIGHT = float(os.environ.get("BTS_FOREGROUND_LOSS_WEIGHT", "12.0"))
 FOREGROUND_EDGE_LOSS_WEIGHT = float(os.environ.get("BTS_FOREGROUND_EDGE_LOSS_WEIGHT", "0.05"))
 MAX_WORKERS = int(os.environ.get("BTS_MAX_WORKERS", "2"))
-KAGGLE_TIME_LIMIT_H = float(os.environ.get("BTS_TIME_LIMIT_H", "11.0"))
+KAGGLE_TIME_LIMIT_H = float(os.environ.get("BTS_TIME_LIMIT_H", "11.5"))
 # Reserve time for the final compact checkpoint, render, and packaging.
 KAGGLE_STOP_BUFFER_MIN = float(os.environ.get("BTS_STOP_BUFFER_MIN", "30"))
 # Below this threshold, training exits cleanly and preserves the last verified checkpoint.
@@ -169,6 +168,10 @@ CHECKPOINT_STAGGER_SECONDS = float(os.environ.get("BTS_CHECKPOINT_STAGGER_SECOND
 # Retaining every 5M-Gaussian checkpoint can fill Kaggle's working disk.  Keep
 # the two newest verified backups per scene (for example 35000 and 40000).
 CHECKPOINT_BACKUP_KEEP = int(os.environ.get("BTS_CHECKPOINT_BACKUP_KEEP", "2"))
+# Store a portable zip of the extracted checkpoint archive after every clean
+# train exit, including deadline/disk early-stop.  Keeping only the zip avoids
+# retaining two full copies of a 10M-Gaussian checkpoint on Kaggle disk.
+CHECKPOINT_ARCHIVE_ZIP = os.environ.get("BTS_CHECKPOINT_ARCHIVE_ZIP", "1").strip() != "0"
 if (
     TRAIN_RESOLUTION <= 0
     or RENDER_RESOLUTION <= 0
@@ -678,7 +681,24 @@ def optional_mask_args(scene_path):
     # Prefer the generated object masks over a generic legacy ``masks``
     # directory when both are present in a Kaggle dataset mount.
     for name in ["foreground_masks", "masks", "mask", "foreground"]:
-        if (root / name).is_dir():
+        mask_root = root / name
+        if mask_root.is_dir():
+            image_stems = {
+                path.stem for ext in ("*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG")
+                for path in (root / "images").glob(ext)
+            }
+            mask_stems = {
+                path.stem for ext in ("*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG")
+                for path in mask_root.glob(ext)
+            }
+            missing = image_stems - mask_stems
+            if not image_stems or missing:
+                print(
+                    f"[{Path(scene_path).name}] foreground masks disabled: "
+                    f"{len(mask_stems)}/{len(image_stems)} image stems matched; "
+                    f"missing={len(missing)}. Generate a complete mask set before training."
+                )
+                return []
             args = ["--masks", name]
             if SUPPORTS_FOREGROUND_WEIGHT:
                 args.extend(["--foreground_loss_weight", str(FOREGROUND_LOSS_WEIGHT)])
@@ -782,6 +802,19 @@ def is_valid_checkpoint_archive(path):
     )
 
 
+def is_valid_checkpoint_zip(path):
+    """Validate the portable zip made from an extracted checkpoint folder."""
+    path = Path(path)
+    if not path.is_file() or path.suffix.lower() != ".zip" or path.stat().st_size < 1024:
+        return False
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            names = zf.namelist()
+            return zf.testzip() is None and any(name.endswith("/data.pkl") for name in names)
+    except Exception:
+        return False
+
+
 def pack_checkpoint_archive(archive_dir, destination):
     """Recreate a torch-compatible .pth zip from an extracted archive folder."""
     archive_dir, destination = Path(archive_dir), Path(destination)
@@ -798,8 +831,31 @@ def pack_checkpoint_archive(archive_dir, destination):
         return False
 
 
+def zip_checkpoint_archive(archive_dir, destination):
+    """Atomically package an extracted checkpoint directory as a portable zip."""
+    archive_dir, destination = Path(archive_dir), Path(destination)
+    if not is_valid_checkpoint_archive(archive_dir):
+        return None
+    # Keep the .zip suffix on the temporary path so the same validator is
+    # exercised before atomic publication.
+    temporary = destination.with_name(destination.stem + ".tmp" + destination.suffix)
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for entry in archive_dir.rglob("*"):
+                if entry.is_file():
+                    zf.write(entry, entry.relative_to(archive_dir).as_posix())
+        if not is_valid_checkpoint_zip(temporary):
+            raise RuntimeError("zip CRC/data.pkl validation failed")
+        os.replace(temporary, destination)
+        return destination
+    except Exception as exc:
+        temporary.unlink(missing_ok=True)
+        print(f"Checkpoint zip failed for {archive_dir}: {exc}")
+        return None
+
+
 def archive_checkpoint(scene_name, source):
-    """Extract a verified .pth into a durable per-scene archive directory."""
+    """Create a verified, portable per-scene checkpoint archive."""
     source = Path(source)
     iteration = checkpoint_iter(source)
     if iteration <= 0 or not is_valid_checkpoint(source):
@@ -823,14 +879,30 @@ def archive_checkpoint(scene_name, source):
         print(f"[{scene_name}] checkpoint archive failed: {exc}")
         return None
 
-    scene_suffix = f"_{destination.name.split('_', 1)[1]}"
+    zip_destination = destination.with_suffix(".zip")
+    if CHECKPOINT_ARCHIVE_ZIP:
+        if zip_checkpoint_archive(destination, zip_destination) is None:
+            # Preserve the extracted, verified archive when zip creation
+            # fails; it remains resumable and is safer than losing recovery.
+            return destination
+        shutil.rmtree(destination, ignore_errors=True)
+        destination = zip_destination
+
+    scene_suffix = f"_{checkpoint_backup_path(scene_name, 0).name.split('_', 1)[1]}"
     backups = sorted(
-        (path for path in CHECKPOINT_DIR.glob(f"chkpnt*{scene_suffix}") if path.is_dir()),
+        (
+            path for path in CHECKPOINT_DIR.glob(f"chkpnt*{scene_suffix}*")
+            if (path.is_dir() or path.suffix.lower() == ".zip")
+            and (path.stem if path.suffix.lower() == ".zip" else path.name).endswith(scene_suffix)
+        ),
         key=checkpoint_iter,
         reverse=True,
     )
     for stale in backups[CHECKPOINT_BACKUP_KEEP:]:
-        shutil.rmtree(stale, ignore_errors=True)
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+        else:
+            stale.unlink(missing_ok=True)
     print(f"[{scene_name}] verified checkpoint backup: {destination}")
     return destination
 
@@ -842,8 +914,19 @@ def restore_archived_checkpoint(scene_name, out_dir, source):
     if is_valid_checkpoint(destination):
         return destination
     temporary = destination.with_suffix(destination.suffix + ".restore.tmp")
+    unpacked = None
     try:
-        if not pack_checkpoint_archive(source, temporary):
+        archive_source = source
+        if source.suffix.lower() == ".zip":
+            if not is_valid_checkpoint_zip(source):
+                raise RuntimeError("checkpoint zip failed CRC/data.pkl validation")
+            unpacked = Path(tempfile.mkdtemp(prefix=f".{source.stem}.", dir=Path(out_dir)))
+            with zipfile.ZipFile(source, "r") as zf:
+                zf.extractall(unpacked)
+            if not is_valid_checkpoint_archive(unpacked):
+                raise RuntimeError("unpacked checkpoint has no data.pkl/data payload")
+            archive_source = unpacked
+        if not pack_checkpoint_archive(archive_source, temporary):
             raise RuntimeError("repacked checkpoint failed CRC/torch.load validation")
         os.replace(temporary, destination)
         print(f"[{scene_name}] restored verified checkpoint: {source} -> {destination}")
@@ -852,6 +935,9 @@ def restore_archived_checkpoint(scene_name, out_dir, source):
         temporary.unlink(missing_ok=True)
         print(f"[{scene_name}] checkpoint restore failed: {exc}")
         return None
+    finally:
+        if unpacked is not None:
+            shutil.rmtree(unpacked, ignore_errors=True)
 
 
 def is_valid_ply(path):
@@ -887,8 +973,9 @@ def latest_archived_checkpoint(scene_path, max_iter=None):
         (
             path
             for root in roots if root.is_dir()
-            for path in root.glob(f"chkpnt*{suffix}")
-            if path.is_dir()
+            for path in root.glob(f"chkpnt*{suffix}*")
+            if (path.is_dir() or path.suffix.lower() == ".zip")
+            and (path.stem if path.suffix.lower() == ".zip" else path.name).endswith(suffix)
         ),
         key=checkpoint_iter,
         reverse=True,
@@ -897,7 +984,7 @@ def latest_archived_checkpoint(scene_path, max_iter=None):
         iteration = checkpoint_iter(checkpoint)
         if max_iter is not None and iteration > max_iter:
             continue
-        if is_valid_checkpoint_archive(checkpoint):
+        if is_valid_checkpoint_archive(checkpoint) or is_valid_checkpoint_zip(checkpoint):
             print(f"[{scene_name}] verified archived checkpoint: {checkpoint} (iter {iteration})")
             return checkpoint
     return None
@@ -993,6 +1080,12 @@ def scene_train_config(scene_path):
         "checkpoint_iterations": CHECKPOINT_ITERATIONS,
         "validation_iterations": VALIDATION_ITERATIONS,
         "max_gaussians": MAX_GAUSSIANS,
+        # Do not let a 10M budget be consumed before camera coverage and
+        # opacity have stabilised.  For a 60k checkpoint-refinement run, the
+        # last stage admits the remaining budget only after 40k.
+        "densify_cap_schedule": os.environ.get(
+            "BTS_DENSIFY_CAP_SCHEDULE", "12000:1500000,22000:4000000,40000:7000000"
+        ).strip(),
         "max_screen_size": int(os.environ.get("BTS_MAX_SCREEN_SIZE", "20")),
         # Do not erase mature thin splats during the extended densification
         # phase.  New high-gradient structure can still split until 30k.
@@ -1014,6 +1107,9 @@ def scene_train_config(scene_path):
             # The final 10k remains a fixed-geometry convergence phase.
             "densify_until_iter": min(int(os.environ.get("BTS_CLOSEUP_DENSIFY_UNTIL_ITER", "30000")), ITERATIONS),
             "max_gaussians": int(os.environ.get("BTS_CLOSEUP_MAX_GAUSSIANS", "5000000")),
+            "densify_cap_schedule": os.environ.get(
+                "BTS_CLOSEUP_DENSIFY_CAP_SCHEDULE", "12000:1500000,22000:3500000"
+            ).strip(),
             "percent_dense": float(os.environ.get("BTS_CLOSEUP_PERCENT_DENSE", "0.005")),
             "depth_weight_init": float(os.environ.get("BTS_CLOSEUP_DEPTH_WEIGHT_INIT", "0.01")),
             # Keep large, distant window/background splats long enough to
@@ -1048,6 +1144,7 @@ def build_train_cmd(scene_path, gpu_id):
         f"[{scene_name}] profile={'closeup' if scene_name in CLOSEUP_SCENES else 'bts'} "
         f"| dense={cfg['percent_dense']} | grad={cfg['densify_grad_threshold']} "
         f"| depth_weight={cfg['depth_weight_init']} | screen_prune={cfg['max_screen_size']} "
+        f"| cap_schedule={cfg['densify_cap_schedule'] or 'off'} "
         f"| edge_loss={cfg['image_edge_loss_weight']} | checkpoints={cfg['checkpoint_iterations']} "
         f"| validate/render={cfg['validation_iterations']}"
     )
@@ -1094,6 +1191,8 @@ def build_train_cmd(scene_path, gpu_id):
         str(cfg["densify_grad_threshold"]),
         "--densify_until_iter",
         str(cfg["densify_until_iter"]),
+        "--densify_cap_schedule",
+        cfg["densify_cap_schedule"],
         "--percent_dense",
         str(cfg["percent_dense"]),
         "--opacity_reset_interval",
@@ -1304,12 +1403,24 @@ def train_and_render_scene(scene_path, gpu_id):
         if archived is not None and (local is None or checkpoint_iter(archived) > checkpoint_iter(local)):
             restore_archived_checkpoint(scene_name, out_dir, archived)
 
+    # A complete submission from an earlier (for example 40k) experiment must
+    # not prevent an explicit higher-iteration refinement run from resuming.
+    # The old behaviour returned here solely because images existed, even when
+    # BTS_ITERATIONS had been raised and no model at that target existed.
+    final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
+    final_ckpt = out_dir / f"chkpnt{ITERATIONS}.pth"
+    target_model_exists = is_valid_ply(final_ply) or is_valid_checkpoint(final_ckpt)
     expected_names = expected_submission_names(scene_path)
     existing_names = submission_names(scene_name)
-    if expected_names and existing_names == expected_names:
+    if expected_names and existing_names == expected_names and target_model_exists:
         print(f"[{scene_name}] submission already has all {len(existing_names)} expected images, skipping train/render.")
         return scene_name, 0
-    if existing_names:
+    if expected_names and existing_names == expected_names:
+        print(
+            f"[{scene_name}] existing submission is from an earlier iteration; "
+            f"target {ITERATIONS} has no verified model, so refinement will resume."
+        )
+    if existing_names and existing_names != expected_names:
         print(f"[{scene_name}] incomplete/stale submission ({len(existing_names)}/{len(expected_names)}); rerendering.")
 
     if hours_remaining() < KAGGLE_STOP_BUFFER_MIN / 60:
@@ -1320,9 +1431,6 @@ def train_and_render_scene(scene_path, gpu_id):
     if free_gb < MIN_FREE_DISK_GB:
         print(f"[{scene_name}] disk free {free_gb:.1f}GB < {MIN_FREE_DISK_GB:.1f}GB, skipping new training to preserve verified checkpoints.")
         return scene_name, 5
-
-    final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
-    final_ckpt = out_dir / f"chkpnt{ITERATIONS}.pth"
 
     print(f"[{scene_name}] checking final model artifacts.", flush=True)
     if is_valid_ply(final_ply) or is_valid_checkpoint(final_ckpt):
@@ -1450,6 +1558,9 @@ def worker(scene):
         print(f"[{Path(scene).name}] acquired GPU {gpu} from queue.", flush=True)
         return train_and_render_scene(scene, gpu)
     finally:
+        if unpacked is not None:
+            shutil.rmtree(unpacked, ignore_errors=True)
+
         gpu_queue.put(gpu)
 
 

@@ -697,13 +697,17 @@ def optional_mask_args(scene_path):
                 for path in mask_root.glob(ext)
             }
             missing = image_stems - mask_stems
-            if not image_stems or missing:
+            if not image_stems:
                 print(
                     f"[{Path(scene_path).name}] foreground masks disabled: "
-                    f"{len(mask_stems)}/{len(image_stems)} image stems matched; "
-                    f"missing={len(missing)}. Generate a complete mask set before training."
+                    "no training images were found."
                 )
                 return []
+            if missing:
+                print(
+                    f"[{Path(scene_path).name}] foreground masks: {len(mask_stems)}/{len(image_stems)} "
+                    f"matched; {len(missing)} views have no mask and will receive zero mask loss."
+                )
             args = ["--masks", name]
             if SUPPORTS_FOREGROUND_WEIGHT:
                 args.extend(["--foreground_loss_weight", str(FOREGROUND_LOSS_WEIGHT)])

@@ -213,14 +213,10 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
     )
     if opt.foreground_loss_weight > 0.0 or opt.foreground_edge_loss_weight > 0.0:
         missing_masks = [camera.image_name for camera in train_cameras if camera.foreground_mask is None]
-        if missing_masks:
-            raise RuntimeError(
-                "Foreground optimisation was requested but masks are missing for "
-                f"{len(missing_masks)}/{len(train_cameras)} train views; first={missing_masks[0]}"
-            )
         print(
-            f"Foreground optimisation enabled for all {len(train_cameras)} train views: "
-            f"L1 weight={opt.foreground_loss_weight}, edge weight={opt.foreground_edge_loss_weight}."
+            f"Foreground optimisation: masks for {len(train_cameras) - len(missing_masks)}/{len(train_cameras)} "
+            f"train views; L1 weight={opt.foreground_loss_weight}, edge weight={opt.foreground_edge_loss_weight}. "
+            "Views without a mask use only RGB/depth/image-edge losses."
         )
 
     # Phục hồi Exposure Compensation (giúp giảm mây mờ / floaters do chênh lệch độ sáng giữa các ảnh từ camera drone)

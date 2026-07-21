@@ -433,8 +433,8 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        if max_points > 0:
-            remaining = max(0, max_points - self.get_xyz.shape[0])
+        if max_points > 0 or max_new_points > 0:
+            remaining = max(0, max_points - self.get_xyz.shape[0]) if max_points > 0 else selected_pts_mask.sum().item()
             if max_new_points > 0:
                 remaining = min(remaining, max_new_points)
             selected = torch.nonzero(selected_pts_mask, as_tuple=False).squeeze(1)
@@ -473,8 +473,17 @@ class GaussianModel:
         )
         split_added = self.get_xyz.shape[0] - points_before_split
         clone_budget = max(0, max_new_points - split_added) if max_new_points > 0 else 0
+        # ``densify_and_split`` appends/prunes Gaussians and resets the
+        # densification accumulators.  The gradient tensor above describes
+        # the pre-split model, so indexing the post-split tensors with it
+        # causes a size mismatch (and would assign stale gradients to new
+        # children even if padded).  Defer cloning to the next densification
+        # interval, when all remaining points have fresh gradients.
+        clone_grads = grads
+        if clone_grads.shape[0] != self.get_xyz.shape[0]:
+            clone_grads = torch.zeros_like(self.xyz_gradient_accum)
         self.densify_and_clone(
-            grads, max_grad, extent, max_points=max_points,
+            clone_grads, max_grad, extent, max_points=max_points,
             max_new_points=clone_budget,
         )
 

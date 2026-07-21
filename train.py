@@ -462,7 +462,8 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                     if current_cap <= 0 or gaussians.get_xyz.shape[0] < current_cap:
                         gaussians.densify_and_prune(
                             opt.densify_grad_threshold, 0.005, scene.cameras_extent,
-                            size_threshold, radii, max_points=current_cap
+                            size_threshold, radii, max_points=current_cap,
+                            max_new_points=opt.max_new_points_per_densify,
                         )
                     else:
                         print(f"\n[ITER {iteration}] Point budget reached ({gaussians.get_xyz.shape[0]}/{current_cap}). Skipping densification.")

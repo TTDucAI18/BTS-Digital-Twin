@@ -110,6 +110,10 @@ class OptimizationParams(ParamGroup):
         # afterwards.  This prevents a low gradient threshold from consuming
         # the entire point budget in the first few thousand iterations.
         self.densify_cap_schedule = ""
+        # Bound one densification event independently of the global cap. This
+        # prevents split/clone temporary tensors from OOMing near the cap.
+        # 0 preserves the legacy unlimited event size.
+        self.max_new_points_per_densify = 0
         self.foreground_loss_weight = 0.0
         self.foreground_edge_loss_weight = 0.05
         self.image_edge_loss_weight = 0.0

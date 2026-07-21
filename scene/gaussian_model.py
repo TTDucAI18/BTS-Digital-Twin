@@ -390,7 +390,7 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, max_points=0):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, max_points=0, max_new_points=0):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -403,6 +403,8 @@ class GaussianModel:
             # N-1 points from the remaining model budget per selected source.
             remaining = max(0, max_points - self.get_xyz.shape[0])
             allowed = remaining // (N - 1)
+            if max_new_points > 0:
+                allowed = min(allowed, max_new_points // (N - 1))
             selected = torch.nonzero(selected_pts_mask, as_tuple=False).squeeze(1)
             if selected.numel() > allowed:
                 keep = selected[torch.topk(padded_grad[selected], allowed, sorted=False).indices] if allowed else selected[:0]
@@ -426,13 +428,15 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent, max_points=0):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, max_points=0, max_new_points=0):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         if max_points > 0:
             remaining = max(0, max_points - self.get_xyz.shape[0])
+            if max_new_points > 0:
+                remaining = min(remaining, max_new_points)
             selected = torch.nonzero(selected_pts_mask, as_tuple=False).squeeze(1)
             if selected.numel() > remaining:
                 grad_norm = torch.norm(grads, dim=-1)
@@ -451,7 +455,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_points=0):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_points=0, max_new_points=0):
         grads = self.xyz_gradient_accum / self.denom
         # A single invalid projected point must never win the top-k budget and
         # create a burst of displaced children around a tower tip.  NaN/Inf
@@ -459,8 +463,20 @@ class GaussianModel:
         grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
 
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent, max_points=max_points)
-        self.densify_and_split(grads, max_grad, extent, max_points=max_points)
+        # Split large high-gradient splats first.  With a fixed point budget,
+        # clone-first can exhaust all remaining slots and permanently starve
+        # the operation that actually sharpens blurred cables and edges.
+        points_before_split = self.get_xyz.shape[0]
+        self.densify_and_split(
+            grads, max_grad, extent, max_points=max_points,
+            max_new_points=max_new_points,
+        )
+        split_added = self.get_xyz.shape[0] - points_before_split
+        clone_budget = max(0, max_new_points - split_added) if max_new_points > 0 else 0
+        self.densify_and_clone(
+            grads, max_grad, extent, max_points=max_points,
+            max_new_points=clone_budget,
+        )
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:

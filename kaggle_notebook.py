@@ -121,9 +121,11 @@ CLOSEUP_RENDER_ENSEMBLE_SCALES = [
 ]
 if not CLOSEUP_RENDER_ENSEMBLE_SCALES or any(scale < 1.0 for scale in CLOSEUP_RENDER_ENSEMBLE_SCALES):
     raise ValueError("BTS_CLOSEUP_RENDER_ENSEMBLE_SCALES must contain one or more scales >= 1.0.")
-# Upper bound only, never a target.  The staged budget below makes a 10M
-# ceiling safe for high-detail BTS reruns instead of spending it immediately.
-MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "10000000"))
+# A 7M run needs bounded densification events and lower SH storage on a T4;
+# both are configured below.  It remains an upper bound, not a point target.
+MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "7000000"))
+SH_DEGREE = int(os.environ.get("BTS_SH_DEGREE", "2"))
+MAX_NEW_POINTS_PER_DENSIFY = int(os.environ.get("BTS_MAX_NEW_POINTS_PER_DENSIFY", "75000"))
 # Thin tower lattice and cables retain high image-space gradients late in
 # training.  Stopping at 15k freezes their allocation while the 15k--40k
 # phase merely optimises oversized splats, producing the observed smearing.
@@ -176,6 +178,9 @@ if (
     TRAIN_RESOLUTION <= 0
     or RENDER_RESOLUTION <= 0
     or MAX_GAUSSIANS < 0
+    or SH_DEGREE < 0
+    or SH_DEGREE > 3
+    or MAX_NEW_POINTS_PER_DENSIFY < 0
     or FOREGROUND_LOSS_WEIGHT < 0
     or FOREGROUND_EDGE_LOSS_WEIGHT < 0
     or MAX_WORKERS <= 0
@@ -1080,11 +1085,12 @@ def scene_train_config(scene_path):
         "checkpoint_iterations": CHECKPOINT_ITERATIONS,
         "validation_iterations": VALIDATION_ITERATIONS,
         "max_gaussians": MAX_GAUSSIANS,
-        # Do not let a 10M budget be consumed before camera coverage and
-        # opacity have stabilised.  For a 60k checkpoint-refinement run, the
-        # last stage admits the remaining budget only after 40k.
+        "max_new_points_per_densify": MAX_NEW_POINTS_PER_DENSIFY,
+        # Spend the memory-safe budget gradually.  Fine wire/background
+        # structure gets new splats late, while early training cannot consume
+        # all memory in one densification peak.
         "densify_cap_schedule": os.environ.get(
-            "BTS_DENSIFY_CAP_SCHEDULE", "12000:1500000,22000:4000000,40000:7000000"
+            "BTS_DENSIFY_CAP_SCHEDULE", "10000:1200000,17000:3200000,21000:5200000"
         ).strip(),
         "max_screen_size": int(os.environ.get("BTS_MAX_SCREEN_SIZE", "20")),
         # Do not erase mature thin splats during the extended densification
@@ -1105,10 +1111,16 @@ def scene_train_config(scene_path):
             # Do not freeze close-up geometry at 20k: this was the source of
             # the chair/bonsai point-count plateau and blurred close-up edges.
             # The final 10k remains a fixed-geometry convergence phase.
-            "densify_until_iter": min(int(os.environ.get("BTS_CLOSEUP_DENSIFY_UNTIL_ITER", "30000")), ITERATIONS),
-            "max_gaussians": int(os.environ.get("BTS_CLOSEUP_MAX_GAUSSIANS", "5000000")),
+            "densify_until_iter": min(
+                int(os.environ.get("BTS_CLOSEUP_DENSIFY_UNTIL_ITER", str(DENSIFY_UNTIL_ITER))),
+                ITERATIONS,
+            ),
+            "max_gaussians": int(os.environ.get("BTS_CLOSEUP_MAX_GAUSSIANS", str(MAX_GAUSSIANS))),
+            "max_new_points_per_densify": int(os.environ.get(
+                "BTS_CLOSEUP_MAX_NEW_POINTS_PER_DENSIFY", str(MAX_NEW_POINTS_PER_DENSIFY)
+            )),
             "densify_cap_schedule": os.environ.get(
-                "BTS_CLOSEUP_DENSIFY_CAP_SCHEDULE", "12000:1500000,22000:3500000"
+                "BTS_CLOSEUP_DENSIFY_CAP_SCHEDULE", "10000:1200000,17000:3200000,21000:5200000"
             ).strip(),
             "percent_dense": float(os.environ.get("BTS_CLOSEUP_PERCENT_DENSE", "0.005")),
             "depth_weight_init": float(os.environ.get("BTS_CLOSEUP_DEPTH_WEIGHT_INIT", "0.01")),
@@ -1125,6 +1137,7 @@ def scene_train_config(scene_path):
         or not 0 < cfg["percent_dense"] <= 1
         or cfg["depth_weight_init"] < 0
         or cfg["max_gaussians"] < 0
+        or cfg["max_new_points_per_densify"] < 0
         or cfg["max_screen_size"] < 0
         or cfg["opacity_reset_until_iter"] < 0
         or cfg["image_edge_loss_weight"] < 0
@@ -1144,7 +1157,7 @@ def build_train_cmd(scene_path, gpu_id):
         f"[{scene_name}] profile={'closeup' if scene_name in CLOSEUP_SCENES else 'bts'} "
         f"| dense={cfg['percent_dense']} | grad={cfg['densify_grad_threshold']} "
         f"| depth_weight={cfg['depth_weight_init']} | screen_prune={cfg['max_screen_size']} "
-        f"| cap_schedule={cfg['densify_cap_schedule'] or 'off'} "
+        f"| cap_schedule={cfg['densify_cap_schedule'] or 'off'} | max_new={cfg['max_new_points_per_densify']} "
         f"| edge_loss={cfg['image_edge_loss_weight']} | checkpoints={cfg['checkpoint_iterations']} "
         f"| validate/render={cfg['validation_iterations']}"
     )
@@ -1174,7 +1187,7 @@ def build_train_cmd(scene_path, gpu_id):
         "-r",
         str(cfg["resolution"]),
         "--sh_degree",
-        "3",
+        str(SH_DEGREE),
         "--data_device",
         "cpu",
         "--iterations",
@@ -1193,6 +1206,8 @@ def build_train_cmd(scene_path, gpu_id):
         str(cfg["densify_until_iter"]),
         "--densify_cap_schedule",
         cfg["densify_cap_schedule"],
+        "--max_new_points_per_densify",
+        str(cfg["max_new_points_per_densify"]),
         "--percent_dense",
         str(cfg["percent_dense"]),
         "--opacity_reset_interval",
@@ -1287,7 +1302,7 @@ def build_render_cmd(scene_path, gpu_id, iteration):
         "--iteration",
         str(iteration),
         "--sh_degree",
-        "3",
+        str(SH_DEGREE),
         "--quiet",
         "--ensemble_scales",
         *[str(scale) for scale in ensemble_scales],
@@ -1558,9 +1573,6 @@ def worker(scene):
         print(f"[{Path(scene).name}] acquired GPU {gpu} from queue.", flush=True)
         return train_and_render_scene(scene, gpu)
     finally:
-        if unpacked is not None:
-            shutil.rmtree(unpacked, ignore_errors=True)
-
         gpu_queue.put(gpu)
 
 

@@ -460,6 +460,7 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                             opt.densify_grad_threshold, 0.005, scene.cameras_extent,
                             size_threshold, radii, max_points=current_cap,
                             max_new_points=opt.max_new_points_per_densify,
+                            clone_before_split=opt.densify_clone_before_split,
                         )
                     else:
                         print(f"\n[ITER {iteration}] Point budget reached ({gaussians.get_xyz.shape[0]}/{current_cap}). Skipping densification.")

@@ -69,10 +69,14 @@ DATA_ROOT_CANDIDATES = [
     Path("D:/ai_race_2026/data/phase1"),
 ]
 
-ITERATIONS = int(os.environ.get("BTS_ITERATIONS", "40000"))
+# BTS scenes already have useful 40k checkpoints; give their refinement phase
+# enough room for new geometry.  Close-up scenes intentionally start clean and
+# retain the shorter 40k schedule below.
+ITERATIONS = int(os.environ.get("BTS_ITERATIONS", "60000"))
+CLOSEUP_ITERATIONS = int(os.environ.get("BTS_CLOSEUP_ITERATIONS", "40000"))
 POSITION_LR_MAX_STEPS = int(os.environ.get("BTS_POSITION_LR_MAX_STEPS", str(ITERATIONS)))
-if ITERATIONS <= 0 or POSITION_LR_MAX_STEPS <= 0:
-    raise ValueError("BTS_ITERATIONS and BTS_POSITION_LR_MAX_STEPS must be positive.")
+if ITERATIONS <= 0 or CLOSEUP_ITERATIONS <= 0 or POSITION_LR_MAX_STEPS <= 0:
+    raise ValueError("BTS_ITERATIONS, BTS_CLOSEUP_ITERATIONS and BTS_POSITION_LR_MAX_STEPS must be positive.")
 # Keep recovery/model-selection checkpoints at these milestones.  Checkpoint
 # I/O is much cheaper than rendering a set of held-out cameras, and the latter
 # is unnecessary once 40k has been selected as the submission schedule.
@@ -81,7 +85,7 @@ _requested_checkpoint_iterations = {
     # With a 5M safety ceiling, a CUDA OOM is a hard crash rather than a clean
     # deadline stop.  Checkpoint at 10k/20k as well, while train.py retains
     # only the latest verified archive so this does not accumulate disk usage.
-    for value in os.environ.get("BTS_CHECKPOINT_ITERATIONS", "10000,20000,30000,35000,40000").split(",")
+    for value in os.environ.get("BTS_CHECKPOINT_ITERATIONS", "10000,20000,30000,35000,40000,45000,50000,55000,60000").split(",")
     if value.strip()
 }
 CHECKPOINT_ITERATIONS = sorted(
@@ -123,14 +127,14 @@ if not CLOSEUP_RENDER_ENSEMBLE_SCALES or any(scale < 1.0 for scale in CLOSEUP_RE
     raise ValueError("BTS_CLOSEUP_RENDER_ENSEMBLE_SCALES must contain one or more scales >= 1.0.")
 # A 7M run needs bounded densification events and lower SH storage on a T4;
 # both are configured below.  It remains an upper bound, not a point target.
-MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "7000000"))
+MAX_GAUSSIANS = int(os.environ.get("BTS_MAX_GAUSSIANS", "8000000"))
 SH_DEGREE = int(os.environ.get("BTS_SH_DEGREE", "2"))
 MAX_NEW_POINTS_PER_DENSIFY = int(os.environ.get("BTS_MAX_NEW_POINTS_PER_DENSIFY", "75000"))
 # Thin tower lattice and cables retain high image-space gradients late in
 # training.  Stopping at 15k freezes their allocation while the 15k--40k
 # phase merely optimises oversized splats, producing the observed smearing.
 DENSIFY_GRAD_THRESHOLD = float(os.environ.get("BTS_DENSIFY_GRAD_THRESHOLD", "0.00015"))
-DENSIFY_UNTIL_ITER = int(os.environ.get("BTS_DENSIFY_UNTIL_ITER", "30000"))
+DENSIFY_UNTIL_ITER = int(os.environ.get("BTS_DENSIFY_UNTIL_ITER", "50000"))
 PERCENT_DENSE = float(os.environ.get("BTS_PERCENT_DENSE", "0.005"))
 if DENSIFY_GRAD_THRESHOLD <= 0 or DENSIFY_UNTIL_ITER <= 0 or not 0 < PERCENT_DENSE <= 1:
     raise ValueError("BTS densification settings must be positive, and BTS_PERCENT_DENSE must be in (0, 1].")
@@ -160,6 +164,12 @@ RESUME_INPUT = os.environ.get("BTS_RESUME_INPUT", "0").strip() == "1"
 # directories immediately before that scene starts.  It is opt-in because it
 # intentionally discards resumable checkpoints from a prior experiment.
 FRESH_RUN = os.environ.get("BTS_FRESH_RUN", "0").strip() == "1"
+# This run deliberately retrains the two close-range scenes from scratch while
+# preserving all five BTS 40k checkpoints for refinement.  Set to an empty
+# string to retain a close-up checkpoint for an ablation.
+FRESH_SCENES = frozenset(
+    name.strip() for name in os.environ.get("BTS_FRESH_SCENES", "bonsai,chair").split(",") if name.strip()
+)
 # Successful scenes normally release their model after their exact render set
 # was copied, saving Kaggle disk.  Enable this for a rerun when final PLY and
 # checkpoint artifacts must remain available for inspection or later renders.
@@ -1080,14 +1090,20 @@ print(f"Extracted {{args.out_ply}}")
 
 def scene_train_config(scene_path):
     scene_name = Path(scene_path).name
+    target_iterations = CLOSEUP_ITERATIONS if scene_name in CLOSEUP_SCENES else ITERATIONS
     cfg = {
+        "iterations": target_iterations,
         "resolution": TRAIN_RESOLUTION,
         "densify_grad_threshold": DENSIFY_GRAD_THRESHOLD,
-        "densify_until_iter": min(DENSIFY_UNTIL_ITER, ITERATIONS),
+        "densify_until_iter": min(DENSIFY_UNTIL_ITER, target_iterations),
         "percent_dense": PERCENT_DENSE,
         "depth_weight_init": float(os.environ.get("BTS_DEPTH_WEIGHT_INIT", "0.02")),
-        "checkpoint_iterations": CHECKPOINT_ITERATIONS,
-        "validation_iterations": VALIDATION_ITERATIONS,
+        "checkpoint_iterations": sorted(set(
+            iteration for iteration in CHECKPOINT_ITERATIONS if iteration <= target_iterations
+        ) | {target_iterations}),
+        "validation_iterations": sorted(set(
+            iteration for iteration in VALIDATION_ITERATIONS if iteration <= target_iterations
+        ) | {target_iterations}),
         "max_gaussians": MAX_GAUSSIANS,
         "max_new_points_per_densify": MAX_NEW_POINTS_PER_DENSIFY,
         # Spend the memory-safe budget gradually.  Fine wire/background
@@ -1105,28 +1121,41 @@ def scene_train_config(scene_path):
         "image_edge_loss_weight": float(os.environ.get("BTS_IMAGE_EDGE_LOSS_WEIGHT", "0.02")),
         "position_lr_init": float(os.environ.get("BTS_POSITION_LR_INIT", "0.00016")),
         "position_lr_max_steps": POSITION_LR_MAX_STEPS,
+        "densify_clone_before_split": False,
     }
     if scene_name in CLOSEUP_SCENES:
         # bonsai/chair are compact, close-range 360-degree captures.  Smaller
         # split/clone scale and a lower gradient gate create tighter Gaussians;
         # Depth Anything remains a weak anchor instead of flattening fine shape.
         cfg.update({
-            "densify_grad_threshold": float(os.environ.get("BTS_CLOSEUP_DENSIFY_GRAD_THRESHOLD", "0.00012")),
+            "densify_grad_threshold": float(os.environ.get("BTS_CLOSEUP_DENSIFY_GRAD_THRESHOLD", "0.00008")),
             # Do not freeze close-up geometry at 20k: this was the source of
             # the chair/bonsai point-count plateau and blurred close-up edges.
             # The final 10k remains a fixed-geometry convergence phase.
             "densify_until_iter": min(
-                int(os.environ.get("BTS_CLOSEUP_DENSIFY_UNTIL_ITER", str(DENSIFY_UNTIL_ITER))),
-                ITERATIONS,
+                int(os.environ.get("BTS_CLOSEUP_DENSIFY_UNTIL_ITER", "30000")),
+                target_iterations,
             ),
             "max_gaussians": int(os.environ.get("BTS_CLOSEUP_MAX_GAUSSIANS", str(MAX_GAUSSIANS))),
             "max_new_points_per_densify": int(os.environ.get(
                 "BTS_CLOSEUP_MAX_NEW_POINTS_PER_DENSIFY", str(MAX_NEW_POINTS_PER_DENSIFY)
             )),
+            # Allocate at least 3M slots by 30k.  The target is reachable only
+            # when gradients justify it; it is not an artificial point pad.
             "densify_cap_schedule": os.environ.get(
-                "BTS_CLOSEUP_DENSIFY_CAP_SCHEDULE", "10000:1200000,17000:3200000,21000:5200000"
+                "BTS_CLOSEUP_DENSIFY_CAP_SCHEDULE", "10000:1200000,17000:2200000,30000:4000000"
             ).strip(),
-            "percent_dense": float(os.environ.get("BTS_CLOSEUP_PERCENT_DENSE", "0.005")),
+            # Small close-up splats must clone even in an interval that also
+            # splits larger splats; otherwise foliage/chair detail plateaus.
+            "densify_clone_before_split": os.environ.get(
+                "BTS_CLOSEUP_CLONE_BEFORE_SPLIT", "1"
+            ).strip() != "0",
+            # A fresh 40k close-up run should decay its position LR over 40k,
+            # independently from the BTS 40k->60k refinement schedule.
+            "position_lr_max_steps": int(os.environ.get(
+                "BTS_CLOSEUP_POSITION_LR_MAX_STEPS", str(target_iterations)
+            )),
+            "percent_dense": float(os.environ.get("BTS_CLOSEUP_PERCENT_DENSE", "0.01")),
             "depth_weight_init": float(os.environ.get("BTS_CLOSEUP_DEPTH_WEIGHT_INIT", "0.01")),
             # Keep large, distant window/background splats long enough to
             # converge, while a weak image-edge loss protects chair holes and
@@ -1153,6 +1182,10 @@ def scene_train_config(scene_path):
     return cfg
 
 
+def scene_is_fresh(scene_name):
+    return FRESH_RUN or scene_name in FRESH_SCENES
+
+
 def build_train_cmd(scene_path, gpu_id):
     scene_name = Path(scene_path).name
     out_dir = scene_output(scene_path)
@@ -1166,18 +1199,19 @@ def build_train_cmd(scene_path, gpu_id):
         f"| validate/render={cfg['validation_iterations']}"
     )
     resume = None
-    if RESUME_LOCAL and not FRESH_RUN:
+    target_iterations = cfg["iterations"]
+    if RESUME_LOCAL and not scene_is_fresh(scene_name):
         # A SIGKILL may leave the scene output partially cleaned or corrupted.
         # Choose the newest valid copy across the live model directory and the
         # independently verified archive.
-        local_resume = latest_checkpoint(out_dir, max_iter=ITERATIONS - 1)
-        archived_resume = latest_archived_checkpoint(scene_path, max_iter=ITERATIONS - 1)
+        local_resume = latest_checkpoint(out_dir, max_iter=target_iterations - 1)
+        archived_resume = latest_archived_checkpoint(scene_path, max_iter=target_iterations - 1)
         candidates = [path for path in (local_resume, archived_resume) if path is not None]
         resume = max(candidates, key=checkpoint_iter) if candidates else None
     if resume is not None:
         print(f"[{scene_name}] resuming newest verified checkpoint: {resume}")
     elif RESUME_INPUT:
-        resume = latest_input_checkpoint(scene_path, max_iter=ITERATIONS - 1)
+        resume = latest_input_checkpoint(scene_path, max_iter=target_iterations - 1)
     else:
         print(f"[{scene_name}] input-checkpoint resume disabled; starting clean if no local checkpoint exists.")
 
@@ -1195,7 +1229,7 @@ def build_train_cmd(scene_path, gpu_id):
         "--data_device",
         "cpu",
         "--iterations",
-        str(ITERATIONS),
+        str(target_iterations),
         "--lambda_dssim",
         "0.2",
         "--position_lr_init",
@@ -1237,7 +1271,7 @@ def build_train_cmd(scene_path, gpu_id):
         "--checkpoint_iterations",
         *[str(x) for x in cfg["checkpoint_iterations"]],
         "--save_iterations",
-        str(ITERATIONS),
+        str(target_iterations),
         "--disable_viewer",
         # Do not pass --quiet here. train.py sends it to safe_state(), whose
         # stdout wrapper drops every print and tqdm update. With subprocess
@@ -1251,6 +1285,8 @@ def build_train_cmd(scene_path, gpu_id):
     ]
     if VALIDATION_HOLDOUT:
         cmd.append("--validation_holdout")
+    if cfg["densify_clone_before_split"]:
+        cmd.append("--densify_clone_before_split")
 
     if SUPPORTS_MAX_GAUSSIANS:
         cmd.extend(["--max_gaussians", str(cfg["max_gaussians"])])
@@ -1398,11 +1434,13 @@ def submission_names(scene_name):
 def train_and_render_scene(scene_path, gpu_id):
     scene_path = Path(scene_path)
     scene_name = scene_path.name
+    target_iterations = scene_train_config(scene_path)["iterations"]
+    fresh_scene = scene_is_fresh(scene_name)
     out_dir = scene_output(scene_path)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[{scene_name}] worker started on GPU {gpu_id}; running preflight.", flush=True)
 
-    if FRESH_RUN:
+    if fresh_scene:
         # This is intentionally scoped to exactly one selected scene.  It runs
         # before checkpoint discovery so --start_checkpoint can never revive a
         # model from the previous experiment.
@@ -1412,9 +1450,9 @@ def train_and_render_scene(scene_path, gpu_id):
         if scene_submission.exists():
             shutil.rmtree(scene_submission)
         out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[{scene_name}] BTS_FRESH_RUN=1: cleared prior model and renders.")
+        print(f"[{scene_name}] fresh-scene policy: cleared prior model and renders.")
 
-    if RESUME_LOCAL and not FRESH_RUN:
+    if RESUME_LOCAL and not fresh_scene:
         # Hydrate a backup before the final-artifact check as well: an archived
         # 40k checkpoint can be rendered immediately without retraining.
         archived = latest_archived_checkpoint(scene_path)
@@ -1426,8 +1464,8 @@ def train_and_render_scene(scene_path, gpu_id):
     # not prevent an explicit higher-iteration refinement run from resuming.
     # The old behaviour returned here solely because images existed, even when
     # BTS_ITERATIONS had been raised and no model at that target existed.
-    final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
-    final_ckpt = out_dir / f"chkpnt{ITERATIONS}.pth"
+    final_ply = out_dir / "point_cloud" / f"iteration_{target_iterations}" / "point_cloud.ply"
+    final_ckpt = out_dir / f"chkpnt{target_iterations}.pth"
     target_model_exists = is_valid_ply(final_ply) or is_valid_checkpoint(final_ckpt)
     expected_names = expected_submission_names(scene_path)
     existing_names = submission_names(scene_name)
@@ -1437,7 +1475,7 @@ def train_and_render_scene(scene_path, gpu_id):
     if expected_names and existing_names == expected_names:
         print(
             f"[{scene_name}] existing submission is from an earlier iteration; "
-            f"target {ITERATIONS} has no verified model, so refinement will resume."
+            f"target {target_iterations} has no verified model, so refinement will resume."
         )
     if existing_names and existing_names != expected_names:
         print(f"[{scene_name}] incomplete/stale submission ({len(existing_names)}/{len(expected_names)}); rerendering.")
@@ -1488,11 +1526,11 @@ def train_and_render_scene(scene_path, gpu_id):
     # Render the requested schedule point exactly.  A prior experiment can
     # leave a later valid checkpoint in this output directory; choosing the
     # numerically latest artifact would silently submit that other experiment.
-    it = ITERATIONS
+    it = target_iterations
     if not (is_valid_ply(final_ply) or is_valid_checkpoint(final_ckpt)):
         completed_iter = final_iteration(out_dir)
         print(
-            f"[{scene_name}] training stopped at iter {completed_iter}; expected {ITERATIONS}. "
+            f"[{scene_name}] training stopped at iter {completed_iter}; expected {target_iterations}. "
             "Rendering is deferred until a verified final checkpoint/PLY exists."
         )
         return scene_name, 6
@@ -1544,15 +1582,17 @@ def train_and_render_scene(scene_path, gpu_id):
 
 def scene_priority(scene_path):
     out_dir = scene_output(scene_path)
-    final_ply = out_dir / "point_cloud" / f"iteration_{ITERATIONS}" / "point_cloud.ply"
-    if is_valid_ply(final_ply) or is_valid_checkpoint(out_dir / f"chkpnt{ITERATIONS}.pth"):
+    scene_name = Path(scene_path).name
+    target_iterations = scene_train_config(scene_path)["iterations"]
+    final_ply = out_dir / "point_cloud" / f"iteration_{target_iterations}" / "point_cloud.ply"
+    if is_valid_ply(final_ply) or is_valid_checkpoint(out_dir / f"chkpnt{target_iterations}.pth"):
         return (3, 0)
     partial = None
-    if RESUME_LOCAL:
+    if RESUME_LOCAL and not scene_is_fresh(scene_name):
         candidates = [
             checkpoint for checkpoint in (
-                latest_checkpoint(out_dir, max_iter=ITERATIONS - 1),
-                latest_archived_checkpoint(scene_path, max_iter=ITERATIONS - 1),
+                latest_checkpoint(out_dir, max_iter=target_iterations - 1),
+                latest_archived_checkpoint(scene_path, max_iter=target_iterations - 1),
             )
             if checkpoint is not None
         ]
@@ -1582,7 +1622,8 @@ def worker(scene):
 
 print("=" * 80)
 print(
-    f"Starting pipeline: {len(ALL_SCENES)} scenes, GPUs={GPU_IDS}, iterations={ITERATIONS}, "
+    f"Starting pipeline: {len(ALL_SCENES)} scenes, GPUs={GPU_IDS}, BTS iterations={ITERATIONS}, "
+    f"close-up iterations={CLOSEUP_ITERATIONS}, fresh={sorted(FRESH_SCENES)}, "
     f"checkpoints={CHECKPOINT_ITERATIONS}, validation/render={VALIDATION_ITERATIONS}"
 )
 print("=" * 80)

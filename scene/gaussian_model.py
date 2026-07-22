@@ -455,7 +455,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_points=0, max_new_points=0):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_points=0, max_new_points=0, clone_before_split=False):
         grads = self.xyz_gradient_accum / self.denom
         # A single invalid projected point must never win the top-k budget and
         # create a burst of displaced children around a tower tip.  NaN/Inf
@@ -463,13 +463,31 @@ class GaussianModel:
         grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
 
         self.tmp_radii = radii
+        # Close-range reconstruction needs small splats to clone as well as
+        # large splats to split.  Reserve half an event's growth for cloning;
+        # it otherwise gets skipped whenever splitting changes tensor size.
+        if clone_before_split:
+            clone_budget = max_new_points // 2 if max_new_points > 0 else 0
+            points_before_clone = self.get_xyz.shape[0]
+            self.densify_and_clone(
+                grads, max_grad, extent, max_points=max_points,
+                max_new_points=clone_budget,
+            )
+            clone_added = self.get_xyz.shape[0] - points_before_clone
+            split_budget = max(0, max_new_points - clone_added) if max_new_points > 0 else 0
+            # The original points remain at the front after cloning, so the
+            # pre-clone gradients are still correctly aligned; new clones get
+            # a zero gradient in densify_and_split's padded vector.
+        else:
+            split_budget = max_new_points
+
         # Split large high-gradient splats first.  With a fixed point budget,
         # clone-first can exhaust all remaining slots and permanently starve
         # the operation that actually sharpens blurred cables and edges.
         points_before_split = self.get_xyz.shape[0]
         self.densify_and_split(
             grads, max_grad, extent, max_points=max_points,
-            max_new_points=max_new_points,
+            max_new_points=split_budget,
         )
         split_added = self.get_xyz.shape[0] - points_before_split
         clone_budget = max(0, max_new_points - split_added) if max_new_points > 0 else 0
@@ -482,10 +500,11 @@ class GaussianModel:
         clone_grads = grads
         if clone_grads.shape[0] != self.get_xyz.shape[0]:
             clone_grads = torch.zeros_like(self.xyz_gradient_accum)
-        self.densify_and_clone(
-            clone_grads, max_grad, extent, max_points=max_points,
-            max_new_points=clone_budget,
-        )
+        if not clone_before_split:
+            self.densify_and_clone(
+                clone_grads, max_grad, extent, max_points=max_points,
+                max_new_points=clone_budget,
+            )
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:

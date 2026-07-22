@@ -114,6 +114,10 @@ class OptimizationParams(ParamGroup):
         # prevents split/clone temporary tensors from OOMing near the cap.
         # 0 preserves the legacy unlimited event size.
         self.max_new_points_per_densify = 0
+        # Close-range scenes benefit from cloning already-small splats in the
+        # same densification interval as large-splat splitting.  Default keeps
+        # the established BTS split-first behaviour.
+        self.densify_clone_before_split = False
         self.foreground_loss_weight = 0.0
         self.foreground_edge_loss_weight = 0.05
         self.image_edge_loss_weight = 0.0

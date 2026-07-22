@@ -932,7 +932,13 @@ def restore_archived_checkpoint(scene_name, out_dir, source):
     destination = Path(out_dir) / f"chkpnt{checkpoint_iter(source)}.pth"
     if is_valid_checkpoint(destination):
         return destination
-    temporary = destination.with_suffix(destination.suffix + ".restore.tmp")
+    # Keep a normal checkpoint-shaped name while validating the temporary
+    # archive.  ``is_valid_checkpoint`` derives the expected iteration from
+    # the filename, so ``chkpnt40000.pth.restore.tmp`` is rejected despite a
+    # valid torch payload (its stem no longer parses as iteration 40000).
+    temporary = destination.with_name(
+        f"chkpnt{checkpoint_iter(source)}_restore.pth"
+    )
     unpacked = None
     try:
         archive_source = source

@@ -1200,19 +1200,22 @@ def scene_train_config(scene_path):
             "prune_only_until_iter": target_iterations,
             "prune_opacity_threshold": float(os.environ.get(
                 f"{scene_prefix}_CLEANUP_PRUNE_OPACITY_THRESHOLD",
-                os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_OPACITY_THRESHOLD", "0.008"),
+                os.environ.get(
+                    f"{group_prefix}_CLEANUP_PRUNE_OPACITY_THRESHOLD",
+                    "0.008" if is_closeup else "0.003",
+                ),
             )),
             "max_screen_size": int(os.environ.get(
                 f"{scene_prefix}_CLEANUP_MAX_SCREEN_SIZE",
-                os.environ.get(f"{group_prefix}_CLEANUP_MAX_SCREEN_SIZE", "96" if is_closeup else "80"),
+                os.environ.get(f"{group_prefix}_CLEANUP_MAX_SCREEN_SIZE", "96" if is_closeup else "256"),
             )),
             "prune_warmup_iters": int(os.environ.get(
                 f"{scene_prefix}_CLEANUP_PRUNE_WARMUP_ITERS",
-                os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_WARMUP_ITERS", "500"),
+                os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_WARMUP_ITERS", "500" if is_closeup else "1000"),
             )),
             "prune_interval": int(os.environ.get(
                 f"{scene_prefix}_CLEANUP_PRUNE_INTERVAL",
-                os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_INTERVAL", "500"),
+                os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_INTERVAL", "750" if is_closeup else "1000"),
             )),
         })
     invalid = (

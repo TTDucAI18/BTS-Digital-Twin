@@ -1144,6 +1144,8 @@ def scene_train_config(scene_path):
         "densify_clone_before_split": False,
         "prune_only_until_iter": 0,
         "prune_opacity_threshold": float(os.environ.get("BTS_PRUNE_OPACITY_THRESHOLD", "0.005")),
+        "prune_warmup_iters": int(os.environ.get("BTS_PRUNE_WARMUP_ITERS", "500")),
+        "prune_interval": int(os.environ.get("BTS_PRUNE_INTERVAL", "500")),
     }
     if is_closeup:
         # bonsai/chair are compact, close-range 360-degree captures.  Smaller
@@ -1188,6 +1190,8 @@ def scene_train_config(scene_path):
             "prune_opacity_threshold": float(os.environ.get(
                 "BTS_CLOSEUP_PRUNE_OPACITY_THRESHOLD", "0.005"
             )),
+            "prune_warmup_iters": int(os.environ.get("BTS_CLOSEUP_PRUNE_WARMUP_ITERS", "500")),
+            "prune_interval": int(os.environ.get("BTS_CLOSEUP_PRUNE_INTERVAL", "500")),
         })
     if cleanup_active:
         group_prefix = "BTS_CLOSEUP" if is_closeup else "BTS"
@@ -1200,7 +1204,15 @@ def scene_train_config(scene_path):
             )),
             "max_screen_size": int(os.environ.get(
                 f"{scene_prefix}_CLEANUP_MAX_SCREEN_SIZE",
-                os.environ.get(f"{group_prefix}_CLEANUP_MAX_SCREEN_SIZE", "24" if is_closeup else "18"),
+                os.environ.get(f"{group_prefix}_CLEANUP_MAX_SCREEN_SIZE", "96" if is_closeup else "80"),
+            )),
+            "prune_warmup_iters": int(os.environ.get(
+                f"{scene_prefix}_CLEANUP_PRUNE_WARMUP_ITERS",
+                os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_WARMUP_ITERS", "500"),
+            )),
+            "prune_interval": int(os.environ.get(
+                f"{scene_prefix}_CLEANUP_PRUNE_INTERVAL",
+                os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_INTERVAL", "500"),
             )),
         })
     invalid = (
@@ -1217,6 +1229,8 @@ def scene_train_config(scene_path):
         or cfg["position_lr_max_steps"] <= 0
         or cfg["prune_only_until_iter"] < 0
         or not 0 < cfg["prune_opacity_threshold"] < 1
+        or cfg["prune_warmup_iters"] < 0
+        or cfg["prune_interval"] <= 0
     )
     if invalid:
         raise ValueError(f"[{scene_name}] invalid scene training configuration: {cfg}")
@@ -1237,7 +1251,8 @@ def build_train_cmd(scene_path, gpu_id):
         f"| depth_weight={cfg['depth_weight_init']} | screen_prune={cfg['max_screen_size']} "
         f"| cap_schedule={cfg['densify_cap_schedule'] or 'off'} | max_new={cfg['max_new_points_per_densify']} "
         f"| edge_loss={cfg['image_edge_loss_weight']} | prune_until={cfg['prune_only_until_iter']} "
-        f"| prune_opacity={cfg['prune_opacity_threshold']} | checkpoints={cfg['checkpoint_iterations']} "
+        f"| prune_opacity={cfg['prune_opacity_threshold']} | prune_warmup={cfg['prune_warmup_iters']} "
+        f"| prune_interval={cfg['prune_interval']} | checkpoints={cfg['checkpoint_iterations']} "
         f"| validate/render={cfg['validation_iterations']}"
     )
     resume = None
@@ -1292,6 +1307,10 @@ def build_train_cmd(scene_path, gpu_id):
         str(cfg["prune_only_until_iter"]),
         "--prune_opacity_threshold",
         str(cfg["prune_opacity_threshold"]),
+        "--prune_warmup_iters",
+        str(cfg["prune_warmup_iters"]),
+        "--prune_interval",
+        str(cfg["prune_interval"]),
         "--percent_dense",
         str(cfg["percent_dense"]),
         "--opacity_reset_interval",

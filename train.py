@@ -152,6 +152,7 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
         print(f"Densification point-budget schedule: {densify_cap_stages}; final={opt.max_gaussians}")
 
     first_iter = 0
+    cleanup_start_iter = 0
     tb_writer = prepare_output_and_logger(args)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
@@ -170,6 +171,23 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
             gaussians.training_setup(opt)
         else:
             gaussians.restore(model_params, opt)
+            cleanup_start_iter = first_iter
+            if (
+                opt.prune_only_until_iter > first_iter
+                and first_iter >= opt.densify_until_iter
+            ):
+                # max_radii2D, gradient_accum and denom in a checkpoint
+                # describe all earlier training views.  Reusing them in a
+                # prune-only pass makes a modest screen threshold delete most
+                # of the model at the first interval.  Cleanup must decide
+                # from fresh evidence gathered after resume.
+                gaussians.max_radii2D = torch.zeros_like(gaussians.max_radii2D)
+                gaussians.xyz_gradient_accum = torch.zeros_like(gaussians.xyz_gradient_accum)
+                gaussians.denom = torch.zeros_like(gaussians.denom)
+                print(
+                    f"Cleanup resume at iter {first_iter}: reset historical "
+                    "screen-radius and gradient statistics."
+                )
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -457,7 +475,17 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                densify_is_due = (
+                    densification_active
+                    and iteration > opt.densify_from_iter
+                    and iteration % opt.densification_interval == 0
+                )
+                cleanup_is_due = (
+                    prune_only_active
+                    and iteration > cleanup_start_iter + opt.prune_warmup_iters
+                    and (iteration - cleanup_start_iter) % opt.prune_interval == 0
+                )
+                if densify_is_due or cleanup_is_due:
                     size_threshold = (
                         opt.max_screen_size
                         if iteration > opt.opacity_reset_interval and opt.max_screen_size > 0

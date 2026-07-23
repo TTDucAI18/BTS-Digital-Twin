@@ -123,6 +123,11 @@ class OptimizationParams(ParamGroup):
         # 0 disables this post-densification phase.
         self.prune_only_until_iter = 0
         self.prune_opacity_threshold = 0.005
+        # A resumed checkpoint contains historical screen radii.  Accumulate
+        # fresh multi-view evidence before cleanup starts, then prune at a
+        # lower cadence than normal densification.
+        self.prune_warmup_iters = 500
+        self.prune_interval = 500
         self.foreground_loss_weight = 0.0
         self.foreground_edge_loss_weight = 0.05
         self.image_edge_loss_weight = 0.0

@@ -442,8 +442,17 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                 torch.cuda.empty_cache()
                 scene.save(iteration)
 
-            # Densification
-            if iteration < opt.densify_until_iter:
+            # Densification and post-training cleanup share the same
+            # multi-view visibility statistics.  The cleanup phase explicitly
+            # prunes only: it must never create new splats after a selected
+            # checkpoint has already converged.
+            densification_active = iteration < opt.densify_until_iter
+            prune_only_active = (
+                not densification_active
+                and opt.prune_only_until_iter > 0
+                and iteration <= opt.prune_only_until_iter
+            )
+            if densification_active or prune_only_active:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -455,17 +464,20 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                         else None
                     )
                     current_cap = densify_point_cap(iteration, densify_cap_stages, opt.max_gaussians)
-                    if current_cap <= 0 or gaussians.get_xyz.shape[0] < current_cap:
+                    if densification_active and (current_cap <= 0 or gaussians.get_xyz.shape[0] < current_cap):
                         gaussians.densify_and_prune(
-                            opt.densify_grad_threshold, 0.005, scene.cameras_extent,
+                            opt.densify_grad_threshold, opt.prune_opacity_threshold, scene.cameras_extent,
                             size_threshold, radii, max_points=current_cap,
                             max_new_points=opt.max_new_points_per_densify,
                             clone_before_split=opt.densify_clone_before_split,
                         )
                     else:
-                        print(f"\n[ITER {iteration}] Point budget reached ({gaussians.get_xyz.shape[0]}/{current_cap}). Skipping densification.")
-                        # Still prune to remove transparent ones
-                        prune_mask = (gaussians.get_opacity < 0.005).squeeze()
+                        phase = "Cleanup pruning" if prune_only_active else "Point budget reached"
+                        print(f"\n[ITER {iteration}] {phase} ({gaussians.get_xyz.shape[0]}/{current_cap}).")
+                        # Do not introduce new geometry in cleanup; remove
+                        # transparent and large cross-view occluders instead.
+                        points_before_prune = gaussians.get_xyz.shape[0]
+                        prune_mask = (gaussians.get_opacity < opt.prune_opacity_threshold).squeeze()
                         if size_threshold:
                             big_points_vs = gaussians.max_radii2D > size_threshold
                             big_points_ws = gaussians.get_scaling.max(dim=1).values > 0.1 * scene.cameras_extent
@@ -473,6 +485,7 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                         gaussians.tmp_radii = radii
                         gaussians.prune_points(prune_mask)
                         gaussians.tmp_radii = None
+                        print(f"[ITER {iteration}] Pruned {points_before_prune - gaussians.get_xyz.shape[0]} Gaussians; {gaussians.get_xyz.shape[0]} remain.")
                         torch.cuda.empty_cache()
                 
                 reset_is_due = (
@@ -483,8 +496,16 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                     opt.opacity_reset_until_iter <= 0
                     or iteration <= opt.opacity_reset_until_iter
                 )
-                if (reset_is_due and reset_is_allowed) or (dataset.white_background and iteration == opt.densify_from_iter):
+                if densification_active and ((reset_is_due and reset_is_allowed) or (dataset.white_background and iteration == opt.densify_from_iter)):
                     gaussians.reset_opacity()
+
+                # Saving occurs before this block for compatibility with the
+                # normal training loop.  Cleanup pruning changes the model
+                # afterwards, so overwrite the PLY at a save milestone.
+                if prune_only_active and iteration in saving_iterations:
+                    print(f"\n[ITER {iteration}] Saving pruned Gaussians")
+                    torch.cuda.empty_cache()
+                    scene.save(iteration)
 
             # Optimizer step
             if iteration < opt.iterations:

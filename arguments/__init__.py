@@ -118,6 +118,11 @@ class OptimizationParams(ParamGroup):
         # same densification interval as large-splat splitting.  Default keeps
         # the established BTS split-first behaviour.
         self.densify_clone_before_split = False
+        # Cleanup refinement can keep collecting visibility/size statistics
+        # and prune a completed model without creating any new Gaussians.
+        # 0 disables this post-densification phase.
+        self.prune_only_until_iter = 0
+        self.prune_opacity_threshold = 0.005
         self.foreground_loss_weight = 0.0
         self.foreground_edge_loss_weight = 0.05
         self.image_edge_loss_weight = 0.0

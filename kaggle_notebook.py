@@ -170,6 +170,16 @@ FRESH_RUN = os.environ.get("BTS_FRESH_RUN", "0").strip() == "1"
 FRESH_SCENES = frozenset(
     name.strip() for name in os.environ.get("BTS_FRESH_SCENES", "bonsai,chair").split(",") if name.strip()
 )
+# Comma-separated scenes that should resume a completed model into a
+# prune-only cleanup phase.  This is intentionally opt-in so normal training
+# runs do not extend their target iteration.
+CLEANUP_SCENES = frozenset(
+    name.strip() for name in os.environ.get("BTS_CLEANUP_SCENES", "").split(",") if name.strip()
+)
+BTS_CLEANUP_STEPS = int(os.environ.get("BTS_CLEANUP_STEPS", "0"))
+CLOSEUP_CLEANUP_STEPS = int(os.environ.get("BTS_CLOSEUP_CLEANUP_STEPS", "0"))
+if BTS_CLEANUP_STEPS < 0 or CLOSEUP_CLEANUP_STEPS < 0:
+    raise ValueError("BTS_CLEANUP_STEPS and BTS_CLOSEUP_CLEANUP_STEPS must be non-negative.")
 # Successful scenes normally release their model after their exact render set
 # was copied, saving Kaggle disk.  Enable this for a rerun when final PLY and
 # checkpoint artifacts must remain available for inspection or later renders.
@@ -1096,7 +1106,11 @@ print(f"Extracted {{args.out_ply}}")
 
 def scene_train_config(scene_path):
     scene_name = Path(scene_path).name
-    target_iterations = CLOSEUP_ITERATIONS if scene_name in CLOSEUP_SCENES else ITERATIONS
+    is_closeup = scene_name in CLOSEUP_SCENES
+    base_iterations = CLOSEUP_ITERATIONS if is_closeup else ITERATIONS
+    cleanup_active = scene_name in CLEANUP_SCENES
+    cleanup_steps = CLOSEUP_CLEANUP_STEPS if is_closeup else BTS_CLEANUP_STEPS
+    target_iterations = base_iterations + (cleanup_steps if cleanup_active else 0)
     cfg = {
         "iterations": target_iterations,
         "resolution": TRAIN_RESOLUTION,
@@ -1128,8 +1142,10 @@ def scene_train_config(scene_path):
         "position_lr_init": float(os.environ.get("BTS_POSITION_LR_INIT", "0.00016")),
         "position_lr_max_steps": POSITION_LR_MAX_STEPS,
         "densify_clone_before_split": False,
+        "prune_only_until_iter": 0,
+        "prune_opacity_threshold": float(os.environ.get("BTS_PRUNE_OPACITY_THRESHOLD", "0.005")),
     }
-    if scene_name in CLOSEUP_SCENES:
+    if is_closeup:
         # bonsai/chair are compact, close-range 360-degree captures.  Smaller
         # split/clone scale and a lower gradient gate create tighter Gaussians;
         # Depth Anything remains a weak anchor instead of flattening fine shape.
@@ -1169,6 +1185,23 @@ def scene_train_config(scene_path):
             "max_screen_size": int(os.environ.get("BTS_CLOSEUP_MAX_SCREEN_SIZE", "64")),
             "opacity_reset_until_iter": int(os.environ.get("BTS_CLOSEUP_OPACITY_RESET_UNTIL_ITER", "12000")),
             "image_edge_loss_weight": float(os.environ.get("BTS_CLOSEUP_IMAGE_EDGE_LOSS_WEIGHT", "0.03")),
+            "prune_opacity_threshold": float(os.environ.get(
+                "BTS_CLOSEUP_PRUNE_OPACITY_THRESHOLD", "0.005"
+            )),
+        })
+    if cleanup_active:
+        group_prefix = "BTS_CLOSEUP" if is_closeup else "BTS"
+        scene_prefix = f"BTS_{scene_name.upper()}"
+        cfg.update({
+            "prune_only_until_iter": target_iterations,
+            "prune_opacity_threshold": float(os.environ.get(
+                f"{scene_prefix}_CLEANUP_PRUNE_OPACITY_THRESHOLD",
+                os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_OPACITY_THRESHOLD", "0.008"),
+            )),
+            "max_screen_size": int(os.environ.get(
+                f"{scene_prefix}_CLEANUP_MAX_SCREEN_SIZE",
+                os.environ.get(f"{group_prefix}_CLEANUP_MAX_SCREEN_SIZE", "24" if is_closeup else "18"),
+            )),
         })
     invalid = (
         cfg["densify_grad_threshold"] <= 0
@@ -1182,6 +1215,8 @@ def scene_train_config(scene_path):
         or cfg["image_edge_loss_weight"] < 0
         or cfg["position_lr_init"] <= 0
         or cfg["position_lr_max_steps"] <= 0
+        or cfg["prune_only_until_iter"] < 0
+        or not 0 < cfg["prune_opacity_threshold"] < 1
     )
     if invalid:
         raise ValueError(f"[{scene_name}] invalid scene training configuration: {cfg}")
@@ -1201,7 +1236,8 @@ def build_train_cmd(scene_path, gpu_id):
         f"| dense={cfg['percent_dense']} | grad={cfg['densify_grad_threshold']} "
         f"| depth_weight={cfg['depth_weight_init']} | screen_prune={cfg['max_screen_size']} "
         f"| cap_schedule={cfg['densify_cap_schedule'] or 'off'} | max_new={cfg['max_new_points_per_densify']} "
-        f"| edge_loss={cfg['image_edge_loss_weight']} | checkpoints={cfg['checkpoint_iterations']} "
+        f"| edge_loss={cfg['image_edge_loss_weight']} | prune_until={cfg['prune_only_until_iter']} "
+        f"| prune_opacity={cfg['prune_opacity_threshold']} | checkpoints={cfg['checkpoint_iterations']} "
         f"| validate/render={cfg['validation_iterations']}"
     )
     resume = None
@@ -1252,6 +1288,10 @@ def build_train_cmd(scene_path, gpu_id):
         cfg["densify_cap_schedule"],
         "--max_new_points_per_densify",
         str(cfg["max_new_points_per_densify"]),
+        "--prune_only_until_iter",
+        str(cfg["prune_only_until_iter"]),
+        "--prune_opacity_threshold",
+        str(cfg["prune_opacity_threshold"]),
         "--percent_dense",
         str(cfg["percent_dense"]),
         "--opacity_reset_interval",

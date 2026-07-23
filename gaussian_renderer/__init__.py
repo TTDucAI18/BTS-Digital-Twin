@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, opacity_mask=None):
     # NOTE: use_trained_exp retained as a no-op kwarg for call-site backward compatibility.
     # Exposure compensation is disabled (TASK 1): BTS data captured under uniform lighting.
     """
@@ -56,6 +56,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+    if opacity_mask is not None:
+        if opacity_mask.ndim != 1 or opacity_mask.shape[0] != opacity.shape[0]:
+            raise ValueError("opacity_mask must be a 1D mask matching the Gaussian count")
+        # Keep the full tensor layout rather than gathering all SH/covariance
+        # tensors.  A camera-specific gather spikes VRAM on 6M+ point BTS
+        # models; zero opacity is equivalent for rasterization and is safe for
+        # an inference-only per-view floater cull.
+        opacity = opacity * opacity_mask.to(dtype=opacity.dtype).unsqueeze(1)
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.

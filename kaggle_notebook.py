@@ -176,6 +176,18 @@ FRESH_SCENES = frozenset(
 CLEANUP_SCENES = frozenset(
     name.strip() for name in os.environ.get("BTS_CLEANUP_SCENES", "").split(",") if name.strip()
 )
+# A render-only scene must already have a checkpoint/PLY at its configured
+# target iteration.  This makes a final rendering pass safe: a missing or
+# incorrectly-versioned archive can never silently start a costly retrain.
+RENDER_ONLY_SCENES = frozenset(
+    name.strip() for name in os.environ.get("BTS_RENDER_ONLY_SCENES", "").split(",") if name.strip()
+)
+# Run these scenes to completion before the remaining queue is allowed to
+# hydrate checkpoints and render.  It is opt-in: the normal mixed queue keeps
+# its historical priority order unless a run profile explicitly requests it.
+TRAIN_FIRST_SCENES = frozenset(
+    name.strip() for name in os.environ.get("BTS_TRAIN_FIRST_SCENES", "").split(",") if name.strip()
+)
 BTS_CLEANUP_STEPS = int(os.environ.get("BTS_CLEANUP_STEPS", "0"))
 CLOSEUP_CLEANUP_STEPS = int(os.environ.get("BTS_CLOSEUP_CLEANUP_STEPS", "0"))
 if BTS_CLEANUP_STEPS < 0 or CLOSEUP_CLEANUP_STEPS < 0:
@@ -184,6 +196,12 @@ if BTS_CLEANUP_STEPS < 0 or CLOSEUP_CLEANUP_STEPS < 0:
 # was copied, saving Kaggle disk.  Enable this for a rerun when final PLY and
 # checkpoint artifacts must remain available for inspection or later renders.
 KEEP_MODEL_ARTIFACTS = os.environ.get("BTS_KEEP_MODEL_ARTIFACTS", "0").strip() == "1"
+# When non-empty, retain final model artifacts only for these scenes.  This is
+# useful for inspecting a newly retrained close-up pair without keeping five
+# large hydrated BTS models after their render-only phase.
+KEEP_MODEL_SCENES = frozenset(
+    name.strip() for name in os.environ.get("BTS_KEEP_MODEL_SCENES", "").split(",") if name.strip()
+)
 # Offset checkpoint writes per GPU so two large archives do not saturate the
 # small Kaggle working disk at the same iteration.
 CHECKPOINT_STAGGER_SECONDS = float(os.environ.get("BTS_CHECKPOINT_STAGGER_SECONDS", "90"))
@@ -231,6 +249,17 @@ TARGET_SCENES = [
 ]
 CLOSEUP_SCENES = frozenset({"bonsai", "chair"})
 SCENE_FILTER = os.environ.get("BTS_SCENES", ",".join(TARGET_SCENES)).strip()
+_unknown_control_scenes = (RENDER_ONLY_SCENES | TRAIN_FIRST_SCENES) - set(TARGET_SCENES)
+if _unknown_control_scenes:
+    raise ValueError(f"Unknown BTS control scenes: {sorted(_unknown_control_scenes)}")
+if RENDER_ONLY_SCENES & FRESH_SCENES:
+    raise ValueError(
+        "A scene cannot be both BTS_RENDER_ONLY_SCENES and BTS_FRESH_SCENES: "
+        f"{sorted(RENDER_ONLY_SCENES & FRESH_SCENES)}"
+    )
+_unknown_keep_scenes = KEEP_MODEL_SCENES - set(TARGET_SCENES)
+if _unknown_keep_scenes:
+    raise ValueError(f"Unknown BTS_KEEP_MODEL_SCENES: {sorted(_unknown_keep_scenes)}")
 
 def get_secret(name):
     value = os.environ.get(name, "").strip()
@@ -1025,6 +1054,14 @@ def latest_archived_checkpoint(scene_path, max_iter=None):
     return None
 
 
+def archived_checkpoint_at(scene_path, iteration):
+    """Return a verified archive for exactly ``iteration``, if present."""
+    checkpoint = latest_archived_checkpoint(scene_path, max_iter=iteration)
+    if checkpoint is not None and checkpoint_iter(checkpoint) == iteration:
+        return checkpoint
+    return None
+
+
 def latest_input_checkpoint(scene_path, max_iter=None):
     """Find the newest verified checkpoint shipped with the Kaggle dataset."""
     scene_name = Path(scene_path).name
@@ -1240,8 +1277,22 @@ def scene_train_config(scene_path):
     return cfg
 
 
+def fresh_run_marker(scene_name):
+    """Marker proving that this scene has already received its one reset."""
+    return scene_output(Path(scene_name)) / ".fresh_run_started"
+
+
 def scene_is_fresh(scene_name):
-    return FRESH_RUN or scene_name in FRESH_SCENES
+    """Whether this invocation must discard an old scene model.
+
+    ``BTS_FRESH_SCENES`` is often kept in a Kaggle config after an interrupted
+    session.  Without a durable marker, retrying that session deletes its new
+    10k/40k checkpoint and starts over.  Mark immediately after the initial
+    reset so subsequent invocations resume normally; delete the marker (or
+    the scene output directory) to intentionally force another clean run.
+    """
+    requested = FRESH_RUN or scene_name in FRESH_SCENES
+    return requested and not fresh_run_marker(scene_name).exists()
 
 
 def build_train_cmd(scene_path, gpu_id):
@@ -1396,7 +1447,8 @@ def build_train_cmd(scene_path, gpu_id):
 
 def build_render_cmd(scene_path, gpu_id, iteration):
     out_dir = scene_output(scene_path)
-    ensemble_scales = CLOSEUP_RENDER_ENSEMBLE_SCALES if Path(scene_path).name in CLOSEUP_SCENES else RENDER_ENSEMBLE_SCALES
+    scene_name = Path(scene_path).name
+    ensemble_scales = CLOSEUP_RENDER_ENSEMBLE_SCALES if scene_name in CLOSEUP_SCENES else RENDER_ENSEMBLE_SCALES
     cmd = [
         sys.executable,
         REPO_DIR / "render.py",
@@ -1417,6 +1469,18 @@ def build_render_cmd(scene_path, gpu_id, iteration):
     ]
     if USE_ANTIALIASING:
         cmd.append("--antialiasing")
+    # Semicolon separates rules so image file names remain unmodified.  This
+    # is intentionally an inference-only exception, scoped to a known bad
+    # test pose rather than a global mutation of the trained model.
+    cull_rules = os.environ.get(
+        f"BTS_{scene_name.upper()}_RENDER_NEAR_CAMERA_CULLS",
+        os.environ.get("BTS_RENDER_NEAR_CAMERA_CULLS", ""),
+    ).strip()
+    if cull_rules:
+        for rule in cull_rules.split(";"):
+            rule = rule.strip()
+            if rule:
+                cmd.extend(["--near_camera_cull", rule])
     return cmd, {"CUDA_VISIBLE_DEVICES": str(gpu_id)}
 
 
@@ -1518,14 +1582,25 @@ def train_and_render_scene(scene_path, gpu_id):
         if scene_submission.exists():
             shutil.rmtree(scene_submission)
         out_dir.mkdir(parents=True, exist_ok=True)
+        fresh_run_marker(scene_name).touch()
         print(f"[{scene_name}] fresh-scene policy: cleared prior model and renders.")
 
     if RESUME_LOCAL and not fresh_scene:
         # Hydrate a backup before the final-artifact check as well: an archived
         # 40k checkpoint can be rendered immediately without retraining.
-        archived = latest_archived_checkpoint(scene_path)
+        # Render-only jobs require the exact requested model, rather than a
+        # newer cleanup/refinement checkpoint with a different schedule.
+        archived = (
+            archived_checkpoint_at(scene_path, target_iterations)
+            if scene_name in RENDER_ONLY_SCENES
+            else latest_archived_checkpoint(scene_path)
+        )
         local = latest_checkpoint(out_dir)
-        if archived is not None and (local is None or checkpoint_iter(archived) > checkpoint_iter(local)):
+        if archived is not None and (
+            local is None
+            or (scene_name in RENDER_ONLY_SCENES and checkpoint_iter(local) != target_iterations)
+            or checkpoint_iter(archived) > checkpoint_iter(local)
+        ):
             restore_archived_checkpoint(scene_name, out_dir, archived)
 
     # A complete submission from an earlier (for example 40k) experiment must
@@ -1562,6 +1637,12 @@ def train_and_render_scene(scene_path, gpu_id):
         if is_valid_checkpoint(final_ckpt):
             archive_checkpoint(scene_name, final_ckpt)
         print(f"[{scene_name}] final model exists, skipping training.")
+    elif scene_name in RENDER_ONLY_SCENES:
+        print(
+            f"[{scene_name}] render-only policy: missing verified iteration "
+            f"{target_iterations} checkpoint/PLY; refusing to train."
+        )
+        return scene_name, 8
     else:
         print(f"[{scene_name}] preparing train.py command.", flush=True)
         cmd, env = build_train_cmd(scene_path, gpu_id)
@@ -1633,7 +1714,10 @@ def train_and_render_scene(scene_path, gpu_id):
 
     # Only reclaim the large model artifacts after the copied render set has
     # passed the same exact-name contract that Cell 6 enforces at packaging.
-    if KEEP_MODEL_ARTIFACTS:
+    keep_scene_artifacts = KEEP_MODEL_ARTIFACTS and (
+        not KEEP_MODEL_SCENES or scene_name in KEEP_MODEL_SCENES
+    )
+    if keep_scene_artifacts:
         cleanup_intermediate(out_dir, it)
         print(f"[{scene_name}] retaining final model artifacts (BTS_KEEP_MODEL_ARTIFACTS=1).")
     else:
@@ -1645,7 +1729,7 @@ def train_and_render_scene(scene_path, gpu_id):
 
 
 # =============================================================================
-# CELL 5 - Run two-GPU queue
+# CELL 5 - Run two-phase GPU queue
 # =============================================================================
 
 def scene_priority(scene_path):
@@ -1674,25 +1758,17 @@ def scene_priority(scene_path):
 
 
 ALL_SCENES = sorted(ALL_SCENES, key=scene_priority, reverse=True)
-gpu_queue = queue.Queue()
-for gpu in GPU_IDS:
-    gpu_queue.put(gpu)
-
-
-def worker(scene):
-    gpu = gpu_queue.get()
-    try:
-        print(f"[{Path(scene).name}] acquired GPU {gpu} from queue.", flush=True)
-        return train_and_render_scene(scene, gpu)
-    finally:
-        gpu_queue.put(gpu)
+first_phase_scenes = [scene for scene in ALL_SCENES if scene.name in TRAIN_FIRST_SCENES]
+second_phase_scenes = [scene for scene in ALL_SCENES if scene.name not in TRAIN_FIRST_SCENES]
 
 
 print("=" * 80)
 print(
     f"Starting pipeline: {len(ALL_SCENES)} scenes, GPUs={GPU_IDS}, BTS iterations={ITERATIONS}, "
     f"close-up iterations={CLOSEUP_ITERATIONS}, fresh={sorted(FRESH_SCENES)}, "
-    f"checkpoints={CHECKPOINT_ITERATIONS}, validation/render={VALIDATION_ITERATIONS}"
+    f"train-first={[scene.name for scene in first_phase_scenes]}, "
+    f"render-only={sorted(RENDER_ONLY_SCENES)}, checkpoints={CHECKPOINT_ITERATIONS}, "
+    f"validation/render={VALIDATION_ITERATIONS}"
 )
 print("=" * 80)
 
@@ -1700,50 +1776,91 @@ _scene_start_times: dict = {}
 
 results = []
 _pipeline_bar = _tqdm(total=len(ALL_SCENES), desc="Scenes", unit="scene", dynamic_ncols=True)
-executor = ThreadPoolExecutor(max_workers=len(GPU_IDS))
-futures = {}
-try:
-    futures = {executor.submit(worker, scene): scene for scene in ALL_SCENES}
-    for future in as_completed(futures):
-        scene = futures[future]
-        scene_name = Path(scene).name
-        t_done = time.time()
+active_futures = {}
+
+
+def run_phase(scenes, phase_name):
+    """Run one queue phase and return each scene's result.
+
+    The second phase is deliberately not submitted until this call returns.
+    This prevents checkpoint hydration/rendering from competing with the two
+    close-up fresh runs for GPU RAM, disk bandwidth, or deadline budget.
+    """
+    global active_futures
+    if not scenes:
+        return []
+    print(f"Starting {phase_name}: {[scene.name for scene in scenes]}")
+    gpu_queue = queue.Queue()
+    for gpu in GPU_IDS:
+        gpu_queue.put(gpu)
+
+    def worker(scene):
+        gpu = gpu_queue.get()
         try:
-            result = future.result()
-        except Exception as exc:
-            result = (scene_name, 99)
-            print(f"[{scene_name}] unhandled error: {exc}")
-        results.append(result)
-        rc = result[1]
-        rc_label = {0: "OK", 2: "timeout", 3: "no-PLY", 4: "no-renders",
-                    5: "low-disk", 6: "partial", 7: "invalid-render-set", 99: "exception"}.get(rc, f"rc={rc}")
-        free_gb, _ = disk_free_gb()
-        n_imgs = submission_image_count(scene_name)
-        _pipeline_bar.set_postfix(scene=scene_name, status=rc_label, imgs=n_imgs,
-                                  disk_free=f"{free_gb:.1f}GB")
-        _pipeline_bar.update(1)
-        print(f"Completed: {result} | imgs={n_imgs} | disk_free={free_gb:.1f}GB")
-        # WandB belongs to child training processes.  The notebook parent has
-        # no wandb.init(), so do not emit a false error after pipeline exit.
+            print(f"[{Path(scene).name}] acquired GPU {gpu} from {phase_name} queue.", flush=True)
+            return train_and_render_scene(scene, gpu)
+        finally:
+            gpu_queue.put(gpu)
+
+    phase_results = []
+    executor = ThreadPoolExecutor(max_workers=len(GPU_IDS))
+    active_futures = {executor.submit(worker, scene): scene for scene in scenes}
+    try:
+        for future in as_completed(active_futures):
+            scene = active_futures[future]
+            scene_name = Path(scene).name
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = (scene_name, 99)
+                print(f"[{scene_name}] unhandled error: {exc}")
+            phase_results.append(result)
+            rc = result[1]
+            rc_label = {0: "OK", 2: "timeout", 3: "no-PLY", 4: "no-renders",
+                        5: "low-disk", 6: "partial", 7: "invalid-render-set",
+                        8: "missing-render-checkpoint", 99: "exception"}.get(rc, f"rc={rc}")
+            free_gb, _ = disk_free_gb()
+            n_imgs = submission_image_count(scene_name)
+            _pipeline_bar.set_postfix(scene=scene_name, status=rc_label, imgs=n_imgs,
+                                      disk_free=f"{free_gb:.1f}GB")
+            _pipeline_bar.update(1)
+            print(f"Completed {phase_name}: {result} | imgs={n_imgs} | disk_free={free_gb:.1f}GB")
+    except BaseException:
+        for future in active_futures:
+            future.cancel()
+        stop_active_processes()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    finally:
+        active_futures = {}
+    return phase_results
+
+
+try:
+    first_phase_results = run_phase(first_phase_scenes, "phase 1: close-up training")
+    results.extend(first_phase_results)
+    failed_first_phase = [name for name, rc in first_phase_results if rc != 0]
+    if failed_first_phase:
+        raise RuntimeError(
+            "Phase 2 is blocked because train-first scenes did not finish: "
+            f"{failed_first_phase}. Submission packaging is intentionally skipped."
+        )
+    else:
+        results.extend(run_phase(second_phase_scenes, "phase 2: checkpoint render"))
 except KeyboardInterrupt:
     # Do not let ThreadPoolExecutor.__exit__ wait indefinitely for subprocesses
     # after an interrupted Kaggle cell.  Stop active children first, then join
     # the short-lived reader/worker threads.
     print("KeyboardInterrupt: stopping active train/render subprocesses...")
-    for future in futures:
+    for future in active_futures:
         future.cancel()
     stop_active_processes()
-    # A worker can be blocked in a slow checkpoint/PLY validation before it
-    # has spawned a child process.  Do not make the notebook wait for that
-    # thread after the user has explicitly interrupted the cell.
-    executor.shutdown(wait=False, cancel_futures=True)
     raise
 except BaseException:
     stop_active_processes()
-    executor.shutdown(wait=False, cancel_futures=True)
     raise
-else:
-    executor.shutdown(wait=True)
 finally:
     _pipeline_bar.close()
 
@@ -1754,7 +1871,8 @@ if USE_WANDB:
     try:
         import wandb as _wandb
         _rows = [[name, rc, {0:"OK",2:"timeout",3:"no-PLY",4:"no-renders",
-                              5:"low-disk",6:"partial",7:"invalid-render-set",99:"exception"}.get(rc, str(rc)),
+                              5:"low-disk",6:"partial",7:"invalid-render-set",
+                              8:"missing-render-checkpoint",99:"exception"}.get(rc, str(rc)),
                   submission_image_count(name)]
                  for name, rc in results]
         _wandb.log({"pipeline/summary": _wandb.Table(

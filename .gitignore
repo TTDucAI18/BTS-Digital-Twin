@@ -110,6 +110,10 @@ submissions/
 # The Kaggle orchestration notebook is maintained locally and must not be
 # included in repository updates from this checkout.
 kaggle_notebook.py
+# Machine-specific Kaggle run profiles may contain attached-dataset paths and
+# should remain local.  Copy their values into a notebook cell when needed.
+kaggle_cleanup_config.py
+kaggle_refine_60k_config.py
 kaggle/working/
 working/
 *.csv

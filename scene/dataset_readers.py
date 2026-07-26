@@ -142,7 +142,15 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
             missing_images.append(extr.name)
             continue
         image_name = extr.name
-        depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
+        # Quality-gated monocular depth directories intentionally omit views
+        # that failed the COLMAP consistency check.  Do not attempt to load a
+        # missing map (or a map without calibrated scale/offset): such views
+        # remain normal RGB-only training cameras without noisy warnings.
+        depth_path = ""
+        if depths_folder != "" and depth_params is not None:
+            candidate = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png")
+            if os.path.isfile(candidate):
+                depth_path = candidate
         mask_path = find_optional_image(masks_folder, extr.name[:-n_remove], extr.name)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,

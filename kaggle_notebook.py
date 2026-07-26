@@ -13,6 +13,8 @@
 
 import glob
 import io
+import json
+import math
 import os
 import queue
 import shutil
@@ -145,6 +147,7 @@ DISABLE_FOREGROUND_MASK_SCENES = frozenset(
     for name in os.environ.get("BTS_DISABLE_FOREGROUND_MASK_SCENES", "").split(",")
     if name.strip()
 )
+MIN_DEPTH_COVERAGE = float(os.environ.get("BTS_MIN_DEPTH_COVERAGE", "0.10"))
 MAX_WORKERS = int(os.environ.get("BTS_MAX_WORKERS", "2"))
 KAGGLE_TIME_LIMIT_H = float(os.environ.get("BTS_TIME_LIMIT_H", "11.5"))
 # Reserve time for the final compact checkpoint, render, and packaging.
@@ -229,6 +232,7 @@ if (
     or MAX_NEW_POINTS_PER_DENSIFY < 0
     or FOREGROUND_LOSS_WEIGHT < 0
     or FOREGROUND_EDGE_LOSS_WEIGHT < 0
+    or not 0.0 <= MIN_DEPTH_COVERAGE <= 1.0
     or MAX_WORKERS <= 0
     or KAGGLE_TIME_LIMIT_H <= 0
     or KAGGLE_STOP_BUFFER_MIN < 0
@@ -732,9 +736,46 @@ def optional_depth_args(scene_path):
     if not depth_params.exists():
         print(f"[{Path(scene_path).name}] no Depth Anything metadata; depth regularization is disabled.")
         return []
-    for name in ["depths_any", "depth_anything", "depths", "depth"]:
-        if (root / name).is_dir():
-            return ["--depths", name]
+    try:
+        params = json.loads(depth_params.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[{Path(scene_path).name}] invalid depth_params.json ({exc}); depth regularization is disabled.")
+        return []
+    if not isinstance(params, dict):
+        print(f"[{Path(scene_path).name}] depth_params.json is not an object; depth regularization is disabled.")
+        return []
+    image_stems = {path.stem for path in (root / "images").glob("*") if path.is_file()}
+    # A quality-gated map directory is preferred whenever it exists.  It
+    # deliberately contains only views whose monocular depth agreed with
+    # sparse COLMAP, so unreliable views receive no depth loss at all.
+    for name in ["depths_any_reliable", "depths_any", "depth_anything", "depths", "depth"]:
+        depth_dir = root / name
+        if not depth_dir.is_dir():
+            continue
+        matched = []
+        for path in depth_dir.glob("*.png"):
+            entry = params.get(path.stem)
+            if path.stem not in image_stems or not isinstance(entry, dict):
+                continue
+            try:
+                scale = float(entry["scale"])
+                offset = float(entry["offset"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(scale) and math.isfinite(offset) and scale > 0.0:
+                matched.append(path.stem)
+        coverage = len(matched) / max(1, len(image_stems))
+        if coverage < MIN_DEPTH_COVERAGE:
+            print(
+                f"[{Path(scene_path).name}] depth prior {name}: {len(matched)}/{len(image_stems)} "
+                f"({coverage:.1%}) below minimum {MIN_DEPTH_COVERAGE:.1%}; disabled."
+            )
+            continue
+        print(
+            f"[{Path(scene_path).name}] using quality-gated depth prior {name}: "
+            f"{len(matched)}/{len(image_stems)} views ({coverage:.1%})."
+        )
+        return ["--depths", name]
     print(f"[{Path(scene_path).name}] Depth Anything metadata exists but no depth map directory was found; depth regularization is disabled.")
     return []
 

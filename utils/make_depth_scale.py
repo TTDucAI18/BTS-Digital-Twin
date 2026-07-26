@@ -9,7 +9,7 @@ def get_scales(key, cameras, images, points3d_ordered, args):
     image_meta = images[key]
     cam_intrinsic = cameras[image_meta.camera_id]
 
-    pts_idx = images_metas[key].point3D_ids
+    pts_idx = image_meta.point3D_ids
 
     mask = pts_idx >= 0
     mask *= pts_idx < len(points3d_ordered)
@@ -25,7 +25,7 @@ def get_scales(key, cameras, images, points3d_ordered, args):
     R = qvec2rotmat(image_meta.qvec)
     pts = np.dot(pts, R.T) + image_meta.tvec
 
-    invcolmapdepth = 1. / pts[..., 2] 
+    invcolmapdepth = 1. / pts[..., 2]
     n_remove = len(image_meta.name.split('.')[-1]) + 1
     invmonodepthmap = cv2.imread(f"{args.depths_dir}/{image_meta.name[:-n_remove]}.png", cv2.IMREAD_UNCHANGED)
     
@@ -40,15 +40,24 @@ def get_scales(key, cameras, images, points3d_ordered, args):
 
     maps = (valid_xys * s).astype(np.float32)
     valid = (
-        (maps[..., 0] >= 0) * 
-        (maps[..., 1] >= 0) * 
-        (maps[..., 0] < cam_intrinsic.width * s) * 
-        (maps[..., 1] < cam_intrinsic.height * s) * (invcolmapdepth > 0))
+        (maps[..., 0] >= 0)
+        * (maps[..., 1] >= 0)
+        * (maps[..., 0] < cam_intrinsic.width * s)
+        * (maps[..., 1] < cam_intrinsic.height * s)
+        * np.isfinite(invcolmapdepth)
+        * (invcolmapdepth > 0)
+    )
     
     if valid.sum() > 10 and (invcolmapdepth.max() - invcolmapdepth.min()) > 1e-3:
         maps = maps[valid, :]
         invcolmapdepth = invcolmapdepth[valid]
-        invmonodepth = cv2.remap(invmonodepthmap, maps[..., 0], maps[..., 1], interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[..., 0]
+        # remap returns either (N,) or (N, 1) depending on the OpenCV build.
+        # Indexing [..., 0] on the former silently selects one scalar and
+        # produces scale=inf for every frame.
+        invmonodepth = cv2.remap(
+            invmonodepthmap, maps[..., 0], maps[..., 1],
+            interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+        ).reshape(-1)
         
         ## Median / dev
         t_colmap = np.median(invcolmapdepth)
@@ -56,8 +65,12 @@ def get_scales(key, cameras, images, points3d_ordered, args):
 
         t_mono = np.median(invmonodepth)
         s_mono = np.mean(np.abs(invmonodepth - t_mono))
+        if not np.isfinite(s_mono) or s_mono <= 1e-8:
+            return None
         scale = s_colmap / s_mono
         offset = t_colmap - t_mono * scale
+        if not np.isfinite(scale) or not np.isfinite(offset) or scale <= 0:
+            return None
     else:
         scale = 0
         offset = 0
@@ -85,7 +98,7 @@ if __name__ == '__main__':
 
     depth_params = {
         depth_param["image_name"]: {"scale": depth_param["scale"], "offset": depth_param["offset"]}
-        for depth_param in depth_param_list if depth_param != None
+        for depth_param in depth_param_list if depth_param is not None
     }
 
     with open(f"{args.base_dir}/sparse/0/depth_params.json", "w") as f:

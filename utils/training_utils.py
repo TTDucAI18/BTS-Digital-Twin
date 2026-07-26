@@ -35,6 +35,12 @@ def foreground_weighted_l1(rendered, target, foreground_mask, foreground_weight)
     return (pixel_l1 * pixel_weight).sum() / (pixel_weight.sum() + 1e-6)
 
 
+def straight_through_color_clamp(image):
+    """Bound RGB in the forward loss while keeping corrective gradients."""
+    bounded = image.clamp(0.0, 1.0)
+    return image + (bounded - image).detach()
+
+
 def foreground_edge_l1(rendered, target, foreground_mask):
     """Match horizontal and vertical RGB gradients in and around the foreground."""
     error_x = torch.abs(

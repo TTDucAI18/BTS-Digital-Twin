@@ -19,7 +19,7 @@ except ImportError:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def view_opacity_mask(view, gaussians, near_camera_culls):
+def view_opacity_mask(view, gaussians, near_camera_culls, global_near_distance, global_scale_to_distance):
     """Return a per-view keep mask for explicitly configured near floaters.
 
     Rules have the form ``image_name:near_distance:scale_to_distance``.  A
@@ -30,6 +30,8 @@ def view_opacity_mask(view, gaussians, near_camera_culls):
     radius.  A non-positive scale ratio disables that secondary rule.
     """
     rule = near_camera_culls.get(getattr(view, "image_name", ""))
+    if rule is None and (global_near_distance > 0.0 or global_scale_to_distance > 0.0):
+        rule = (global_near_distance, global_scale_to_distance)
     if rule is None:
         return None
     near_distance, scale_to_distance = rule
@@ -47,12 +49,23 @@ def view_opacity_mask(view, gaussians, near_camera_culls):
     return ~remove
 
 
-def render_view(view, gaussians, pipeline, background, separate_sh, scales, near_camera_culls):
+def unsharp_mask(image, amount, radius=1):
+    """Recover modest high-frequency detail after supersample downscaling."""
+    if amount <= 0.0:
+        return image
+    kernel = 2 * radius + 1
+    blur = F.avg_pool2d(image.unsqueeze(0), kernel, stride=1, padding=radius).squeeze(0)
+    return (image + amount * (image - blur)).clamp(0.0, 1.0)
+
+
+def render_view(view, gaussians, pipeline, background, separate_sh, scales, near_camera_culls, global_near_distance, global_scale_to_distance, sharpen_amount):
     """Supersample a view, falling back to native resolution on render OOM."""
     original_width, original_height = view.image_width, view.image_height
     accumulated = None
     active_scales = scales
-    opacity_mask = view_opacity_mask(view, gaussians, near_camera_culls)
+    opacity_mask = view_opacity_mask(
+        view, gaussians, near_camera_culls, global_near_distance, global_scale_to_distance,
+    )
     try:
         for scale in active_scales:
             view.image_width = int(original_width * scale)
@@ -89,10 +102,11 @@ def render_view(view, gaussians, pipeline, background, separate_sh, scales, near
     finally:
         view.image_width, view.image_height = original_width, original_height
 
-    return (accumulated / len(active_scales)).clamp(0.0, 1.0)
+    image = (accumulated / len(active_scales)).clamp(0.0, 1.0)
+    return unsharp_mask(image, sharpen_amount)
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, separate_sh, ensemble_scales, save_gt, near_camera_culls):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, separate_sh, ensemble_scales, save_gt, near_camera_culls, global_near_distance, global_scale_to_distance, sharpen_amount):
     render_path = os.path.join(model_path, name, f"ours_{iteration}", "renders")
     gts_path = os.path.join(model_path, name, f"ours_{iteration}", "gt")
     makedirs(render_path, exist_ok=True)
@@ -112,7 +126,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         final_rendering = render_view(
             view, gaussians, pipeline, background, separate_sh, ensemble_scales,
-            near_camera_culls,
+            near_camera_culls, global_near_distance, global_scale_to_distance, sharpen_amount,
         )
         out_name = getattr(view, "image_name", None) or f"{idx:05d}.jpg"
         render_file_path = os.path.join(render_path, out_name)
@@ -129,7 +143,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         del final_rendering
 
 
-def render_sets(dataset, iteration, pipeline, skip_train, skip_test, separate_sh, ensemble_scales, near_camera_culls):
+def render_sets(dataset, iteration, pipeline, skip_train, skip_test, separate_sh, ensemble_scales, near_camera_culls, global_near_distance, global_scale_to_distance, sharpen_amount):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
@@ -137,10 +151,10 @@ def render_sets(dataset, iteration, pipeline, skip_train, skip_test, separate_sh
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         if not skip_train:
-            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, separate_sh, ensemble_scales, save_gt=True, near_camera_culls=near_camera_culls)
+            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, separate_sh, ensemble_scales, save_gt=True, near_camera_culls=near_camera_culls, global_near_distance=0.0, global_scale_to_distance=0.0, sharpen_amount=sharpen_amount)
         if not skip_test:
             # Test poses have no images; do not waste disk on black placeholders.
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, separate_sh, ensemble_scales, save_gt=False, near_camera_culls=near_camera_culls)
+            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, separate_sh, ensemble_scales, save_gt=False, near_camera_culls=near_camera_culls, global_near_distance=global_near_distance, global_scale_to_distance=global_scale_to_distance, sharpen_amount=sharpen_amount)
 
 
 def parse_near_camera_culls(values, parser):
@@ -169,6 +183,9 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--ensemble_scales", nargs="+", type=float, default=[1.0])
+    parser.add_argument("--near_camera_distance", type=float, default=0.0, help="Cull Gaussians closer than this to every test camera.")
+    parser.add_argument("--near_camera_scale_to_distance", type=float, default=0.0, help="Also cull splats larger than this ratio of test-camera distance.")
+    parser.add_argument("--sharpen_amount", type=float, default=0.0, help="Optional mild unsharp-mask amount after rendering.")
     parser.add_argument(
         "--near_camera_cull", action="append", default=[], metavar="RULE",
         help="Per-image inference cull: image_name:near_distance:scale_to_distance",
@@ -179,9 +196,11 @@ if __name__ == "__main__":
     args.skip_test_poses = False
     if not args.ensemble_scales or any(scale < 1.0 for scale in args.ensemble_scales):
         parser.error("--ensemble_scales must contain one or more values >= 1.0")
+    if args.near_camera_distance < 0.0 or args.near_camera_scale_to_distance < 0.0 or args.sharpen_amount < 0.0:
+        parser.error("near-camera cull values and sharpen amount must be non-negative")
     print("Rendering " + args.model_path)
     safe_state(args.quiet)
     near_camera_culls = parse_near_camera_culls(args.near_camera_cull, parser)
     if near_camera_culls:
         print(f"Configured targeted floater culls: {near_camera_culls}")
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE, args.ensemble_scales, near_camera_culls)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, SPARSE_ADAM_AVAILABLE, args.ensemble_scales, near_camera_culls, args.near_camera_distance, args.near_camera_scale_to_distance, args.sharpen_amount)

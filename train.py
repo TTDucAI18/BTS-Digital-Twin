@@ -27,7 +27,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.training_utils import evenly_spaced_holdout_indices, foreground_edge_l1, foreground_weighted_l1, image_edge_l1, natural_image_key
+from utils.training_utils import evenly_spaced_holdout_indices, foreground_edge_l1, foreground_weighted_l1, image_edge_l1, natural_image_key, straight_through_color_clamp
 try:
     import wandb
     WANDB_FOUND = True
@@ -308,11 +308,11 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
         # directly.  Clamping it would zero gradients at saturated edges, where
         # sharp BTS silhouettes and cables need the strongest correction.
         if exposure_optimizer is None:
-            image_for_loss = image
+            image_for_loss = straight_through_color_clamp(image)
         else:
             cam_uid = torch.tensor([viewpoint_cam.uid], device="cuda", dtype=torch.long)
             exp_modifier = torch.exp(exposure_embedding(cam_uid)).squeeze(0).unsqueeze(-1).unsqueeze(-1)
-            image_for_loss = torch.clamp(image * exp_modifier, 0.0, 1.0)
+            image_for_loss = straight_through_color_clamp(image * exp_modifier)
 
         # Loss
         # Camera images are parked as FP16 and masks as uint8 when

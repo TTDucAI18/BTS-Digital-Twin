@@ -140,6 +140,11 @@ if DENSIFY_GRAD_THRESHOLD <= 0 or DENSIFY_UNTIL_ITER <= 0 or not 0 < PERCENT_DEN
     raise ValueError("BTS densification settings must be positive, and BTS_PERCENT_DENSE must be in (0, 1].")
 FOREGROUND_LOSS_WEIGHT = float(os.environ.get("BTS_FOREGROUND_LOSS_WEIGHT", "12.0"))
 FOREGROUND_EDGE_LOSS_WEIGHT = float(os.environ.get("BTS_FOREGROUND_EDGE_LOSS_WEIGHT", "0.05"))
+DISABLE_FOREGROUND_MASK_SCENES = frozenset(
+    name.strip()
+    for name in os.environ.get("BTS_DISABLE_FOREGROUND_MASK_SCENES", "").split(",")
+    if name.strip()
+)
 MAX_WORKERS = int(os.environ.get("BTS_MAX_WORKERS", "2"))
 KAGGLE_TIME_LIMIT_H = float(os.environ.get("BTS_TIME_LIMIT_H", "11.5"))
 # Reserve time for the final compact checkpoint, render, and packaging.
@@ -164,6 +169,9 @@ RESUME_INPUT = os.environ.get("BTS_RESUME_INPUT", "0").strip() == "1"
 # directories immediately before that scene starts.  It is opt-in because it
 # intentionally discards resumable checkpoints from a prior experiment.
 FRESH_RUN = os.environ.get("BTS_FRESH_RUN", "0").strip() == "1"
+# A named run creates a new one-reset marker: changed profiles can start
+# clean, while an interrupted run of that same profile remains resumable.
+FRESH_RUN_ID = os.environ.get("BTS_FRESH_RUN_ID", "").strip()
 # This run deliberately retrains the two close-range scenes from scratch while
 # preserving all five BTS 40k checkpoints for refinement.  Set to an empty
 # string to retain a close-up checkpoint for an ablation.
@@ -252,6 +260,9 @@ SCENE_FILTER = os.environ.get("BTS_SCENES", ",".join(TARGET_SCENES)).strip()
 _unknown_control_scenes = (RENDER_ONLY_SCENES | TRAIN_FIRST_SCENES) - set(TARGET_SCENES)
 if _unknown_control_scenes:
     raise ValueError(f"Unknown BTS control scenes: {sorted(_unknown_control_scenes)}")
+_unknown_mask_scenes = DISABLE_FOREGROUND_MASK_SCENES - set(TARGET_SCENES)
+if _unknown_mask_scenes:
+    raise ValueError(f"Unknown BTS_DISABLE_FOREGROUND_MASK_SCENES: {sorted(_unknown_mask_scenes)}")
 if RENDER_ONLY_SCENES & FRESH_SCENES:
     raise ValueError(
         "A scene cannot be both BTS_RENDER_ONLY_SCENES and BTS_FRESH_SCENES: "
@@ -729,6 +740,10 @@ def optional_depth_args(scene_path):
 
 
 def optional_mask_args(scene_path):
+    scene_name = Path(scene_path).name
+    if scene_name in DISABLE_FOREGROUND_MASK_SCENES:
+        print(f"[{scene_name}] foreground masks explicitly disabled for this scene.")
+        return []
     if not SUPPORTS_MASKS:
         return []
     root = train_root(scene_path)
@@ -1279,7 +1294,8 @@ def scene_train_config(scene_path):
 
 def fresh_run_marker(scene_name):
     """Marker proving that this scene has already received its one reset."""
-    return scene_output(Path(scene_name)) / ".fresh_run_started"
+    suffix = f"_{FRESH_RUN_ID}" if FRESH_RUN_ID else ""
+    return scene_output(Path(scene_name)) / f".fresh_run_started{suffix}"
 
 
 def scene_is_fresh(scene_name):
@@ -1291,6 +1307,8 @@ def scene_is_fresh(scene_name):
     reset so subsequent invocations resume normally; delete the marker (or
     the scene output directory) to intentionally force another clean run.
     """
+    # The ID changes only the marker namespace; scene selection remains under
+    # BTS_FRESH_RUN/BTS_FRESH_SCENES so render-only scenes are never reset.
     requested = FRESH_RUN or scene_name in FRESH_SCENES
     return requested and not fresh_run_marker(scene_name).exists()
 
@@ -1469,6 +1487,31 @@ def build_render_cmd(scene_path, gpu_id, iteration):
     ]
     if USE_ANTIALIASING:
         cmd.append("--antialiasing")
+    scene_prefix = f"BTS_{scene_name.upper()}"
+    near_distance = float(os.environ.get(
+        f"{scene_prefix}_RENDER_NEAR_CAMERA_DISTANCE",
+        os.environ.get("BTS_RENDER_NEAR_CAMERA_DISTANCE", "0"),
+    ))
+    scale_to_distance = float(os.environ.get(
+        f"{scene_prefix}_RENDER_NEAR_CAMERA_SCALE_TO_DISTANCE",
+        os.environ.get("BTS_RENDER_NEAR_CAMERA_SCALE_TO_DISTANCE", "0"),
+    ))
+    sharpen_amount = float(os.environ.get(
+        f"{scene_prefix}_RENDER_SHARPEN_AMOUNT",
+        os.environ.get(
+            "BTS_CLOSEUP_RENDER_SHARPEN_AMOUNT" if scene_name in CLOSEUP_SCENES else "BTS_RENDER_SHARPEN_AMOUNT",
+            "0",
+        ),
+    ))
+    if near_distance < 0.0 or scale_to_distance < 0.0 or sharpen_amount < 0.0:
+        raise ValueError(f"[{scene_name}] render cull/sharpen values must be non-negative")
+    if near_distance or scale_to_distance:
+        cmd.extend([
+            "--near_camera_distance", str(near_distance),
+            "--near_camera_scale_to_distance", str(scale_to_distance),
+        ])
+    if sharpen_amount:
+        cmd.extend(["--sharpen_amount", str(sharpen_amount)])
     # Semicolon separates rules so image file names remain unmodified.  This
     # is intentionally an inference-only exception, scoped to a known bad
     # test pose rather than a global mutation of the trained model.

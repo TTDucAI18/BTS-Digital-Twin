@@ -26,7 +26,10 @@ os.environ.update({
 
     # Scene selection and phase ordering.
     "BTS_SCENES": "bonsai,chair,HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
+    # New marker namespace: reset both close-ups once for this maskless-chair
+    # experiment, then retain their checkpoints if the notebook is resumed.
     "BTS_FRESH_RUN": "0",
+    "BTS_FRESH_RUN_ID": "maskless-chair-v1",
     "BTS_FRESH_SCENES": "bonsai,chair",
     "BTS_TRAIN_FIRST_SCENES": "bonsai,chair",
     "BTS_RENDER_ONLY_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
@@ -73,6 +76,9 @@ os.environ.update({
     "BTS_CLOSEUP_OPACITY_RESET_UNTIL_ITER": "12000",
     "BTS_CLOSEUP_DEPTH_WEIGHT_INIT": "0.01",
     "BTS_CLOSEUP_IMAGE_EDGE_LOSS_WEIGHT": "0.03",
+    # Chair masks often include a second chair or a fragment of the target.
+    # Disable them only for chair; bonsai continues using its foreground masks.
+    "BTS_DISABLE_FOREGROUND_MASK_SCENES": "chair",
     "BTS_FOREGROUND_LOSS_WEIGHT": "12.0",
     "BTS_FOREGROUND_EDGE_LOSS_WEIGHT": "0.05",
 
@@ -97,5 +103,11 @@ os.environ.update({
     "BTS_RENDER_RESOLUTION": "1",
     "BTS_ANTIALIASING": "1",
     "BTS_RENDER_ENSEMBLE_SCALES": "1.0",
-    "BTS_CLOSEUP_RENDER_ENSEMBLE_SCALES": "1.0",
+    "BTS_CLOSEUP_RENDER_ENSEMBLE_SCALES": "1.25",
+    # Test-pose-only floater cull and a mild post-render detail recovery.
+    # Values are conservative in native COLMAP units; set the radius to 0 to
+    # disable this ablation without changing the trained model.
+    "BTS_RENDER_NEAR_CAMERA_DISTANCE": "0.10",
+    "BTS_RENDER_NEAR_CAMERA_SCALE_TO_DISTANCE": "0.0",
+    "BTS_CLOSEUP_RENDER_SHARPEN_AMOUNT": "0.12",
 })

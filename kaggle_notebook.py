@@ -1239,6 +1239,8 @@ def scene_train_config(scene_path):
         "prune_opacity_threshold": float(os.environ.get("BTS_PRUNE_OPACITY_THRESHOLD", "0.005")),
         "prune_warmup_iters": int(os.environ.get("BTS_PRUNE_WARMUP_ITERS", "500")),
         "prune_interval": int(os.environ.get("BTS_PRUNE_INTERVAL", "500")),
+        "test_pose_prune_distance": float(os.environ.get("BTS_TEST_POSE_PRUNE_DISTANCE", "0")),
+        "test_pose_prune_chunk_size": int(os.environ.get("BTS_TEST_POSE_PRUNE_CHUNK_SIZE", "262144")),
     }
     if is_closeup:
         # bonsai/chair are compact, close-range 360-degree captures.  Smaller
@@ -1311,6 +1313,24 @@ def scene_train_config(scene_path):
                 os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_INTERVAL", "750" if is_closeup else "1000"),
             )),
         })
+    scene_prefix = f"BTS_{scene_name.upper()}"
+    # A scene-specific cap is useful when capture quality differs sharply.
+    # Keep this after the close-up override so, for example, chair can impose
+    # a stricter budget than the shared close-up profile.
+    cfg["max_gaussians"] = int(os.environ.get(
+        f"{scene_prefix}_MAX_GAUSSIANS", str(cfg["max_gaussians"]),
+    ))
+    cfg["densify_cap_schedule"] = os.environ.get(
+        f"{scene_prefix}_DENSIFY_CAP_SCHEDULE", cfg["densify_cap_schedule"],
+    ).strip()
+    cfg["test_pose_prune_distance"] = float(os.environ.get(
+        f"{scene_prefix}_TEST_POSE_PRUNE_DISTANCE",
+        str(cfg["test_pose_prune_distance"]),
+    ))
+    cfg["test_pose_prune_chunk_size"] = int(os.environ.get(
+        f"{scene_prefix}_TEST_POSE_PRUNE_CHUNK_SIZE",
+        str(cfg["test_pose_prune_chunk_size"]),
+    ))
     invalid = (
         cfg["densify_grad_threshold"] <= 0
         or cfg["densify_until_iter"] <= 0
@@ -1327,6 +1347,8 @@ def scene_train_config(scene_path):
         or not 0 < cfg["prune_opacity_threshold"] < 1
         or cfg["prune_warmup_iters"] < 0
         or cfg["prune_interval"] <= 0
+        or cfg["test_pose_prune_distance"] < 0
+        or cfg["test_pose_prune_chunk_size"] <= 0
     )
     if invalid:
         raise ValueError(f"[{scene_name}] invalid scene training configuration: {cfg}")
@@ -1366,6 +1388,7 @@ def build_train_cmd(scene_path, gpu_id):
         f"| edge_loss={cfg['image_edge_loss_weight']} | prune_until={cfg['prune_only_until_iter']} "
         f"| prune_opacity={cfg['prune_opacity_threshold']} | prune_warmup={cfg['prune_warmup_iters']} "
         f"| prune_interval={cfg['prune_interval']} | checkpoints={cfg['checkpoint_iterations']} "
+        f"| test_pose_prune={cfg['test_pose_prune_distance']}/{cfg['test_pose_prune_chunk_size']} "
         f"| validate/render={cfg['validation_iterations']}"
     )
     resume = None
@@ -1377,11 +1400,32 @@ def build_train_cmd(scene_path, gpu_id):
         local_resume = latest_checkpoint(out_dir, max_iter=target_iterations - 1)
         archived_resume = latest_archived_checkpoint(scene_path, max_iter=target_iterations - 1)
         candidates = [path for path in (local_resume, archived_resume) if path is not None]
-        resume = max(candidates, key=checkpoint_iter) if candidates else None
+        local_resume = max(candidates, key=checkpoint_iter) if candidates else None
+    else:
+        local_resume = None
+    input_resume = (
+        latest_input_checkpoint(scene_path, max_iter=target_iterations - 1)
+        if RESUME_INPUT else None
+    )
+    # Input is the canonical 50k baseline.  A strictly newer local checkpoint
+    # can only come from an interrupted continuation, so retain it safely.
+    # At equal iteration prefer the attached input archive over stale working
+    # files from a previous profile.
+    if input_resume is not None and (
+        local_resume is None or checkpoint_iter(input_resume) >= checkpoint_iter(local_resume)
+    ):
+        resume = input_resume
+        resume_source = "input"
+    elif local_resume is not None:
+        resume = local_resume
+        resume_source = "local"
+    else:
+        resume = None
+        resume_source = None
     if resume is not None:
-        print(f"[{scene_name}] resuming newest verified checkpoint: {resume}")
+        print(f"[{scene_name}] resuming verified {resume_source} checkpoint: {resume}")
     elif RESUME_INPUT:
-        resume = latest_input_checkpoint(scene_path, max_iter=target_iterations - 1)
+        print(f"[{scene_name}] no verified input or local checkpoint found; starting clean.")
     else:
         print(f"[{scene_name}] input-checkpoint resume disabled; starting clean if no local checkpoint exists.")
 
@@ -1424,6 +1468,10 @@ def build_train_cmd(scene_path, gpu_id):
         str(cfg["prune_warmup_iters"]),
         "--prune_interval",
         str(cfg["prune_interval"]),
+        "--test_pose_prune_distance",
+        str(cfg["test_pose_prune_distance"]),
+        "--test_pose_prune_chunk_size",
+        str(cfg["test_pose_prune_chunk_size"]),
         "--percent_dense",
         str(cfg["percent_dense"]),
         "--opacity_reset_interval",
@@ -1457,12 +1505,15 @@ def build_train_cmd(scene_path, gpu_id):
         # while the notebook waits in as_completed().
         "--progress_name",
         f"{scene_name}-gpu{gpu_id}",
-        "--skip_test_poses",
         *optional_depth_args(scene_path),
         *optional_mask_args(scene_path),
     ]
     if VALIDATION_HOLDOUT:
         cmd.append("--validation_holdout")
+    if cfg["test_pose_prune_distance"] <= 0:
+        # Avoid allocating black placeholder images for test views unless the
+        # training profile explicitly needs their poses for pruning.
+        cmd.append("--skip_test_poses")
     if cfg["densify_clone_before_split"]:
         cmd.append("--densify_clone_before_split")
 

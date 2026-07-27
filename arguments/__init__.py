@@ -128,6 +128,14 @@ class OptimizationParams(ParamGroup):
         # lower cadence than normal densification.
         self.prune_warmup_iters = 500
         self.prune_interval = 500
+        # Competition test cameras have no images, but their calibrated poses
+        # identify empty camera space.  Optionally remove splats whose centres
+        # enter this space while densification is still creating geometry.
+        # 0 disables the rule and preserves the historical training path.
+        self.test_pose_prune_distance = 0.0
+        # Bound the temporary point-by-pose distance block; this keeps the
+        # near-field rule safe at multi-million-Gaussian scale.
+        self.test_pose_prune_chunk_size = 262144
         self.foreground_loss_weight = 0.0
         self.foreground_edge_loss_weight = 0.05
         self.image_edge_loss_weight = 0.0

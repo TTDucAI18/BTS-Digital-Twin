@@ -136,6 +136,24 @@ def densify_point_cap(iteration, stages, final_cap):
             return cap
     return final_cap
 
+
+def test_pose_proximity_mask(points, test_pose_centers, distance, chunk_size):
+    """Mark splats inside a test camera's empty near-field.
+
+    Chunking bounds the temporary point-by-camera matrix: a dense 3.5M-splat
+    model with 60 test poses never allocates its full N-by-C distance matrix
+    during the highest-VRAM densification phase.
+    """
+    if distance <= 0.0 or test_pose_centers is None or points.numel() == 0:
+        return None
+    prune_mask = torch.zeros(points.shape[0], dtype=torch.bool, device=points.device)
+    chunk_size = max(1, chunk_size)
+    for start in range(0, points.shape[0], chunk_size):
+        end = min(start + chunk_size, points.shape[0])
+        nearest_distance = torch.cdist(points[start:end], test_pose_centers).amin(dim=1)
+        prune_mask[start:end] = nearest_distance < distance
+    return prune_mask
+
 def training(dataset, opt, pipe, validation_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -157,6 +175,17 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    test_pose_centers = None
+    if opt.test_pose_prune_distance > 0.0:
+        test_cameras = scene.getTestCameras()
+        if test_cameras:
+            test_pose_centers = torch.stack([camera.camera_center for camera in test_cameras])
+            print(
+                f"Test-pose near-field pruning enabled: {len(test_cameras)} poses, "
+                f"radius={opt.test_pose_prune_distance:g}."
+            )
+        else:
+            print("[WARN] Test-pose pruning requested, but this scene has no loaded test poses.")
     if checkpoint:
         # weights_only=False: required for checkpoints containing numpy scalars (optimizer states)
         # Compatible with PyTorch >= 2.6 where default changed from False to True
@@ -515,6 +544,44 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                         gaussians.tmp_radii = None
                         print(f"[ITER {iteration}] Pruned {points_before_prune - gaussians.get_xyz.shape[0]} Gaussians; {gaussians.get_xyz.shape[0]} remain.")
                         torch.cuda.empty_cache()
+
+                    # Apply this only while geometry is being created.  It
+                    # keeps newly split/clone splats out of the unobserved
+                    # near-field of hidden test cameras without changing a
+                    # later fixed-geometry convergence/cleanup phase.
+                    if densify_is_due and test_pose_centers is not None:
+                        points_before_test_prune = gaussians.get_xyz.shape[0]
+                        test_pose_prune_mask = test_pose_proximity_mask(
+                            gaussians.get_xyz, test_pose_centers, opt.test_pose_prune_distance,
+                            opt.test_pose_prune_chunk_size,
+                        )
+                        if test_pose_prune_mask is not None and bool(test_pose_prune_mask.any()):
+                            gaussians.prune_points(test_pose_prune_mask)
+                            print(
+                                f"[ITER {iteration}] Test-pose near-field pruned "
+                                f"{points_before_test_prune - gaussians.get_xyz.shape[0]} Gaussians; "
+                                f"{gaussians.get_xyz.shape[0]} remain."
+                            )
+
+                    # ``max_gaussians`` is a hard limit even when resuming a
+                    # checkpoint created with a larger historical budget.
+                    # Prefer removing low-opacity splats so chair's 3.5M cap
+                    # does not retain weak, view-local noise merely because
+                    # it existed before this continuation run.
+                    if densify_is_due and current_cap > 0 and gaussians.get_xyz.shape[0] > current_cap:
+                        excess = gaussians.get_xyz.shape[0] - current_cap
+                        low_opacity_indices = torch.topk(
+                            gaussians.get_opacity.squeeze(), excess, largest=False,
+                        ).indices
+                        cap_prune_mask = torch.zeros(
+                            gaussians.get_xyz.shape[0], dtype=torch.bool, device=gaussians.get_xyz.device,
+                        )
+                        cap_prune_mask[low_opacity_indices] = True
+                        gaussians.prune_points(cap_prune_mask)
+                        print(
+                            f"[ITER {iteration}] Enforced point cap {current_cap}: "
+                            f"pruned {excess} low-opacity Gaussians."
+                        )
                 
                 reset_is_due = (
                     opt.opacity_reset_interval > 0

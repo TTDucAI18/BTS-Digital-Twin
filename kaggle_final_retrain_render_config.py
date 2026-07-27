@@ -1,14 +1,9 @@
-"""Final Kaggle profile: retrain close-ups, then render fixed BTS models.
+"""Kaggle profile: resume every scene from the attached checkpoint to 70k.
 
-Run this file/cell before ``kaggle_notebook.py``.  It has two strict phases:
+Run this file/cell before ``kaggle_notebook.py``.
 
-1. Fresh-train ``bonsai`` and ``chair`` to 50k iterations.
-2. Only after both complete, hydrate the five BTS checkpoints at 60k and
-   render them.  Those five scenes are render-only and can never retrain.
-
-The notebook writes a ``.fresh_run_started`` marker after the initial reset,
-so rerunning this exact profile after an interruption resumes bonsai/chair
-instead of deleting their new checkpoint.
+All scenes first hydrate their latest compatible input checkpoint (currently
+50k), then preserve local checkpoints for interruption-safe continuation.
 """
 
 import os
@@ -26,35 +21,36 @@ os.environ.update({
 
     # Scene selection and phase ordering.
     "BTS_SCENES": "bonsai,chair,HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
-    # New marker namespace: reset both close-ups once for this maskless-chair
-    # experiment, then retain their checkpoints if the notebook is resumed.
+    # Hydrate the attached input checkpoint at the same step as any stale
+    # local archive; a strictly newer local checkpoint wins after an
+    # interruption instead of losing progress.
     "BTS_FRESH_RUN": "0",
-    "BTS_FRESH_RUN_ID": "maskless-chair-v1",
-    "BTS_FRESH_SCENES": "bonsai,chair",
-    "BTS_TRAIN_FIRST_SCENES": "bonsai,chair",
-    "BTS_RENDER_ONLY_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
+    "BTS_FRESH_RUN_ID": "resume-input-70k-v1",
+    "BTS_FRESH_SCENES": "",
+    "BTS_TRAIN_FIRST_SCENES": "",
+    "BTS_RENDER_ONLY_SCENES": "",
     "BTS_RESUME_LOCAL": "1",
-    "BTS_RESUME_INPUT": "0",
+    "BTS_RESUME_INPUT": "1",
     "BTS_CLEANUP_SCENES": "",
     "BTS_CLEANUP_STEPS": "0",
     "BTS_CLOSEUP_CLEANUP_STEPS": "0",
 
-    # Target iterations.  HCM scenes must supply exact 60k archives; the
-    # close-up pair uses its own fresh 50k schedule.
-    "BTS_ITERATIONS": "60000",
-    "BTS_POSITION_LR_MAX_STEPS": "60000",
-    "BTS_CLOSEUP_ITERATIONS": "50000",
-    "BTS_CLOSEUP_POSITION_LR_MAX_STEPS": "50000",
-    "BTS_CHECKPOINT_ITERATIONS": "40000,45000,50000,60000",
-    "BTS_VALIDATION_ITERATIONS": "40000,45000,50000,60000",
+    # Resume all current 50k models through a 20k refinement tail.  Continue
+    # densification only through 60k, then let 60k--70k converge geometry.
+    "BTS_ITERATIONS": "70000",
+    "BTS_POSITION_LR_MAX_STEPS": "70000",
+    "BTS_CLOSEUP_ITERATIONS": "70000",
+    "BTS_CLOSEUP_POSITION_LR_MAX_STEPS": "70000",
+    "BTS_CHECKPOINT_ITERATIONS": "60000,65000,70000",
+    "BTS_VALIDATION_ITERATIONS": "60000,65000,70000",
 
-    # Base BTS settings.  They are not used to optimise the five render-only
-    # scenes, but retain explicit, safe values for a controlled recovery run.
+    # Base BTS settings retain the existing memory-safe schedule while its
+    # densification window is extended for resumed refinement.
     "BTS_MAX_GAUSSIANS": "8000000",
     "BTS_SH_DEGREE": "2",
     "BTS_MAX_NEW_POINTS_PER_DENSIFY": "75000",
     "BTS_DENSIFY_GRAD_THRESHOLD": "0.00015",
-    "BTS_DENSIFY_UNTIL_ITER": "50000",
+    "BTS_DENSIFY_UNTIL_ITER": "60000",
     "BTS_DENSIFY_CAP_SCHEDULE": "10000:1200000,17000:3200000,21000:5200000",
     "BTS_PERCENT_DENSE": "0.005",
     "BTS_MAX_SCREEN_SIZE": "20",
@@ -62,12 +58,11 @@ os.environ.update({
     "BTS_DEPTH_WEIGHT_INIT": "0.02",
     "BTS_IMAGE_EDGE_LOSS_WEIGHT": "0.02",
 
-    # Close-up geometry: extend allocation through 40k, followed by a 10k
-    # fixed-geometry convergence phase.  The 4.8M staged cap and 0.00010
-    # gradient gate favour real multi-view detail over noise-driven floaters.
+    # Close-up geometry densifies to 60k, then converges to 70k.  Chair has
+    # the weakest data, so its lower cap avoids fitting view-local noise.
     "BTS_CLOSEUP_MAX_GAUSSIANS": "4800000",
     "BTS_CLOSEUP_DENSIFY_GRAD_THRESHOLD": "0.00010",
-    "BTS_CLOSEUP_DENSIFY_UNTIL_ITER": "40000",
+    "BTS_CLOSEUP_DENSIFY_UNTIL_ITER": "60000",
     "BTS_CLOSEUP_DENSIFY_CAP_SCHEDULE": "10000:1200000,20000:2600000,30000:4000000,40000:4800000",
     "BTS_CLOSEUP_MAX_NEW_POINTS_PER_DENSIFY": "50000",
     "BTS_CLOSEUP_CLONE_BEFORE_SPLIT": "1",
@@ -76,11 +71,18 @@ os.environ.update({
     "BTS_CLOSEUP_OPACITY_RESET_UNTIL_ITER": "12000",
     "BTS_CLOSEUP_DEPTH_WEIGHT_INIT": "0.01",
     "BTS_CLOSEUP_IMAGE_EDGE_LOSS_WEIGHT": "0.03",
+    "BTS_CHAIR_MAX_GAUSSIANS": "3500000",
+    "BTS_CHAIR_DENSIFY_CAP_SCHEDULE": "10000:1200000,20000:2200000,40000:3000000,60000:3500000",
     # Chair masks often include a second chair or a fragment of the target.
     # Disable them only for chair; bonsai continues using its foreground masks.
     "BTS_DISABLE_FOREGROUND_MASK_SCENES": "chair",
     "BTS_FOREGROUND_LOSS_WEIGHT": "12.0",
     "BTS_FOREGROUND_EDGE_LOSS_WEIGHT": "0.05",
+
+    # Remove splats that densification creates inside hidden test-camera
+    # space.  The implementation uses a bounded point-by-camera block, so it
+    # remains VRAM-safe for multi-million-Gaussian models.
+    "BTS_TEST_POSE_PRUNE_DISTANCE": "0.10",
 
     # Render-only repair for the known HCM0421 near-camera floater.  Format:
     # image_name:near_distance:maximum_scale_to_distance.

@@ -91,7 +91,11 @@ _requested_checkpoint_iterations = {
     if value.strip()
 }
 CHECKPOINT_ITERATIONS = sorted(
-    iteration for iteration in _requested_checkpoint_iterations if 0 < iteration <= ITERATIONS
+    # Scene profiles may legitimately run beyond BTS_ITERATIONS (for example
+    # chair's 70k reconstruction plus 10k cleanup).  Filter against each
+    # scene's target later in scene_train_config(), not against this shared
+    # default here.
+    iteration for iteration in _requested_checkpoint_iterations if iteration > 0
 )
 if ITERATIONS not in CHECKPOINT_ITERATIONS:
     CHECKPOINT_ITERATIONS.append(ITERATIONS)
@@ -103,7 +107,7 @@ _requested_validation_iterations = {
     if value.strip()
 }
 VALIDATION_ITERATIONS = sorted(
-    iteration for iteration in _requested_validation_iterations if 0 < iteration <= ITERATIONS
+    iteration for iteration in _requested_validation_iterations if iteration > 0
 )
 if ITERATIONS not in VALIDATION_ITERATIONS:
     VALIDATION_ITERATIONS.append(ITERATIONS)
@@ -1276,6 +1280,7 @@ def scene_train_config(scene_path):
         "position_lr_max_steps": POSITION_LR_MAX_STEPS,
         "densify_clone_before_split": False,
         "prune_only_until_iter": 0,
+        "prune_only_from_iter": 0,
         "prune_opacity_threshold": float(os.environ.get("BTS_PRUNE_OPACITY_THRESHOLD", "0.005")),
         "prune_min_visibility": 0,
         "prune_warmup_iters": int(os.environ.get("BTS_PRUNE_WARMUP_ITERS", "500")),
@@ -1337,6 +1342,10 @@ def scene_train_config(scene_path):
         scene_prefix = f"BTS_{scene_name.upper()}"
         cfg.update({
             "prune_only_until_iter": target_iterations,
+            "prune_only_from_iter": int(os.environ.get(
+                f"{scene_prefix}_CLEANUP_PRUNE_FROM_ITER",
+                os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_FROM_ITER", "0"),
+            )),
             "prune_opacity_threshold": float(os.environ.get(
                 f"{scene_prefix}_CLEANUP_PRUNE_OPACITY_THRESHOLD",
                 os.environ.get(
@@ -1373,6 +1382,7 @@ def scene_train_config(scene_path):
         cfg.update({
             "densify_until_iter": FINETUNE_BASE_ITERATIONS,
             "prune_only_until_iter": target_iterations,
+            "prune_only_from_iter": FINETUNE_BASE_ITERATIONS,
             "depth_weight_init": 0.0,
             "position_lr_max_steps": FINETUNE_POSITION_LR_MAX_STEPS,
             "prune_opacity_threshold": float(os.environ.get(
@@ -1428,6 +1438,9 @@ def scene_train_config(scene_path):
     cfg["prune_min_visibility"] = int(os.environ.get(
         f"{scene_prefix}_PRUNE_MIN_VISIBILITY", str(cfg["prune_min_visibility"]),
     ))
+    cfg["prune_only_from_iter"] = int(os.environ.get(
+        f"{scene_prefix}_PRUNE_ONLY_FROM_ITER", str(cfg["prune_only_from_iter"]),
+    ))
     cfg["test_pose_prune_distance"] = float(os.environ.get(
         f"{scene_prefix}_TEST_POSE_PRUNE_DISTANCE",
         str(cfg["test_pose_prune_distance"]),
@@ -1449,6 +1462,8 @@ def scene_train_config(scene_path):
         or cfg["position_lr_init"] <= 0
         or cfg["position_lr_max_steps"] <= 0
         or cfg["prune_only_until_iter"] < 0
+        or cfg["prune_only_from_iter"] < 0
+        or cfg["prune_only_from_iter"] > cfg["prune_only_until_iter"]
         or not 0 < cfg["prune_opacity_threshold"] < 1
         or cfg["prune_min_visibility"] < 0
         or cfg["prune_warmup_iters"] < 0
@@ -1492,6 +1507,7 @@ def build_train_cmd(scene_path, gpu_id, force_fresh=False):
         f"| depth_weight={cfg['depth_weight_init']} | screen_prune={cfg['max_screen_size']} "
         f"| cap_schedule={cfg['densify_cap_schedule'] or 'off'} | max_new={cfg['max_new_points_per_densify']} "
         f"| edge_loss={cfg['image_edge_loss_weight']} | prune_until={cfg['prune_only_until_iter']} "
+        f"| prune_from={cfg['prune_only_from_iter']} "
         f"| prune_opacity={cfg['prune_opacity_threshold']} | prune_warmup={cfg['prune_warmup_iters']} "
         f"| prune_visibility={cfg['prune_min_visibility']} | prune_interval={cfg['prune_interval']} "
         f"| checkpoints={cfg['checkpoint_iterations']} "
@@ -1581,6 +1597,8 @@ def build_train_cmd(scene_path, gpu_id, force_fresh=False):
         str(cfg["max_new_points_per_densify"]),
         "--prune_only_until_iter",
         str(cfg["prune_only_until_iter"]),
+        "--prune_only_from_iter",
+        str(cfg["prune_only_from_iter"]),
         "--prune_opacity_threshold",
         str(cfg["prune_opacity_threshold"]),
         "--prune_min_visibility",

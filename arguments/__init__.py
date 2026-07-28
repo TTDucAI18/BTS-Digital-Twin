@@ -122,6 +122,10 @@ class OptimizationParams(ParamGroup):
         # and prune a completed model without creating any new Gaussians.
         # 0 disables this post-densification phase.
         self.prune_only_until_iter = 0
+        # Optional absolute iteration at which cleanup may begin.  This lets
+        # a fresh model retain a fixed-geometry convergence interval before
+        # reset visibility statistics drive floater pruning.
+        self.prune_only_from_iter = 0
         self.prune_opacity_threshold = 0.005
         # During a prune-only resume, discard splats that fail to appear in
         # this many freshly sampled training views.  Zero keeps legacy

@@ -497,9 +497,20 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
             prune_only_active = (
                 not densification_active
                 and opt.prune_only_until_iter > 0
+                and iteration > opt.prune_only_from_iter
                 and iteration <= opt.prune_only_until_iter
             )
             if densification_active or prune_only_active:
+                if prune_only_active and iteration == opt.prune_only_from_iter + 1:
+                    # Fresh models normally carry 70k iterations of stale
+                    # statistics.  Reset exactly at cleanup entry so the
+                    # visibility threshold reflects the intended final tail,
+                    # not whether a splat happened to be seen early on.
+                    gaussians.max_radii2D.zero_()
+                    gaussians.xyz_gradient_accum.zero_()
+                    gaussians.denom.zero_()
+                    cleanup_start_iter = iteration
+                    print(f"[ITER {iteration}] Started cleanup: reset visibility and screen-radius statistics.")
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -511,8 +522,8 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                 )
                 cleanup_is_due = (
                     prune_only_active
-                    and iteration > cleanup_start_iter + opt.prune_warmup_iters
-                    and (iteration - cleanup_start_iter) % opt.prune_interval == 0
+                    and iteration - cleanup_start_iter >= opt.prune_warmup_iters
+                    and (iteration - cleanup_start_iter - opt.prune_warmup_iters) % opt.prune_interval == 0
                 )
                 if densify_is_due or cleanup_is_due:
                     size_threshold = (

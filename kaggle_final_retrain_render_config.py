@@ -43,9 +43,12 @@ os.environ.update({
     "BTS_RENDER_ONLY_SCENES": "",
     "BTS_RESUME_LOCAL": "1",
     "BTS_RESUME_INPUT": "1",
-    "BTS_CLEANUP_SCENES": "",
+    # Chair: 70k reconstruction followed by 10k fixed-geometry alignment and
+    # multi-view floater cleanup.  No new splats are created in this tail.
+    "BTS_CLEANUP_SCENES": "chair",
     "BTS_CLEANUP_STEPS": "0",
-    "BTS_CLOSEUP_CLEANUP_STEPS": "0",
+    "BTS_CLOSEUP_CLEANUP_STEPS": "10000",
+    "BTS_CHAIR_CLEANUP_PRUNE_FROM_ITER": "70000",
 
     # Resume all current 50k models through a 20k refinement tail.  Continue
     # densification only through 60k, then let 60k--70k converge geometry.
@@ -53,8 +56,8 @@ os.environ.update({
     "BTS_POSITION_LR_MAX_STEPS": "70000",
     "BTS_CLOSEUP_ITERATIONS": "70000",
     "BTS_CLOSEUP_POSITION_LR_MAX_STEPS": "70000",
-    "BTS_CHECKPOINT_ITERATIONS": "60000,65000,70000",
-    "BTS_VALIDATION_ITERATIONS": "60000,65000,70000",
+    "BTS_CHECKPOINT_ITERATIONS": "60000,65000,70000,75000,80000",
+    "BTS_VALIDATION_ITERATIONS": "60000,70000,75000,80000",
 
     # Base BTS settings retain the existing memory-safe schedule while its
     # densification window is extended for resumed refinement.
@@ -83,8 +86,13 @@ os.environ.update({
     "BTS_CLOSEUP_OPACITY_RESET_UNTIL_ITER": "12000",
     "BTS_CLOSEUP_DEPTH_WEIGHT_INIT": "0.01",
     "BTS_CLOSEUP_IMAGE_EDGE_LOSS_WEIGHT": "0.03",
-    "BTS_CHAIR_MAX_GAUSSIANS": "3500000",
-    "BTS_CHAIR_DENSIFY_CAP_SCHEDULE": "10000:1200000,20000:2200000,40000:3000000,60000:3500000",
+    # Chair reaches its point budget naturally.  Give it enough late capacity
+    # for thin chair geometry, but unlock it gradually so early gradients do
+    # not spend the whole budget on view-local texture.
+    "BTS_CHAIR_MAX_GAUSSIANS": "4300000",
+    "BTS_CHAIR_DENSIFY_CAP_SCHEDULE": "10000:1200000,20000:2200000,35000:3200000,50000:3800000,60000:4300000",
+    "BTS_CHAIR_POSITION_LR_MAX_STEPS": "140000",
+    "BTS_CHAIR_CLEANUP_PRUNE_MIN_VISIBILITY": "3",
     # Chair masks often include a second chair or a fragment of the target.
     # Disable them only for chair; bonsai continues using its foreground masks.
     "BTS_DISABLE_FOREGROUND_MASK_SCENES": "chair",

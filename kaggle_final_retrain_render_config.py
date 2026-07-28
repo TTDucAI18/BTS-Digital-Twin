@@ -25,9 +25,21 @@ os.environ.update({
     # local archive; a strictly newer local checkpoint wins after an
     # interruption instead of losing progress.
     "BTS_FRESH_RUN": "0",
-    "BTS_FRESH_RUN_ID": "resume-input-70k-v1",
-    "BTS_FRESH_SCENES": "",
-    "BTS_TRAIN_FIRST_SCENES": "",
+    "BTS_FRESH_RUN_ID": "chair-fresh-plus-alignment-v1",
+    # Chair is rebuilt independently; every other scene must resume its
+    # verified 70k checkpoint for a geometry-conservative 10k alignment tail.
+    "BTS_FRESH_SCENES": "chair",
+    "BTS_FINETUNE_SCENES": "bonsai,HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
+    "BTS_FINETUNE_BASE_ITERATIONS": "70000",
+    "BTS_FINETUNE_STEPS": "10000",
+    "BTS_FINETUNE_POSITION_LR_MAX_STEPS": "140000",
+    "BTS_CLOSEUP_FINETUNE_PRUNE_MIN_VISIBILITY": "3",
+    "BTS_FINETUNE_PRUNE_MIN_VISIBILITY": "2",
+    "BTS_CHAIR_FRESH_ITERATIONS": "70000",
+    # Chair's calibrated Depth Anything prior is materially weaker than
+    # bonsai's.  Avoid using it to anchor a newly rebuilt close-up model.
+    "BTS_CHAIR_DEPTH_WEIGHT_INIT": "0.0",
+    "BTS_TRAIN_FIRST_SCENES": "chair",
     "BTS_RENDER_ONLY_SCENES": "",
     "BTS_RESUME_LOCAL": "1",
     "BTS_RESUME_INPUT": "1",

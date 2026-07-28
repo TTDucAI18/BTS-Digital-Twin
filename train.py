@@ -532,17 +532,27 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                         phase = "Cleanup pruning" if prune_only_active else "Point budget reached"
                         print(f"\n[ITER {iteration}] {phase} ({gaussians.get_xyz.shape[0]}/{current_cap}).")
                         # Do not introduce new geometry in cleanup; remove
-                        # transparent and large cross-view occluders instead.
+                        # transparent, oversized, and view-local splats.  The
+                        # visibility count is collected only after a resumed
+                        # model's historical statistics were cleared, so it
+                        # is meaningful evidence rather than stale history.
                         points_before_prune = gaussians.get_xyz.shape[0]
                         prune_mask = (gaussians.get_opacity < opt.prune_opacity_threshold).squeeze()
                         if size_threshold:
                             big_points_vs = gaussians.max_radii2D > size_threshold
                             big_points_ws = gaussians.get_scaling.max(dim=1).values > 0.1 * scene.cameras_extent
                             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+                        if prune_only_active and opt.prune_min_visibility > 0:
+                            low_visibility = gaussians.denom.squeeze() < opt.prune_min_visibility
+                            prune_mask = torch.logical_or(prune_mask, low_visibility)
                         gaussians.tmp_radii = radii
                         gaussians.prune_points(prune_mask)
                         gaussians.tmp_radii = None
-                        print(f"[ITER {iteration}] Pruned {points_before_prune - gaussians.get_xyz.shape[0]} Gaussians; {gaussians.get_xyz.shape[0]} remain.")
+                        print(
+                            f"[ITER {iteration}] Pruned {points_before_prune - gaussians.get_xyz.shape[0]} "
+                            f"Gaussians; {gaussians.get_xyz.shape[0]} remain "
+                            f"(min_visibility={opt.prune_min_visibility})."
+                        )
                         torch.cuda.empty_cache()
 
                     # Apply this only while geometry is being created.  It

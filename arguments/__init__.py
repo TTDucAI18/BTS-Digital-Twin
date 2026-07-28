@@ -123,6 +123,11 @@ class OptimizationParams(ParamGroup):
         # 0 disables this post-densification phase.
         self.prune_only_until_iter = 0
         self.prune_opacity_threshold = 0.005
+        # During a prune-only resume, discard splats that fail to appear in
+        # this many freshly sampled training views.  Zero keeps legacy
+        # opacity/size-only cleanup; a small positive value removes
+        # view-local floaters without relying on hidden test images.
+        self.prune_min_visibility = 0
         # A resumed checkpoint contains historical screen radii.  Accumulate
         # fresh multi-view evidence before cleanup starts, then prune at a
         # lower cadence than normal densification.

@@ -175,12 +175,39 @@ FRESH_RUN = os.environ.get("BTS_FRESH_RUN", "0").strip() == "1"
 # A named run creates a new one-reset marker: changed profiles can start
 # clean, while an interrupted run of that same profile remains resumable.
 FRESH_RUN_ID = os.environ.get("BTS_FRESH_RUN_ID", "").strip()
-# This run deliberately retrains the two close-range scenes from scratch while
-# preserving all five BTS 40k checkpoints for refinement.  Set to an empty
-# string to retain a close-up checkpoint for an ablation.
+# Chair has failed geometry in the current submission, so it is the only
+# scene retrained from scratch by the quality profile.  A durable fresh-run
+# marker makes an interrupted 70k run resume rather than deleting itself.
 FRESH_SCENES = frozenset(
-    name.strip() for name in os.environ.get("BTS_FRESH_SCENES", "bonsai,chair").split(",") if name.strip()
+    name.strip() for name in os.environ.get("BTS_FRESH_SCENES", "chair").split(",") if name.strip()
 )
+# Existing 70k models should not be sent through another generic training
+# tail.  They receive a short, geometry-conservative alignment phase instead:
+# no new splats, fresh visibility evidence, and prune-only cleanup.  A
+# fine-tune is unsafe without an input/local checkpoint, so build_train_cmd()
+# rejects an accidental fresh start for these scenes.
+FINETUNE_SCENES = frozenset(
+    name.strip()
+    for name in os.environ.get(
+        "BTS_FINETUNE_SCENES", "bonsai,HCM0421,HCM0539,HCM0540,HCM0644,HCM0674"
+    ).split(",")
+    if name.strip()
+)
+FINETUNE_BASE_ITERATIONS = int(os.environ.get("BTS_FINETUNE_BASE_ITERATIONS", "70000"))
+FINETUNE_STEPS = int(os.environ.get("BTS_FINETUNE_STEPS", "10000"))
+# train.py's position schedule uses absolute iteration numbers.  Extending
+# its horizon prevents a 70k checkpoint from receiving a near-zero geometry
+# learning rate during the alignment tail.
+FINETUNE_POSITION_LR_MAX_STEPS = int(
+    os.environ.get("BTS_FINETUNE_POSITION_LR_MAX_STEPS", "140000")
+)
+if FINETUNE_BASE_ITERATIONS <= 0 or FINETUNE_STEPS <= 0 or FINETUNE_POSITION_LR_MAX_STEPS <= 0:
+    raise ValueError("BTS_FINETUNE_* iteration and LR-horizon values must be positive.")
+# Chair receives a full fresh schedule even if BTS_CLOSEUP_ITERATIONS is set
+# lower for a separate bonsai ablation.
+CHAIR_FRESH_ITERATIONS = int(os.environ.get("BTS_CHAIR_FRESH_ITERATIONS", "70000"))
+if CHAIR_FRESH_ITERATIONS <= 0:
+    raise ValueError("BTS_CHAIR_FRESH_ITERATIONS must be positive.")
 # Comma-separated scenes that should resume a completed model into a
 # prune-only cleanup phase.  This is intentionally opt-in so normal training
 # runs do not extend their target iteration.
@@ -271,6 +298,14 @@ if RENDER_ONLY_SCENES & FRESH_SCENES:
     raise ValueError(
         "A scene cannot be both BTS_RENDER_ONLY_SCENES and BTS_FRESH_SCENES: "
         f"{sorted(RENDER_ONLY_SCENES & FRESH_SCENES)}"
+    )
+_unknown_finetune_scenes = FINETUNE_SCENES - set(TARGET_SCENES)
+if _unknown_finetune_scenes:
+    raise ValueError(f"Unknown BTS_FINETUNE_SCENES: {sorted(_unknown_finetune_scenes)}")
+if FINETUNE_SCENES & FRESH_SCENES:
+    raise ValueError(
+        "A scene cannot be both BTS_FINETUNE_SCENES and BTS_FRESH_SCENES: "
+        f"{sorted(FINETUNE_SCENES & FRESH_SCENES)}"
     )
 _unknown_keep_scenes = KEEP_MODEL_SCENES - set(TARGET_SCENES)
 if _unknown_keep_scenes:
@@ -1200,10 +1235,15 @@ print(f"Extracted {{args.out_ply}}")
 def scene_train_config(scene_path):
     scene_name = Path(scene_path).name
     is_closeup = scene_name in CLOSEUP_SCENES
+    is_finetune = scene_name in FINETUNE_SCENES
     base_iterations = CLOSEUP_ITERATIONS if is_closeup else ITERATIONS
+    if scene_name == "chair" and scene_name in FRESH_SCENES:
+        base_iterations = CHAIR_FRESH_ITERATIONS
     cleanup_active = scene_name in CLEANUP_SCENES
     cleanup_steps = CLOSEUP_CLEANUP_STEPS if is_closeup else BTS_CLEANUP_STEPS
     target_iterations = base_iterations + (cleanup_steps if cleanup_active else 0)
+    if is_finetune:
+        target_iterations = FINETUNE_BASE_ITERATIONS + FINETUNE_STEPS
     cfg = {
         "iterations": target_iterations,
         "resolution": TRAIN_RESOLUTION,
@@ -1237,6 +1277,7 @@ def scene_train_config(scene_path):
         "densify_clone_before_split": False,
         "prune_only_until_iter": 0,
         "prune_opacity_threshold": float(os.environ.get("BTS_PRUNE_OPACITY_THRESHOLD", "0.005")),
+        "prune_min_visibility": 0,
         "prune_warmup_iters": int(os.environ.get("BTS_PRUNE_WARMUP_ITERS", "500")),
         "prune_interval": int(os.environ.get("BTS_PRUNE_INTERVAL", "500")),
         "test_pose_prune_distance": float(os.environ.get("BTS_TEST_POSE_PRUNE_DISTANCE", "0")),
@@ -1285,6 +1326,9 @@ def scene_train_config(scene_path):
             "prune_opacity_threshold": float(os.environ.get(
                 "BTS_CLOSEUP_PRUNE_OPACITY_THRESHOLD", "0.005"
             )),
+            "prune_min_visibility": int(os.environ.get(
+                "BTS_CLOSEUP_PRUNE_MIN_VISIBILITY", "0"
+            )),
             "prune_warmup_iters": int(os.environ.get("BTS_CLOSEUP_PRUNE_WARMUP_ITERS", "500")),
             "prune_interval": int(os.environ.get("BTS_CLOSEUP_PRUNE_INTERVAL", "500")),
         })
@@ -1300,6 +1344,10 @@ def scene_train_config(scene_path):
                     "0.008" if is_closeup else "0.003",
                 ),
             )),
+            "prune_min_visibility": int(os.environ.get(
+                f"{scene_prefix}_CLEANUP_PRUNE_MIN_VISIBILITY",
+                os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_MIN_VISIBILITY", "0"),
+            )),
             "max_screen_size": int(os.environ.get(
                 f"{scene_prefix}_CLEANUP_MAX_SCREEN_SIZE",
                 os.environ.get(f"{group_prefix}_CLEANUP_MAX_SCREEN_SIZE", "96" if is_closeup else "256"),
@@ -1313,6 +1361,51 @@ def scene_train_config(scene_path):
                 os.environ.get(f"{group_prefix}_CLEANUP_PRUNE_INTERVAL", "750" if is_closeup else "1000"),
             )),
         })
+    if is_finetune:
+        # Align an existing reconstruction rather than creating another
+        # generation of splats.  Starting at 70k makes the normal
+        # densification condition false; prune-only then gathers fresh
+        # visibility statistics before deleting low-confidence floaters.
+        # Disable monocular depth here: it is useful for fresh geometry but
+        # can pull an already coherent BTS model toward per-view depth noise.
+        group_prefix = "BTS_CLOSEUP" if is_closeup else "BTS"
+        scene_prefix = f"BTS_{scene_name.upper()}"
+        cfg.update({
+            "densify_until_iter": FINETUNE_BASE_ITERATIONS,
+            "prune_only_until_iter": target_iterations,
+            "depth_weight_init": 0.0,
+            "position_lr_max_steps": FINETUNE_POSITION_LR_MAX_STEPS,
+            "prune_opacity_threshold": float(os.environ.get(
+                f"{scene_prefix}_FINETUNE_PRUNE_OPACITY_THRESHOLD",
+                os.environ.get(
+                    f"{group_prefix}_FINETUNE_PRUNE_OPACITY_THRESHOLD",
+                    "0.008" if is_closeup else "0.003",
+                ),
+            )),
+            # A floater which survives only one or two train poses is exactly
+            # the noise seen in bonsai's failed novel views.  Require three
+            # fresh observations after the 1k-view warm-up for close-up scenes
+            # and two for BTS; scene-specific overrides remain available.
+            "prune_min_visibility": int(os.environ.get(
+                f"{scene_prefix}_FINETUNE_PRUNE_MIN_VISIBILITY",
+                os.environ.get(
+                    f"{group_prefix}_FINETUNE_PRUNE_MIN_VISIBILITY",
+                    "3" if is_closeup else "2",
+                ),
+            )),
+            "max_screen_size": int(os.environ.get(
+                f"{scene_prefix}_FINETUNE_MAX_SCREEN_SIZE",
+                os.environ.get(f"{group_prefix}_FINETUNE_MAX_SCREEN_SIZE", "96" if is_closeup else "256"),
+            )),
+            "prune_warmup_iters": int(os.environ.get(
+                f"{scene_prefix}_FINETUNE_PRUNE_WARMUP_ITERS",
+                os.environ.get(f"{group_prefix}_FINETUNE_PRUNE_WARMUP_ITERS", "1000"),
+            )),
+            "prune_interval": int(os.environ.get(
+                f"{scene_prefix}_FINETUNE_PRUNE_INTERVAL",
+                os.environ.get(f"{group_prefix}_FINETUNE_PRUNE_INTERVAL", "500"),
+            )),
+        })
     scene_prefix = f"BTS_{scene_name.upper()}"
     # A scene-specific cap is useful when capture quality differs sharply.
     # Keep this after the close-up override so, for example, chair can impose
@@ -1323,6 +1416,18 @@ def scene_train_config(scene_path):
     cfg["densify_cap_schedule"] = os.environ.get(
         f"{scene_prefix}_DENSIFY_CAP_SCHEDULE", cfg["densify_cap_schedule"],
     ).strip()
+    cfg["depth_weight_init"] = float(os.environ.get(
+        f"{scene_prefix}_DEPTH_WEIGHT_INIT", str(cfg["depth_weight_init"]),
+    ))
+    cfg["position_lr_init"] = float(os.environ.get(
+        f"{scene_prefix}_POSITION_LR_INIT", str(cfg["position_lr_init"]),
+    ))
+    cfg["position_lr_max_steps"] = int(os.environ.get(
+        f"{scene_prefix}_POSITION_LR_MAX_STEPS", str(cfg["position_lr_max_steps"]),
+    ))
+    cfg["prune_min_visibility"] = int(os.environ.get(
+        f"{scene_prefix}_PRUNE_MIN_VISIBILITY", str(cfg["prune_min_visibility"]),
+    ))
     cfg["test_pose_prune_distance"] = float(os.environ.get(
         f"{scene_prefix}_TEST_POSE_PRUNE_DISTANCE",
         str(cfg["test_pose_prune_distance"]),
@@ -1345,6 +1450,7 @@ def scene_train_config(scene_path):
         or cfg["position_lr_max_steps"] <= 0
         or cfg["prune_only_until_iter"] < 0
         or not 0 < cfg["prune_opacity_threshold"] < 1
+        or cfg["prune_min_visibility"] < 0
         or cfg["prune_warmup_iters"] < 0
         or cfg["prune_interval"] <= 0
         or cfg["test_pose_prune_distance"] < 0
@@ -1376,7 +1482,7 @@ def scene_is_fresh(scene_name):
     return requested and not fresh_run_marker(scene_name).exists()
 
 
-def build_train_cmd(scene_path, gpu_id):
+def build_train_cmd(scene_path, gpu_id, force_fresh=False):
     scene_name = Path(scene_path).name
     out_dir = scene_output(scene_path)
     cfg = scene_train_config(scene_path)
@@ -1387,13 +1493,14 @@ def build_train_cmd(scene_path, gpu_id):
         f"| cap_schedule={cfg['densify_cap_schedule'] or 'off'} | max_new={cfg['max_new_points_per_densify']} "
         f"| edge_loss={cfg['image_edge_loss_weight']} | prune_until={cfg['prune_only_until_iter']} "
         f"| prune_opacity={cfg['prune_opacity_threshold']} | prune_warmup={cfg['prune_warmup_iters']} "
-        f"| prune_interval={cfg['prune_interval']} | checkpoints={cfg['checkpoint_iterations']} "
+        f"| prune_visibility={cfg['prune_min_visibility']} | prune_interval={cfg['prune_interval']} "
+        f"| checkpoints={cfg['checkpoint_iterations']} "
         f"| test_pose_prune={cfg['test_pose_prune_distance']}/{cfg['test_pose_prune_chunk_size']} "
         f"| validate/render={cfg['validation_iterations']}"
     )
     resume = None
     target_iterations = cfg["iterations"]
-    if RESUME_LOCAL and not scene_is_fresh(scene_name):
+    if RESUME_LOCAL and not force_fresh and not scene_is_fresh(scene_name):
         # A SIGKILL may leave the scene output partially cleaned or corrupted.
         # Choose the newest valid copy across the live model directory and the
         # independently verified archive.
@@ -1405,7 +1512,7 @@ def build_train_cmd(scene_path, gpu_id):
         local_resume = None
     input_resume = (
         latest_input_checkpoint(scene_path, max_iter=target_iterations - 1)
-        if RESUME_INPUT else None
+        if RESUME_INPUT and not force_fresh else None
     )
     # Input is the canonical 50k baseline.  A strictly newer local checkpoint
     # can only come from an interrupted continuation, so retain it safely.
@@ -1424,10 +1531,22 @@ def build_train_cmd(scene_path, gpu_id):
         resume_source = None
     if resume is not None:
         print(f"[{scene_name}] resuming verified {resume_source} checkpoint: {resume}")
-    elif RESUME_INPUT:
+    elif RESUME_INPUT and not force_fresh:
         print(f"[{scene_name}] no verified input or local checkpoint found; starting clean.")
     else:
-        print(f"[{scene_name}] input-checkpoint resume disabled; starting clean if no local checkpoint exists.")
+        print(f"[{scene_name}] fresh policy active; starting without a checkpoint.")
+
+    if scene_name in FINETUNE_SCENES:
+        if resume is None:
+            raise RuntimeError(
+                f"[{scene_name}] alignment fine-tune requires a verified checkpoint at "
+                f"iteration >= {FINETUNE_BASE_ITERATIONS}; refusing a fresh run."
+            )
+        if checkpoint_iter(resume) < FINETUNE_BASE_ITERATIONS:
+            raise RuntimeError(
+                f"[{scene_name}] latest checkpoint is step {checkpoint_iter(resume)}, but alignment "
+                f"requires >= {FINETUNE_BASE_ITERATIONS}; refusing an underspecified resume."
+            )
 
     cmd = [
         sys.executable,
@@ -1464,6 +1583,8 @@ def build_train_cmd(scene_path, gpu_id):
         str(cfg["prune_only_until_iter"]),
         "--prune_opacity_threshold",
         str(cfg["prune_opacity_threshold"]),
+        "--prune_min_visibility",
+        str(cfg["prune_min_visibility"]),
         "--prune_warmup_iters",
         str(cfg["prune_warmup_iters"]),
         "--prune_interval",
@@ -1780,7 +1901,7 @@ def train_and_render_scene(scene_path, gpu_id):
         return scene_name, 8
     else:
         print(f"[{scene_name}] preparing train.py command.", flush=True)
-        cmd, env = build_train_cmd(scene_path, gpu_id)
+        cmd, env = build_train_cmd(scene_path, gpu_id, force_fresh=fresh_scene)
         log = OUTPUT_DIR / f"{scene_name}_train.log"
         print(f"[{scene_name}] train on GPU {gpu_id} | images={count_images(scene_path)} | log={log}")
         # Stagger the WandB-service startup: GPU-0 initialises it first, and

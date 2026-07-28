@@ -63,6 +63,9 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        # Temporary projected radii are scoped to a densification step.  Keep
+        # the attribute defined for prune-only/resume paths as well.
+        self.tmp_radii = None
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -345,7 +348,11 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
+        # ``tmp_radii`` is only populated while a densification operation is
+        # in progress.  Cleanup and test-pose pruning can legitimately call
+        # this method after that transient state has been cleared.
+        if self.tmp_radii is not None:
+            self.tmp_radii = self.tmp_radii[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}

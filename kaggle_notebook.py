@@ -1359,6 +1359,20 @@ def scene_train_config(scene_path):
     target_iterations = int(os.environ.get(
         f"BTS_{scene_name.upper()}_ITERATIONS", str(target_iterations)
     ))
+    # A render-only scene must render the exact checked checkpoint, never
+    # inherit a group schedule.  This makes the full pinhole profile robust
+    # when a pasted config cell accidentally omits BTS_CHAIR_ITERATIONS:
+    # bonsai is pinned to its required 80k archive and chair to its 70k one.
+    if scene_name in RENDER_ONLY_SCENES and scene_name in REQUIRE_RESUME_SCENES:
+        required_iteration = int(os.environ.get(
+            f"BTS_{scene_name.upper()}_REQUIRE_RESUME_MIN_ITERATION",
+            str(REQUIRE_RESUME_MIN_ITERATION),
+        ))
+        if required_iteration <= 0:
+            raise ValueError(
+                f"[{scene_name}] render-only required checkpoint iteration must be positive."
+            )
+        target_iterations = required_iteration
     if target_iterations <= 0:
         raise ValueError(f"[{scene_name}] BTS_{scene_name.upper()}_ITERATIONS must be positive.")
     cfg = {

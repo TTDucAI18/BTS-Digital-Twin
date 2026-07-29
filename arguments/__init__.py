@@ -89,6 +89,13 @@ class OptimizationParams(ParamGroup):
         self.opacity_lr = 0.025
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
+        # A resumed fixed-geometry alignment tail can scale the restored
+        # optimizer rates without changing normal reconstruction defaults.
+        self.alignment_position_lr_scale = 1.0
+        self.alignment_feature_lr_scale = 1.0
+        self.alignment_opacity_lr_scale = 1.0
+        self.alignment_scaling_lr_scale = 1.0
+        self.alignment_rotation_lr_scale = 1.0
         # exposure_lr_* removed: no exposure compensation needed for BTS uniform lighting.
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2

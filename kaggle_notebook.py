@@ -167,6 +167,17 @@ SUBPROCESS_HEARTBEAT_SECONDS = float(os.environ.get("BTS_SUBPROCESS_HEARTBEAT_SE
 # more than a strict holdout for the final competition reconstruction.
 VALIDATION_FRACTION = float(os.environ.get("BTS_VALIDATION_FRACTION", "0.05"))
 VALIDATION_HOLDOUT = os.environ.get("BTS_VALIDATION_HOLDOUT", "0").strip() == "1"
+VALIDATION_LPIPS_FINAL = os.environ.get("BTS_VALIDATION_LPIPS_FINAL", "0").strip() == "1"
+# Build a writable, camera-consistent copy only for explicitly selected BTS
+# scenes.  The original Kaggle input remains untouched, and the default keeps
+# legacy behaviour for existing runs/checkpoints.
+PINHOLE_PREPROCESS_SCENES = frozenset(
+    name.strip()
+    for name in os.environ.get("BTS_PINHOLE_PREPROCESS_SCENES", "").split(",")
+    if name.strip()
+)
+PINHOLE_DATA_ROOT = Path(os.environ.get("BTS_PINHOLE_DATA_ROOT", "/kaggle/working/data_pinhole"))
+PINHOLE_JPEG_QUALITY = int(os.environ.get("BTS_PINHOLE_JPEG_QUALITY", "100"))
 # Resume an interrupted run from its own output by default.  Input checkpoints
 # can be from a different data/preprocessing/configuration generation, so they
 # are deliberately opt-in for quality-sensitive reruns.
@@ -197,6 +208,15 @@ FINETUNE_SCENES = frozenset(
     ).split(",")
     if name.strip()
 )
+# Detail-recovery runs need a checkpoint but must not inherit FINETUNE_SCENES,
+# whose policy intentionally turns densification off and enables prune-only
+# cleanup.  Keep the safety guard independent from that old phase policy.
+REQUIRE_RESUME_SCENES = frozenset(
+    name.strip() for name in os.environ.get("BTS_REQUIRE_RESUME_SCENES", "").split(",") if name.strip()
+)
+REQUIRE_RESUME_MIN_ITERATION = int(os.environ.get("BTS_REQUIRE_RESUME_MIN_ITERATION", "0"))
+if REQUIRE_RESUME_MIN_ITERATION < 0:
+    raise ValueError("BTS_REQUIRE_RESUME_MIN_ITERATION must be non-negative.")
 FINETUNE_BASE_ITERATIONS = int(os.environ.get("BTS_FINETUNE_BASE_ITERATIONS", "70000"))
 FINETUNE_STEPS = int(os.environ.get("BTS_FINETUNE_STEPS", "10000"))
 # train.py's position schedule uses absolute iteration numbers.  Extending
@@ -230,6 +250,10 @@ RENDER_ONLY_SCENES = frozenset(
 TRAIN_FIRST_SCENES = frozenset(
     name.strip() for name in os.environ.get("BTS_TRAIN_FIRST_SCENES", "").split(",") if name.strip()
 )
+# In exclusive mode, later scenes wait until every train-first scene ends.
+# Disable it for 2x-GPU runs to launch the priority scene first while keeping
+# the other T4 busy with the next queued scene.
+TRAIN_FIRST_EXCLUSIVE = os.environ.get("BTS_TRAIN_FIRST_EXCLUSIVE", "1").strip() != "0"
 BTS_CLEANUP_STEPS = int(os.environ.get("BTS_CLEANUP_STEPS", "0"))
 CLOSEUP_CLEANUP_STEPS = int(os.environ.get("BTS_CLOSEUP_CLEANUP_STEPS", "0"))
 if BTS_CLEANUP_STEPS < 0 or CLOSEUP_CLEANUP_STEPS < 0:
@@ -306,6 +330,11 @@ if RENDER_ONLY_SCENES & FRESH_SCENES:
 _unknown_finetune_scenes = FINETUNE_SCENES - set(TARGET_SCENES)
 if _unknown_finetune_scenes:
     raise ValueError(f"Unknown BTS_FINETUNE_SCENES: {sorted(_unknown_finetune_scenes)}")
+_unknown_required_resume_scenes = REQUIRE_RESUME_SCENES - set(TARGET_SCENES)
+if _unknown_required_resume_scenes:
+    raise ValueError(
+        f"Unknown BTS_REQUIRE_RESUME_SCENES: {sorted(_unknown_required_resume_scenes)}"
+    )
 if FINETUNE_SCENES & FRESH_SCENES:
     raise ValueError(
         "A scene cannot be both BTS_FINETUNE_SCENES and BTS_FRESH_SCENES: "
@@ -314,6 +343,11 @@ if FINETUNE_SCENES & FRESH_SCENES:
 _unknown_keep_scenes = KEEP_MODEL_SCENES - set(TARGET_SCENES)
 if _unknown_keep_scenes:
     raise ValueError(f"Unknown BTS_KEEP_MODEL_SCENES: {sorted(_unknown_keep_scenes)}")
+_unknown_pinhole_scenes = PINHOLE_PREPROCESS_SCENES - set(TARGET_SCENES)
+if _unknown_pinhole_scenes:
+    raise ValueError(f"Unknown BTS_PINHOLE_PREPROCESS_SCENES: {sorted(_unknown_pinhole_scenes)}")
+if not 1 <= PINHOLE_JPEG_QUALITY <= 100:
+    raise ValueError("BTS_PINHOLE_JPEG_QUALITY must be in [1, 100].")
 
 def get_secret(name):
     value = os.environ.get(name, "").strip()
@@ -756,6 +790,39 @@ print(f"DATA_ROOT: {DATA_ROOT}")
 print(f"Target scenes ({len(ALL_SCENES)}): {[p.name for p in ALL_SCENES]}")
 
 
+def prepare_selected_pinhole_scenes(scenes):
+    """Return scene paths, replacing opted-in radial scenes with pinhole copies."""
+    if not PINHOLE_PREPROCESS_SCENES:
+        return scenes
+    script = REPO_DIR / "prepare_pinhole_dataset.py"
+    if not script.is_file():
+        raise FileNotFoundError(f"Missing pinhole preprocessing script: {script}")
+    prepared = []
+    for scene in scenes:
+        if scene.name not in PINHOLE_PREPROCESS_SCENES:
+            prepared.append(scene)
+            continue
+        destination = PINHOLE_DATA_ROOT / scene.name
+        print(f"[{scene.name}] preparing radial->pinhole training copy at {destination}")
+        run(
+            [sys.executable, script, "--source", scene, "--destination", destination,
+             "--jpeg-quality", str(PINHOLE_JPEG_QUALITY)],
+            cwd=REPO_DIR,
+            log_file=OUTPUT_DIR / f"{scene.name}_pinhole_preprocess.log",
+            check=True,
+        )
+        manifest = destination / ".pinhole_manifest.json"
+        if not manifest.is_file() or not (destination / "train" / "sparse" / "0" / "cameras.bin").is_file():
+            raise RuntimeError(f"[{scene.name}] pinhole preprocessing did not create a valid scene at {destination}")
+        prepared.append(destination)
+    return prepared
+
+
+ALL_SCENES = prepare_selected_pinhole_scenes(ALL_SCENES)
+if PINHOLE_PREPROCESS_SCENES:
+    print(f"Pinhole-preprocessed scenes: {sorted(PINHOLE_PREPROCESS_SCENES)}")
+
+
 def train_root(scene_path):
     scene_path = Path(scene_path)
     return scene_path / "train" if (scene_path / "train" / "sparse").exists() else scene_path
@@ -821,6 +888,15 @@ def optional_depth_args(scene_path):
 
 def optional_mask_args(scene_path):
     scene_name = Path(scene_path).name
+    scene_prefix = f"BTS_{scene_name.upper()}"
+    foreground_loss_weight = float(os.environ.get(
+        f"{scene_prefix}_FOREGROUND_LOSS_WEIGHT", str(FOREGROUND_LOSS_WEIGHT)
+    ))
+    foreground_edge_loss_weight = float(os.environ.get(
+        f"{scene_prefix}_FOREGROUND_EDGE_LOSS_WEIGHT", str(FOREGROUND_EDGE_LOSS_WEIGHT)
+    ))
+    if foreground_loss_weight < 0.0 or foreground_edge_loss_weight < 0.0:
+        raise ValueError(f"[{scene_name}] foreground loss weights must be non-negative.")
     if scene_name in DISABLE_FOREGROUND_MASK_SCENES:
         print(f"[{scene_name}] foreground masks explicitly disabled for this scene.")
         return []
@@ -854,9 +930,12 @@ def optional_mask_args(scene_path):
                 )
             args = ["--masks", name]
             if SUPPORTS_FOREGROUND_WEIGHT:
-                args.extend(["--foreground_loss_weight", str(FOREGROUND_LOSS_WEIGHT)])
-                args.extend(["--foreground_edge_loss_weight", str(FOREGROUND_EDGE_LOSS_WEIGHT)])
-            print(f"[{Path(scene_path).name}] foreground masks: {root / name} (weight={FOREGROUND_LOSS_WEIGHT})")
+                args.extend(["--foreground_loss_weight", str(foreground_loss_weight)])
+                args.extend(["--foreground_edge_loss_weight", str(foreground_edge_loss_weight)])
+            print(
+                f"[{Path(scene_path).name}] foreground masks: {root / name} "
+                f"(weight={foreground_loss_weight}, edge_weight={foreground_edge_loss_weight})"
+            )
             return args
     print(f"[{Path(scene_path).name}] no foreground masks found; using image/depth losses only.")
     return []
@@ -1248,6 +1327,11 @@ def scene_train_config(scene_path):
     target_iterations = base_iterations + (cleanup_steps if cleanup_active else 0)
     if is_finetune:
         target_iterations = FINETUNE_BASE_ITERATIONS + FINETUNE_STEPS
+    target_iterations = int(os.environ.get(
+        f"BTS_{scene_name.upper()}_ITERATIONS", str(target_iterations)
+    ))
+    if target_iterations <= 0:
+        raise ValueError(f"[{scene_name}] BTS_{scene_name.upper()}_ITERATIONS must be positive.")
     cfg = {
         "iterations": target_iterations,
         "resolution": TRAIN_RESOLUTION,
@@ -1278,6 +1362,11 @@ def scene_train_config(scene_path):
         "image_edge_loss_weight": float(os.environ.get("BTS_IMAGE_EDGE_LOSS_WEIGHT", "0.02")),
         "position_lr_init": float(os.environ.get("BTS_POSITION_LR_INIT", "0.00016")),
         "position_lr_max_steps": POSITION_LR_MAX_STEPS,
+        "alignment_position_lr_scale": float(os.environ.get("BTS_ALIGNMENT_POSITION_LR_SCALE", "1.0")),
+        "alignment_feature_lr_scale": float(os.environ.get("BTS_ALIGNMENT_FEATURE_LR_SCALE", "1.0")),
+        "alignment_opacity_lr_scale": float(os.environ.get("BTS_ALIGNMENT_OPACITY_LR_SCALE", "1.0")),
+        "alignment_scaling_lr_scale": float(os.environ.get("BTS_ALIGNMENT_SCALING_LR_SCALE", "1.0")),
+        "alignment_rotation_lr_scale": float(os.environ.get("BTS_ALIGNMENT_ROTATION_LR_SCALE", "1.0")),
         "densify_clone_before_split": False,
         "prune_only_until_iter": 0,
         "prune_only_from_iter": 0,
@@ -1426,6 +1515,30 @@ def scene_train_config(scene_path):
     cfg["densify_cap_schedule"] = os.environ.get(
         f"{scene_prefix}_DENSIFY_CAP_SCHEDULE", cfg["densify_cap_schedule"],
     ).strip()
+    # A mixed recovery run can legitimately contain a resumed detail scene
+    # and a fresh scene.  Apply these overrides after the close-up profile so
+    # they can use different densification/pruning policies in one queue.
+    cfg["densify_until_iter"] = min(int(os.environ.get(
+        f"{scene_prefix}_DENSIFY_UNTIL_ITER", str(cfg["densify_until_iter"]),
+    )), target_iterations)
+    cfg["densify_grad_threshold"] = float(os.environ.get(
+        f"{scene_prefix}_DENSIFY_GRAD_THRESHOLD", str(cfg["densify_grad_threshold"]),
+    ))
+    cfg["max_new_points_per_densify"] = int(os.environ.get(
+        f"{scene_prefix}_MAX_NEW_POINTS_PER_DENSIFY", str(cfg["max_new_points_per_densify"]),
+    ))
+    cfg["percent_dense"] = float(os.environ.get(
+        f"{scene_prefix}_PERCENT_DENSE", str(cfg["percent_dense"]),
+    ))
+    cfg["max_screen_size"] = int(os.environ.get(
+        f"{scene_prefix}_MAX_SCREEN_SIZE", str(cfg["max_screen_size"]),
+    ))
+    cfg["prune_opacity_threshold"] = float(os.environ.get(
+        f"{scene_prefix}_PRUNE_OPACITY_THRESHOLD", str(cfg["prune_opacity_threshold"]),
+    ))
+    cfg["image_edge_loss_weight"] = float(os.environ.get(
+        f"{scene_prefix}_IMAGE_EDGE_LOSS_WEIGHT", str(cfg["image_edge_loss_weight"]),
+    ))
     cfg["depth_weight_init"] = float(os.environ.get(
         f"{scene_prefix}_DEPTH_WEIGHT_INIT", str(cfg["depth_weight_init"]),
     ))
@@ -1435,6 +1548,11 @@ def scene_train_config(scene_path):
     cfg["position_lr_max_steps"] = int(os.environ.get(
         f"{scene_prefix}_POSITION_LR_MAX_STEPS", str(cfg["position_lr_max_steps"]),
     ))
+    for name in ("position", "feature", "opacity", "scaling", "rotation"):
+        key = f"alignment_{name}_lr_scale"
+        cfg[key] = float(os.environ.get(
+            f"{scene_prefix}_ALIGNMENT_{name.upper()}_LR_SCALE", str(cfg[key]),
+        ))
     cfg["prune_min_visibility"] = int(os.environ.get(
         f"{scene_prefix}_PRUNE_MIN_VISIBILITY", str(cfg["prune_min_visibility"]),
     ))
@@ -1461,6 +1579,7 @@ def scene_train_config(scene_path):
         or cfg["image_edge_loss_weight"] < 0
         or cfg["position_lr_init"] <= 0
         or cfg["position_lr_max_steps"] <= 0
+        or any(cfg[f"alignment_{name}_lr_scale"] <= 0 for name in ("position", "feature", "opacity", "scaling", "rotation"))
         or cfg["prune_only_until_iter"] < 0
         or cfg["prune_only_from_iter"] < 0
         or cfg["prune_only_from_iter"] > cfg["prune_only_until_iter"]
@@ -1510,6 +1629,9 @@ def build_train_cmd(scene_path, gpu_id, force_fresh=False):
         f"| prune_from={cfg['prune_only_from_iter']} "
         f"| prune_opacity={cfg['prune_opacity_threshold']} | prune_warmup={cfg['prune_warmup_iters']} "
         f"| prune_visibility={cfg['prune_min_visibility']} | prune_interval={cfg['prune_interval']} "
+        f"| align_lr=xyz:{cfg['alignment_position_lr_scale']},feat:{cfg['alignment_feature_lr_scale']},"
+        f"opacity:{cfg['alignment_opacity_lr_scale']},scale:{cfg['alignment_scaling_lr_scale']},"
+        f"rot:{cfg['alignment_rotation_lr_scale']} "
         f"| checkpoints={cfg['checkpoint_iterations']} "
         f"| test_pose_prune={cfg['test_pose_prune_distance']}/{cfg['test_pose_prune_chunk_size']} "
         f"| validate/render={cfg['validation_iterations']}"
@@ -1552,6 +1674,24 @@ def build_train_cmd(scene_path, gpu_id, force_fresh=False):
     else:
         print(f"[{scene_name}] fresh policy active; starting without a checkpoint.")
 
+    if scene_name in REQUIRE_RESUME_SCENES:
+        required_resume_iteration = int(os.environ.get(
+            f"BTS_{scene_name.upper()}_REQUIRE_RESUME_MIN_ITERATION",
+            str(REQUIRE_RESUME_MIN_ITERATION),
+        ))
+        if required_resume_iteration < 0:
+            raise ValueError(f"[{scene_name}] required resume iteration must be non-negative.")
+        if resume is None:
+            raise RuntimeError(
+                f"[{scene_name}] requires a verified recovery checkpoint at iteration >= "
+                f"{required_resume_iteration}; refusing a fresh start."
+            )
+        if checkpoint_iter(resume) < required_resume_iteration:
+            raise RuntimeError(
+                f"[{scene_name}] checkpoint is step {checkpoint_iter(resume)}, but recovery requires "
+                f">= {required_resume_iteration}; refusing an underspecified resume."
+            )
+
     if scene_name in FINETUNE_SCENES:
         if resume is None:
             raise RuntimeError(
@@ -1585,6 +1725,16 @@ def build_train_cmd(scene_path, gpu_id, force_fresh=False):
         str(cfg["position_lr_init"]),
         "--position_lr_max_steps",
         str(cfg["position_lr_max_steps"]),
+        "--alignment_position_lr_scale",
+        str(cfg["alignment_position_lr_scale"]),
+        "--alignment_feature_lr_scale",
+        str(cfg["alignment_feature_lr_scale"]),
+        "--alignment_opacity_lr_scale",
+        str(cfg["alignment_opacity_lr_scale"]),
+        "--alignment_scaling_lr_scale",
+        str(cfg["alignment_scaling_lr_scale"]),
+        "--alignment_rotation_lr_scale",
+        str(cfg["alignment_rotation_lr_scale"]),
         "--densification_interval",
         "100",
         "--densify_grad_threshold",
@@ -1649,6 +1799,8 @@ def build_train_cmd(scene_path, gpu_id, force_fresh=False):
     ]
     if VALIDATION_HOLDOUT:
         cmd.append("--validation_holdout")
+    if VALIDATION_LPIPS_FINAL:
+        cmd.append("--validation_lpips_final")
     if cfg["test_pose_prune_distance"] <= 0:
         # Avoid allocating black placeholder images for test views unless the
         # training profile explicitly needs their poses for pruning.
@@ -2034,6 +2186,7 @@ def scene_priority(scene_path):
 ALL_SCENES = sorted(ALL_SCENES, key=scene_priority, reverse=True)
 first_phase_scenes = [scene for scene in ALL_SCENES if scene.name in TRAIN_FIRST_SCENES]
 second_phase_scenes = [scene for scene in ALL_SCENES if scene.name not in TRAIN_FIRST_SCENES]
+concurrent_priority_scenes = first_phase_scenes + second_phase_scenes
 
 
 print("=" * 80)
@@ -2041,6 +2194,7 @@ print(
     f"Starting pipeline: {len(ALL_SCENES)} scenes, GPUs={GPU_IDS}, BTS iterations={ITERATIONS}, "
     f"close-up iterations={CLOSEUP_ITERATIONS}, fresh={sorted(FRESH_SCENES)}, "
     f"train-first={[scene.name for scene in first_phase_scenes]}, "
+    f"train-first-exclusive={TRAIN_FIRST_EXCLUSIVE}, "
     f"render-only={sorted(RENDER_ONLY_SCENES)}, checkpoints={CHECKPOINT_ITERATIONS}, "
     f"validation/render={VALIDATION_ITERATIONS}"
 )
@@ -2056,20 +2210,23 @@ active_futures = {}
 def run_phase(scenes, phase_name):
     """Run one queue phase and return each scene's result.
 
-    The second phase is deliberately not submitted until this call returns.
-    This prevents checkpoint hydration/rendering from competing with the two
-    close-up fresh runs for GPU RAM, disk bandwidth, or deadline budget.
+    Submission order is preserved: when priority scenes are prepended they
+    acquire the first GPU(s), while later scenes fill otherwise idle GPUs.
     """
     global active_futures
     if not scenes:
         return []
     print(f"Starting {phase_name}: {[scene.name for scene in scenes]}")
     gpu_queue = queue.Queue()
-    for gpu in GPU_IDS:
+    # Reserve GPUs for the first submitted scenes.  This makes a priority
+    # chair task deterministically acquire GPU 0 instead of relying on thread
+    # scheduling luck, while remaining scenes wait for one of those GPUs.
+    reserved_gpus = GPU_IDS[:min(len(GPU_IDS), len(scenes))]
+    for gpu in GPU_IDS[len(reserved_gpus):]:
         gpu_queue.put(gpu)
 
-    def worker(scene):
-        gpu = gpu_queue.get()
+    def worker(scene, reserved_gpu=None):
+        gpu = reserved_gpu if reserved_gpu is not None else gpu_queue.get()
         try:
             print(f"[{Path(scene).name}] acquired GPU {gpu} from {phase_name} queue.", flush=True)
             return train_and_render_scene(scene, gpu)
@@ -2078,7 +2235,10 @@ def run_phase(scenes, phase_name):
 
     phase_results = []
     executor = ThreadPoolExecutor(max_workers=len(GPU_IDS))
-    active_futures = {executor.submit(worker, scene): scene for scene in scenes}
+    active_futures = {
+        executor.submit(worker, scene, reserved_gpus[index] if index < len(reserved_gpus) else None): scene
+        for index, scene in enumerate(scenes)
+    }
     try:
         for future in as_completed(active_futures):
             scene = active_futures[future]
@@ -2113,16 +2273,20 @@ def run_phase(scenes, phase_name):
 
 
 try:
-    first_phase_results = run_phase(first_phase_scenes, "phase 1: close-up training")
-    results.extend(first_phase_results)
-    failed_first_phase = [name for name, rc in first_phase_results if rc != 0]
-    if failed_first_phase:
-        raise RuntimeError(
-            "Phase 2 is blocked because train-first scenes did not finish: "
-            f"{failed_first_phase}. Submission packaging is intentionally skipped."
-        )
+    if TRAIN_FIRST_EXCLUSIVE:
+        first_phase_results = run_phase(first_phase_scenes, "phase 1: priority training")
+        results.extend(first_phase_results)
+        failed_first_phase = [name for name, rc in first_phase_results if rc != 0]
+        if failed_first_phase:
+            raise RuntimeError(
+                "Phase 2 is blocked because train-first scenes did not finish: "
+                f"{failed_first_phase}. Submission packaging is intentionally skipped."
+            )
+        results.extend(run_phase(second_phase_scenes, "phase 2: remaining scenes"))
     else:
-        results.extend(run_phase(second_phase_scenes, "phase 2: checkpoint render"))
+        # Chair is submitted first and therefore receives GPU 0, while GPU 1
+        # immediately starts the next fine-tune instead of waiting ~70k steps.
+        results.extend(run_phase(concurrent_priority_scenes, "concurrent priority queue"))
 except KeyboardInterrupt:
     # Do not let ThreadPoolExecutor.__exit__ wait indefinitely for subprocesses
     # after an interrupted Kaggle cell.  Stop active children first, then join

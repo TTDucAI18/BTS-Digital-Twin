@@ -154,6 +154,34 @@ def test_pose_proximity_mask(points, test_pose_centers, distance, chunk_size):
         prune_mask[start:end] = nearest_distance < distance
     return prune_mask
 
+
+def alignment_lr_scale_for_group(group_name, opt):
+    """Return the optional conservative-tail multiplier for an optimizer group."""
+    if group_name == "xyz":
+        return opt.alignment_position_lr_scale
+    if group_name in {"f_dc", "f_rest"}:
+        return opt.alignment_feature_lr_scale
+    if group_name == "opacity":
+        return opt.alignment_opacity_lr_scale
+    if group_name == "scaling":
+        return opt.alignment_scaling_lr_scale
+    if group_name == "rotation":
+        return opt.alignment_rotation_lr_scale
+    return 1.0
+
+
+def apply_alignment_lr_scales(gaussians, opt):
+    """Scale restored optimizer rates once; xyz is re-scaled after scheduling."""
+    scales = {}
+    for group in gaussians.optimizer.param_groups:
+        scale = alignment_lr_scale_for_group(group["name"], opt)
+        if scale != 1.0:
+            group["lr"] *= scale
+        scales[group["name"]] = scale
+    if any(scale != 1.0 for scale in scales.values()):
+        print(f"Alignment optimizer LR scales: {scales}")
+
+
 def training(dataset, opt, pipe, validation_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
@@ -200,6 +228,7 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
             gaussians.training_setup(opt)
         else:
             gaussians.restore(model_params, opt)
+            apply_alignment_lr_scales(gaussians, opt)
             cleanup_start_iter = first_iter
             if (
                 opt.prune_only_until_iter > first_iter
@@ -307,6 +336,14 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        # The xyz scheduler writes its absolute rate every iteration, so apply
+        # a conservative-tail multiplier after that write.  Other groups were
+        # scaled once immediately after restoring their optimizer state.
+        if opt.alignment_position_lr_scale != 1.0:
+            for group in gaussians.optimizer.param_groups:
+                if group["name"] == "xyz":
+                    group["lr"] *= opt.alignment_position_lr_scale
+                    break
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
@@ -480,7 +517,12 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), validation_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE), val_cameras, validation_name)
+            training_report(
+                tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
+                validation_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE),
+                val_cameras, validation_name,
+                compute_lpips=args.validation_lpips_final and iteration == opt.iterations,
+            )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 # FIX BUG 4: Free VRAM before writing large PLY to disk.
@@ -748,7 +790,11 @@ def prepare_output_and_logger(args):
         
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validation_iterations, scene : Scene, renderFunc, renderArgs, val_cameras, validation_name):
+def training_report(
+    tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validation_iterations,
+    scene: Scene, renderFunc, renderArgs, val_cameras, validation_name,
+    compute_lpips=False,
+):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -765,6 +811,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validatio
                 eval_cams = config['cameras']
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
+                lpips_criterion = None
+                if compute_lpips:
+                    # Instantiate VGG exactly once at the terminal validation
+                    # only.  It is the leaderboard's perceptual component,
+                    # but retaining it during normal 7M-Gaussian training
+                    # would waste the T4 memory headroom.
+                    from lpipsPyTorch.modules.lpips import LPIPS
+                    lpips_criterion = LPIPS(net_type="vgg", version="0.1").cuda().eval()
                 with torch.no_grad():
                     for idx, viewpoint in enumerate(eval_cams):
                         image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
@@ -785,20 +841,55 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, validatio
                             wandb.log(log_dict, step=iteration)
                         l1_test += l1_loss(image, gt_image).mean().double()
                         psnr_test += psnr(image, gt_image).mean().double()
+                        ssim_test += ssim(image, gt_image).mean().double()
+                        if lpips_criterion is not None:
+                            lpips_test += lpips_criterion(image[None], gt_image[None]).mean().double()
                         del image, gt_image
                         torch.cuda.empty_cache()  # giải phóng fragment VRAM sau mỗi camera
                 psnr_test /= len(eval_cams)
                 l1_test /= len(eval_cams)          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                ssim_test /= len(eval_cams)
+                # This proxy uses the public score's PSNR/SSIM weights. LPIPS
+                # is intentionally excluded from a frequent in-training loop
+                # because VGG evaluation would consume the T4 headroom needed
+                # for the 7M-Gaussian BTS model.
+                proxy_score = 100.0 * (0.30 * ssim_test + 0.30 * torch.clamp(psnr_test / 50.0, 0.0, 1.0))
+                message = "\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} proxy(no-LPIPS) {}".format(
+                    iteration, config['name'], l1_test, psnr_test, ssim_test, proxy_score
+                )
+                if lpips_criterion is not None:
+                    lpips_test /= len(eval_cams)
+                    leaderboard_proxy = 100.0 * (
+                        0.40 * (1.0 - lpips_test)
+                        + 0.30 * ssim_test
+                        + 0.30 * torch.clamp(psnr_test / 50.0, 0.0, 1.0)
+                    )
+                    message += f" LPIPS {lpips_test} score-proxy {leaderboard_proxy}"
+                else:
+                    leaderboard_proxy = None
+                print(message)
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/ssim', ssim_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/score_proxy_no_lpips', proxy_score, iteration)
+                    if leaderboard_proxy is not None:
+                        tb_writer.add_scalar(config['name'] + '/lpips', lpips_test, iteration)
+                        tb_writer.add_scalar(config['name'] + '/score_proxy', leaderboard_proxy, iteration)
                 if WANDB_FOUND and wandb.run is not None:
                     wandb.log({
                         "iteration": iteration,
                         f"{config['name']}/l1_loss": l1_test,
-                        f"{config['name']}/psnr": psnr_test
+                        f"{config['name']}/psnr": psnr_test,
+                        f"{config['name']}/ssim": ssim_test,
+                        f"{config['name']}/score_proxy_no_lpips": proxy_score,
                     }, step=iteration)
+                    if leaderboard_proxy is not None:
+                        wandb.log({
+                            "iteration": iteration,
+                            f"{config['name']}/lpips": lpips_test,
+                            f"{config['name']}/score_proxy": leaderboard_proxy,
+                        }, step=iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
@@ -833,6 +924,11 @@ if __name__ == "__main__":
         "--validation_holdout",
         action="store_true",
         help="Exclude fixed validation views from training. Disabled by default to maximise reconstruction coverage.",
+    )
+    parser.add_argument(
+        "--validation_lpips_final",
+        action="store_true",
+        help="Compute VGG LPIPS once on the terminal validation holdout for model selection.",
     )
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")

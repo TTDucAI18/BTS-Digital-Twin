@@ -104,3 +104,20 @@ os.environ.update({
     "BTS_TRAIN_RESOLUTION": "1",
     "BTS_RENDER_RESOLUTION": "1",
 })
+
+# Keep the render-only checkpoint contract explicit in the configuration cell.
+# If a stale/partial cell is pasted into Kaggle, fail here rather than letting
+# chair inherit BTS_CLOSEUP_ITERATIONS=80000 and fail much later in preflight.
+_required_targets = {
+    "BTS_BONSAI_ITERATIONS": "80000",
+    "BTS_CHAIR_ITERATIONS": "70000",
+}
+for _name, _expected in _required_targets.items():
+    if os.environ.get(_name) != _expected:
+        raise RuntimeError(f"{_name} must be {_expected}, got {os.environ.get(_name)!r}")
+print(
+    "Pinhole full profile loaded: "
+    f"bonsai={os.environ['BTS_BONSAI_ITERATIONS']}k, "
+    f"chair={os.environ['BTS_CHAIR_ITERATIONS']}k, "
+    "five BTS scenes=fresh 70k."
+)

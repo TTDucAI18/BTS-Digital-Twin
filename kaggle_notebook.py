@@ -843,6 +843,16 @@ def prepare_selected_pinhole_scenes(scenes):
         manifest = destination / ".pinhole_manifest.json"
         if not manifest.is_file() or not (destination / "train" / "sparse" / "0" / "cameras.bin").is_file():
             raise RuntimeError(f"[{scene.name}] pinhole preprocessing did not create a valid scene at {destination}")
+        try:
+            metadata = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"[{scene.name}] could not read pinhole manifest {manifest}: {exc}") from exc
+        if metadata.get("camera_model") != "PINHOLE":
+            raise RuntimeError(f"[{scene.name}] pinhole manifest does not declare PINHOLE camera model.")
+        print(
+            f"[{scene.name}] PINHOLE ACTIVE: source={destination} | "
+            f"images={metadata.get('image_count')} | masks={metadata.get('mask_counts', {})}"
+        )
         prepared.append(destination)
     return prepared
 
@@ -1661,6 +1671,17 @@ def scene_is_fresh(scene_name):
 
 def build_train_cmd(scene_path, gpu_id, force_fresh=False):
     scene_name = Path(scene_path).name
+    if scene_name in PINHOLE_PREPROCESS_SCENES:
+        expected_scene = (PINHOLE_DATA_ROOT / scene_name).resolve()
+        actual_scene = Path(scene_path).resolve()
+        manifest = actual_scene / ".pinhole_manifest.json"
+        if actual_scene != expected_scene or not manifest.is_file():
+            raise RuntimeError(
+                f"[{scene_name}] PINHOLE REQUIRED but training source is {actual_scene}; "
+                f"expected {expected_scene} with .pinhole_manifest.json. "
+                "Use the latest kaggle_notebook.py and restart from the configuration cell."
+            )
+        print(f"[{scene_name}] PINHOLE TRAINING CONFIRMED: {actual_scene}")
     out_dir = scene_output(scene_path)
     cfg = scene_train_config(scene_path)
     print(

@@ -17,17 +17,14 @@ before allocating a GPU.
 import os
 
 
-bts = "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674"
-all_scenes = f"bonsai,chair,{bts}"
-
 os.environ.update({
     "BTS_DATA_DIR": "/kaggle/input/datasets/tdukaggle/ai-race-data/data/data",
     "BTS_CHECKPOINT_INPUT_DIR": "/kaggle/input/ai-race-best-closeup-checkpoints",
     # Refuse a stale local checkout: the notebook must pull the committed main
     # revision that contains prepare_pinhole_dataset.py before it starts.
     "BTS_REQUIRE_REPO_SYNC": "1",
-    "BTS_SCENES": all_scenes,
-    "BTS_PINHOLE_PREPROCESS_SCENES": bts,
+    "BTS_SCENES": "bonsai,chair,HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
+    "BTS_PINHOLE_PREPROCESS_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
     "BTS_PINHOLE_DATA_ROOT": "/kaggle/working/data_pinhole_full_v1",
     "BTS_PINHOLE_JPEG_QUALITY": "100",
 
@@ -40,7 +37,7 @@ os.environ.update({
     # render-only restores, so this experiment cannot degrade their geometry.
     "BTS_FRESH_RUN": "0",
     "BTS_FRESH_RUN_ID": "pinhole-full-v1",
-    "BTS_FRESH_SCENES": bts,
+    "BTS_FRESH_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
     "BTS_RESUME_LOCAL": "1",
     "BTS_RESUME_INPUT": "1",
     "BTS_REQUIRE_RESUME_SCENES": "bonsai,chair",
@@ -80,7 +77,7 @@ os.environ.update({
     "BTS_DEPTH_WEIGHT_INIT": "0.0",
     "BTS_FOREGROUND_LOSS_WEIGHT": "20.0",
     "BTS_FOREGROUND_EDGE_LOSS_WEIGHT": "0.10",
-    "BTS_REQUIRE_FOREGROUND_MASK_SCENES": bts,
+    "BTS_REQUIRE_FOREGROUND_MASK_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
     # HCM0539 has the lowest observed mask availability (~45%); require at
     # least 40% so a wrongly mounted/no-mask dataset fails before training.
     "BTS_MIN_FOREGROUND_MASK_COVERAGE": "0.40",

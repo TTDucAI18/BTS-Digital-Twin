@@ -151,6 +151,15 @@ DISABLE_FOREGROUND_MASK_SCENES = frozenset(
     for name in os.environ.get("BTS_DISABLE_FOREGROUND_MASK_SCENES", "").split(",")
     if name.strip()
 )
+# A quality profile may demand that masks exist for a useful subset of views,
+# rather than silently falling back to full-image loss if a Kaggle input was
+# mounted without the mask directory.
+REQUIRE_FOREGROUND_MASK_SCENES = frozenset(
+    name.strip()
+    for name in os.environ.get("BTS_REQUIRE_FOREGROUND_MASK_SCENES", "").split(",")
+    if name.strip()
+)
+MIN_FOREGROUND_MASK_COVERAGE = float(os.environ.get("BTS_MIN_FOREGROUND_MASK_COVERAGE", "0.0"))
 MIN_DEPTH_COVERAGE = float(os.environ.get("BTS_MIN_DEPTH_COVERAGE", "0.10"))
 MAX_WORKERS = int(os.environ.get("BTS_MAX_WORKERS", "2"))
 KAGGLE_TIME_LIMIT_H = float(os.environ.get("BTS_TIME_LIMIT_H", "11.5"))
@@ -217,6 +226,14 @@ REQUIRE_RESUME_SCENES = frozenset(
 REQUIRE_RESUME_MIN_ITERATION = int(os.environ.get("BTS_REQUIRE_RESUME_MIN_ITERATION", "0"))
 if REQUIRE_RESUME_MIN_ITERATION < 0:
     raise ValueError("BTS_REQUIRE_RESUME_MIN_ITERATION must be non-negative.")
+# Archive-only restores are a stricter contract than a generic resume.  They
+# are used by a full submission profile to guarantee that a close-up scene is
+# rendered from its selected checkpoint rather than an accidental raw PTH.
+REQUIRE_CHECKPOINT_ARCHIVE_SCENES = frozenset(
+    name.strip()
+    for name in os.environ.get("BTS_REQUIRE_CHECKPOINT_ARCHIVE_SCENES", "").split(",")
+    if name.strip()
+)
 FINETUNE_BASE_ITERATIONS = int(os.environ.get("BTS_FINETUNE_BASE_ITERATIONS", "70000"))
 FINETUNE_STEPS = int(os.environ.get("BTS_FINETUNE_STEPS", "10000"))
 # train.py's position schedule uses absolute iteration numbers.  Extending
@@ -322,6 +339,13 @@ if _unknown_control_scenes:
 _unknown_mask_scenes = DISABLE_FOREGROUND_MASK_SCENES - set(TARGET_SCENES)
 if _unknown_mask_scenes:
     raise ValueError(f"Unknown BTS_DISABLE_FOREGROUND_MASK_SCENES: {sorted(_unknown_mask_scenes)}")
+_unknown_required_mask_scenes = REQUIRE_FOREGROUND_MASK_SCENES - set(TARGET_SCENES)
+if _unknown_required_mask_scenes:
+    raise ValueError(
+        f"Unknown BTS_REQUIRE_FOREGROUND_MASK_SCENES: {sorted(_unknown_required_mask_scenes)}"
+    )
+if not 0.0 <= MIN_FOREGROUND_MASK_COVERAGE <= 1.0:
+    raise ValueError("BTS_MIN_FOREGROUND_MASK_COVERAGE must be in [0, 1].")
 if RENDER_ONLY_SCENES & FRESH_SCENES:
     raise ValueError(
         "A scene cannot be both BTS_RENDER_ONLY_SCENES and BTS_FRESH_SCENES: "
@@ -334,6 +358,11 @@ _unknown_required_resume_scenes = REQUIRE_RESUME_SCENES - set(TARGET_SCENES)
 if _unknown_required_resume_scenes:
     raise ValueError(
         f"Unknown BTS_REQUIRE_RESUME_SCENES: {sorted(_unknown_required_resume_scenes)}"
+    )
+_unknown_required_archive_scenes = REQUIRE_CHECKPOINT_ARCHIVE_SCENES - set(TARGET_SCENES)
+if _unknown_required_archive_scenes:
+    raise ValueError(
+        f"Unknown BTS_REQUIRE_CHECKPOINT_ARCHIVE_SCENES: {sorted(_unknown_required_archive_scenes)}"
     )
 if FINETUNE_SCENES & FRESH_SCENES:
     raise ValueError(
@@ -2181,6 +2210,68 @@ def scene_priority(scene_path):
     # BTS is the submission priority.  Starting bonsai/chair on both GPUs
     # previously pushed all five tower scenes into the global deadline.
     return (1 if Path(scene_path).name not in CLOSEUP_SCENES else 0, 0)
+
+
+def foreground_mask_coverage(scene_path):
+    """Return the best matching mask directory and its image-stem coverage."""
+    root = train_root(scene_path)
+    image_stems = {path.stem for path in (root / "images").glob("*") if path.is_file()}
+    if not image_stems:
+        return None, 0, 0
+    best_name = None
+    best_count = 0
+    for name in ("foreground_masks", "masks", "mask", "foreground"):
+        mask_root = root / name
+        if not mask_root.is_dir():
+            continue
+        mask_stems = {path.stem for path in mask_root.glob("*") if path.is_file()}
+        matched = len(image_stems & mask_stems)
+        if matched > best_count:
+            best_name, best_count = name, matched
+    return best_name, best_count, len(image_stems)
+
+
+def preflight_submission_contract(scenes):
+    """Fail before GPU work when a quality profile's required inputs are absent."""
+    failures = []
+    for scene in scenes:
+        scene_name = scene.name
+        root = train_root(scene)
+        image_count = count_images(scene)
+        if image_count == 0:
+            failures.append(f"{scene_name}: train/images has no supported image files")
+        if not (scene / "test" / "test_poses.csv").is_file():
+            failures.append(f"{scene_name}: missing test/test_poses.csv")
+
+        if scene_name in REQUIRE_FOREGROUND_MASK_SCENES:
+            mask_name, matched, total = foreground_mask_coverage(scene)
+            coverage = matched / max(1, total)
+            if mask_name is None or coverage < MIN_FOREGROUND_MASK_COVERAGE:
+                failures.append(
+                    f"{scene_name}: foreground masks cover {matched}/{total} ({coverage:.1%}); "
+                    f"need at least {MIN_FOREGROUND_MASK_COVERAGE:.1%}"
+                )
+            else:
+                print(
+                    f"[{scene_name}] preflight masks: {mask_name} {matched}/{total} "
+                    f"({coverage:.1%}) meets required coverage."
+                )
+
+        if scene_name in REQUIRE_CHECKPOINT_ARCHIVE_SCENES:
+            target = scene_train_config(scene)["iterations"]
+            archive = archived_checkpoint_at(scene, target)
+            if archive is None:
+                failures.append(
+                    f"{scene_name}: missing verified archive chkpnt{target}_{scene_name.lower()} "
+                    f"(.zip or extracted) under BTS_CHECKPOINT_INPUT_DIR={CHECKPOINT_INPUT_DIR}"
+                )
+            else:
+                print(f"[{scene_name}] preflight checkpoint: {archive}")
+    if failures:
+        raise RuntimeError("Submission input preflight failed:\n- " + "\n- ".join(failures))
+
+
+preflight_submission_contract(ALL_SCENES)
 
 
 ALL_SCENES = sorted(ALL_SCENES, key=scene_priority, reverse=True)

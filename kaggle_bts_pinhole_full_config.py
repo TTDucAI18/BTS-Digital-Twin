@@ -7,6 +7,11 @@ and 70k checkpoints, respectively; they are never pruned in this run.
 Attach an input dataset containing ``chkpnt80000_bonsai`` and
 ``chkpnt70000_chair`` archives (zip or extracted directories), then run this
 file before ``kaggle_notebook.py``.
+
+Kaggle usage: paste this entire file into the first code cell, adjust only
+the two input mount paths below, then run the current kaggle_notebook.py from
+top to bottom.  The notebook now validates both archives and BTS mask coverage
+before allocating a GPU.
 """
 
 import os
@@ -18,6 +23,9 @@ all_scenes = f"bonsai,chair,{bts}"
 os.environ.update({
     "BTS_DATA_DIR": "/kaggle/input/datasets/tdukaggle/ai-race-data/data/data",
     "BTS_CHECKPOINT_INPUT_DIR": "/kaggle/input/ai-race-best-closeup-checkpoints",
+    # Refuse a stale local checkout: the notebook must pull the committed main
+    # revision that contains prepare_pinhole_dataset.py before it starts.
+    "BTS_REQUIRE_REPO_SYNC": "1",
     "BTS_SCENES": all_scenes,
     "BTS_PINHOLE_PREPROCESS_SCENES": bts,
     "BTS_PINHOLE_DATA_ROOT": "/kaggle/working/data_pinhole_full_v1",
@@ -36,6 +44,7 @@ os.environ.update({
     "BTS_RESUME_LOCAL": "1",
     "BTS_RESUME_INPUT": "1",
     "BTS_REQUIRE_RESUME_SCENES": "bonsai,chair",
+    "BTS_REQUIRE_CHECKPOINT_ARCHIVE_SCENES": "bonsai,chair",
     "BTS_BONSAI_REQUIRE_RESUME_MIN_ITERATION": "80000",
     "BTS_CHAIR_REQUIRE_RESUME_MIN_ITERATION": "70000",
     "BTS_RENDER_ONLY_SCENES": "bonsai,chair",
@@ -71,6 +80,10 @@ os.environ.update({
     "BTS_DEPTH_WEIGHT_INIT": "0.0",
     "BTS_FOREGROUND_LOSS_WEIGHT": "20.0",
     "BTS_FOREGROUND_EDGE_LOSS_WEIGHT": "0.10",
+    "BTS_REQUIRE_FOREGROUND_MASK_SCENES": bts,
+    # HCM0539 has the lowest observed mask availability (~45%); require at
+    # least 40% so a wrongly mounted/no-mask dataset fails before training.
+    "BTS_MIN_FOREGROUND_MASK_COVERAGE": "0.40",
     "BTS_IMAGE_EDGE_LOSS_WEIGHT": "0.05",
 
     # Retain the current bonsai/chair render policy: no geometry mutation and

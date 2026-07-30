@@ -1,7 +1,7 @@
 """Phase 2: resume completed BTS scenes from their 70k pinhole checkpoints.
 
-Run this only after the requested scene has a verified ``chkpnt70000`` in
-``BTS_CHECKPOINT_DIR`` (or in the attached checkpoint input).  It preserves
+Attach an input dataset containing extracted or zipped archives named
+``chkpnt70000_hcm0421`` through ``chkpnt70000_hcm0674``.  It preserves
 the successful Phase-1 geometry, gives the tower lattice a small late density
 budget, and deliberately performs no global pruning.  ``bonsai`` and
 ``chair`` are excluded: their floater repair must use per-test-view culls
@@ -14,6 +14,9 @@ import os
 os.environ.update({
     "BTS_REQUIRE_REPO_SYNC": "1",
     "BTS_DATA_DIR": "/kaggle/input/datasets/tdukaggle/ai-race-data/data/data",
+    # The durable Phase-1 archives are read-only Kaggle Input.  Do not rely
+    # on a prior session's /kaggle/working directory surviving a restart.
+    "BTS_CHECKPOINT_INPUT_DIR": "/kaggle/input/datasets/tdukaggle/ai-race-data/checkpoint_final",
     "BTS_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
     "BTS_PINHOLE_PREPROCESS_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
     "BTS_PINHOLE_DATA_ROOT": "/kaggle/working/data_pinhole_full_v1",
@@ -33,6 +36,7 @@ os.environ.update({
     # branch disables densification and turns on prune-only cleanup.
     "BTS_FINETUNE_SCENES": "",
     "BTS_REQUIRE_RESUME_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
+    "BTS_REQUIRE_CHECKPOINT_ARCHIVE_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
     "BTS_HCM0421_REQUIRE_RESUME_MIN_ITERATION": "70000",
     "BTS_HCM0539_REQUIRE_RESUME_MIN_ITERATION": "70000",
     "BTS_HCM0540_REQUIRE_RESUME_MIN_ITERATION": "70000",

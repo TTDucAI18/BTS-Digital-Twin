@@ -12,6 +12,7 @@ import os
 
 
 os.environ.update({
+    "BTS_REQUIRE_REPO_SYNC": "1",
     "BTS_DATA_DIR": "/kaggle/input/datasets/tdukaggle/ai-race-data/data/data",
     "BTS_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",
     "BTS_PINHOLE_PREPROCESS_SCENES": "HCM0421,HCM0539,HCM0540,HCM0644,HCM0674",

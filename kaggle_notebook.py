@@ -995,12 +995,25 @@ for scene in ALL_SCENES:
 # =============================================================================
 
 def get_gpu_ids():
+    # A second, independent phase can safely reserve only an idle GPU.  This
+    # avoids accidental oversubscription when a long Phase 1 process is still
+    # running in another Kaggle terminal/session.  Example: BTS_GPU_IDS=1.
+    requested = os.environ.get("BTS_GPU_IDS", "").strip()
     try:
         import torch
 
         n = torch.cuda.device_count()
+        if requested:
+            gpu_ids = [int(value.strip()) for value in requested.split(",") if value.strip()]
+            if not gpu_ids:
+                raise ValueError("BTS_GPU_IDS is empty")
+            if len(set(gpu_ids)) != len(gpu_ids) or any(gpu_id < 0 or gpu_id >= n for gpu_id in gpu_ids):
+                raise ValueError(f"BTS_GPU_IDS={requested!r} is invalid for {n} visible GPU(s)")
+            return gpu_ids[:MAX_WORKERS]
         return list(range(min(n, MAX_WORKERS)))
     except Exception:
+        if requested:
+            raise
         return [0]
 
 
@@ -1400,6 +1413,7 @@ def scene_train_config(scene_path):
         ) | {target_iterations}),
         "max_gaussians": MAX_GAUSSIANS,
         "max_new_points_per_densify": MAX_NEW_POINTS_PER_DENSIFY,
+        "disable_densify_prune": os.environ.get("BTS_DISABLE_DENSIFY_PRUNE", "0").strip() == "1",
         # Spend the memory-safe budget gradually.  Fine wire/background
         # structure gets new splats late, while early training cannot consume
         # all memory in one densification peak.
@@ -1580,6 +1594,9 @@ def scene_train_config(scene_path):
     cfg["max_new_points_per_densify"] = int(os.environ.get(
         f"{scene_prefix}_MAX_NEW_POINTS_PER_DENSIFY", str(cfg["max_new_points_per_densify"]),
     ))
+    cfg["disable_densify_prune"] = os.environ.get(
+        f"{scene_prefix}_DISABLE_DENSIFY_PRUNE", str(int(cfg["disable_densify_prune"])),
+    ).strip() == "1"
     cfg["percent_dense"] = float(os.environ.get(
         f"{scene_prefix}_PERCENT_DENSE", str(cfg["percent_dense"]),
     ))
@@ -1689,6 +1706,7 @@ def build_train_cmd(scene_path, gpu_id, force_fresh=False):
         f"| dense={cfg['percent_dense']} | grad={cfg['densify_grad_threshold']} "
         f"| depth_weight={cfg['depth_weight_init']} | screen_prune={cfg['max_screen_size']} "
         f"| cap_schedule={cfg['densify_cap_schedule'] or 'off'} | max_new={cfg['max_new_points_per_densify']} "
+        f"| densify_prune={not cfg['disable_densify_prune']} "
         f"| edge_loss={cfg['image_edge_loss_weight']} | prune_until={cfg['prune_only_until_iter']} "
         f"| prune_from={cfg['prune_only_from_iter']} "
         f"| prune_opacity={cfg['prune_opacity_threshold']} | prune_warmup={cfg['prune_warmup_iters']} "
@@ -1871,6 +1889,8 @@ def build_train_cmd(scene_path, gpu_id, force_fresh=False):
         cmd.append("--skip_test_poses")
     if cfg["densify_clone_before_split"]:
         cmd.append("--densify_clone_before_split")
+    if cfg["disable_densify_prune"]:
+        cmd.append("--disable_densify_prune")
 
     if SUPPORTS_MAX_GAUSSIANS:
         cmd.extend(["--max_gaussians", str(cfg["max_gaussians"])])

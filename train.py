@@ -580,6 +580,7 @@ def training(dataset, opt, pipe, validation_iterations, saving_iterations, check
                             size_threshold, radii, max_points=current_cap,
                             max_new_points=opt.max_new_points_per_densify,
                             clone_before_split=opt.densify_clone_before_split,
+                            prune=not opt.disable_densify_prune,
                         )
                     else:
                         phase = "Cleanup pruning" if prune_only_active else "Point budget reached"

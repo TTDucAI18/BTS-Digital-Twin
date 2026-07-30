@@ -462,7 +462,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_points=0, max_new_points=0, clone_before_split=False):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_points=0, max_new_points=0, clone_before_split=False, prune=True):
         grads = self.xyz_gradient_accum / self.denom
         # A single invalid projected point must never win the top-k budget and
         # create a burst of displaced children around a tower tip.  NaN/Inf
@@ -513,12 +513,13 @@ class GaussianModel:
                 max_new_points=clone_budget,
             )
 
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
+        if prune:
+            prune_mask = (self.get_opacity < min_opacity).squeeze()
+            if max_screen_size:
+                big_points_vs = self.max_radii2D > max_screen_size
+                big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+                prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 

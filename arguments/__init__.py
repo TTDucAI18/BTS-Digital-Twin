@@ -121,6 +121,11 @@ class OptimizationParams(ParamGroup):
         # prevents split/clone temporary tensors from OOMing near the cap.
         # 0 preserves the legacy unlimited event size.
         self.max_new_points_per_densify = 0
+        # Keep classic opacity/screen pruning coupled to densification by
+        # default.  A late detail-recovery run can disable only that broad
+        # deletion while retaining the necessary parent replacement when a
+        # Gaussian is split.
+        self.disable_densify_prune = False
         # Close-range scenes benefit from cloning already-small splats in the
         # same densification interval as large-splat splitting.  Default keeps
         # the established BTS split-first behaviour.
